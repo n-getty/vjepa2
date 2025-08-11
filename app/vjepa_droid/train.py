@@ -6,17 +6,6 @@
 #
 
 import os
-
-# -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
-try:
-    # -- WARNING: IF DOING DISTRIBUTED TRAINING ON A NON-SLURM CLUSTER, MAKE
-    # --          SURE TO UPDATE THIS TO GET LOCAL-RANK ON NODE, OR ENSURE
-    # --          THAT YOUR JOBS ARE LAUNCHED WITH ONLY 1 DEVICE VISIBLE
-    # --          TO EACH PROCESS
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
-except Exception:
-    pass
-
 import copy
 import gc
 import random
@@ -162,12 +151,28 @@ def main(args, resume_preempt=False):
     world_size, rank = init_distributed()
     logger.info(f"Initialized (rank/world-size) {rank}/{world_size}")
 
+    device = args.get("device")
+    device_type = args.get("device_type")
+
     # -- set device
-    if not torch.cuda.is_available():
-        device = torch.device("cpu")
+    if device_type == "cuda":
+        if not torch.cuda.is_available():
+            device = torch.device("cpu")
+        else:
+            device = torch.device(device)
+            torch.cuda.set_device(device)
+    elif device_type == "xpu":
+        try:
+            import intel_extension_for_pytorch as ipex
+            if not ipex.xpu.is_available():
+                device = torch.device("cpu")
+            else:
+                device = torch.device(device)
+                ipex.xpu.set_device(device)
+        except ImportError:
+            device = torch.device("cpu")
     else:
-        device = torch.device("cuda:0")
-        torch.cuda.set_device(device)
+        device = torch.device("cpu")
 
     # -- log/checkpointing paths
     log_file = os.path.join(folder, f"log_r{rank}.csv")
@@ -270,7 +275,19 @@ def main(args, resume_preempt=False):
         mixed_precision=mixed_precision,
         betas=betas,
         eps=eps,
+        device_type=device_type,
     )
+
+    if device_type == 'xpu':
+        try:
+            import intel_extension_for_pytorch as ipex
+            logger.info("Optimizing model and optimizer with IPEX...")
+            encoder, predictor, optimizer = ipex.optimize(
+                model=(encoder, predictor), optimizer=optimizer, dtype=dtype
+            )
+        except ImportError:
+            logger.warning("IPEX not found, cannot optimize model for XPU.")
+
     encoder = DistributedDataParallel(encoder, static_graph=True)
     predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
     target_encoder = DistributedDataParallel(target_encoder)
@@ -441,7 +458,7 @@ def main(args, resume_preempt=False):
                     return torch.mean(torch.abs(z - _h) ** loss_exp) / loss_exp
 
                 # Step 1. Forward
-                with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+                with torch.autocast(device_type=device_type, dtype=dtype, enabled=mixed_precision):
                     h = forward_target(clips)
                     z_tf, z_ar = forward_predictions(h)
                     jloss = loss_fn(z_tf, h)
@@ -475,7 +492,7 @@ def main(args, resume_preempt=False):
                 sloss,
                 _new_lr,
                 _new_wd,
-            ), gpu_etime_ms = gpu_timer(train_step)
+            ), gpu_etime_ms = gpu_timer(train_step, device_type=device_type)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
             loss_meter.update(loss)
             jloss_meter.update(jloss)
@@ -503,7 +520,7 @@ def main(args, resume_preempt=False):
                             sloss_meter.avg,
                             _new_wd,
                             _new_lr,
-                            torch.cuda.max_memory_allocated() / 1024.0**2,
+                            (torch.cuda.max_memory_allocated() if device_type == 'cuda' else torch.xpu.max_memory_allocated()) / 1024.0**2,
                             iter_time_meter.avg,
                             gpu_time_meter.avg,
                             data_elapsed_time_meter.avg,

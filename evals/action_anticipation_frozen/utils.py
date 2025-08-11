@@ -13,7 +13,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
-def init_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs, use_bfloat16=False):
+def init_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs, use_bfloat16=False, device_type='cuda'):
     optimizers, schedulers, wd_schedulers, scalers = [], [], [], []
     for c, kwargs in zip(classifiers, opt_kwargs):
         param_groups = [
@@ -31,7 +31,18 @@ def init_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs, use_bflo
         optimizers += [torch.optim.AdamW(param_groups)]
         schedulers += [WarmupCosineLRSchedule(optimizers[-1], T_max=int(num_epochs * iterations_per_epoch))]
         wd_schedulers += [CosineWDSchedule(optimizers[-1], T_max=int(num_epochs * iterations_per_epoch))]
-        scalers += [torch.cuda.amp.GradScaler() if use_bfloat16 else None]
+
+        scaler = None
+        if use_bfloat16:
+            if device_type == 'cuda':
+                scaler = torch.cuda.amp.GradScaler()
+            elif device_type == 'xpu':
+                try:
+                    import intel_extension_for_pytorch as ipex
+                    scaler = ipex.xpu.amp.GradScaler()
+                except ImportError:
+                    logger.warning("IPEX not found, GradScaler not available for XPU.")
+        scalers.append(scaler)
     return optimizers, scalers, schedulers, wd_schedulers
 
 

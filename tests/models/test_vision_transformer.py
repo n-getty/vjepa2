@@ -14,12 +14,30 @@ from src.models.vision_transformer import vit_giant_xformers_rope
 
 
 # Usage: pytest tests/models/test_vision_transformer.py
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="This test requires CUDA")
+def is_cuda_or_xpu_available():
+    if torch.cuda.is_available():
+        return True
+    try:
+        import intel_extension_for_pytorch as ipex
+        if ipex.xpu.is_available():
+            return True
+    except ImportError:
+        pass
+    return False
+
+@pytest.mark.skipif(not is_cuda_or_xpu_available(), reason="This test requires CUDA or XPU")
 class TestViTGiant(unittest.TestCase):
     def setUp(self) -> None:
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            self.device_type = "cuda"
+        else:
+            self.device = torch.device("xpu")
+            self.device_type = "xpu"
+
         self.model_shape_invariant = vit_giant_xformers_rope(
             img_size=256, patch_size=16, num_frames=16, handle_nonsquare_inputs=True
-        ).cuda()
+        ).to(self.device)
         self.model_square = deepcopy(self.model_shape_invariant)
         self.model_square.handle_nonsquare_inputs = False
         torch.manual_seed(42)
@@ -27,8 +45,8 @@ class TestViTGiant(unittest.TestCase):
 
     def test_square_inputs(self):
         for i in range(self.total_iters):
-            input = torch.rand(1, 3, 16, 256, 256).cuda()
-            with torch.cuda.amp.autocast(enabled=True):
+            input = torch.rand(1, 3, 16, 256, 256).to(self.device)
+            with torch.autocast(device_type=self.device_type, enabled=True):
                 with torch.no_grad():
                     out1 = self.model_shape_invariant(input)
                     out2 = self.model_square(input)
@@ -36,9 +54,9 @@ class TestViTGiant(unittest.TestCase):
 
     def test_square_inputs_with_mask(self):
         for i in range(self.total_iters):
-            input = torch.rand(1, 3, 16, 256, 256).cuda()
-            mask = torch.randint(0, 2, (1, 2048)).cuda()
-            with torch.cuda.amp.autocast(enabled=True):
+            input = torch.rand(1, 3, 16, 256, 256).to(self.device)
+            mask = torch.randint(0, 2, (1, 2048)).to(self.device)
+            with torch.autocast(device_type=self.device_type, enabled=True):
                 with torch.no_grad():
                     out1 = self.model_shape_invariant(input, masks=mask)
                     out2 = self.model_square(input, masks=mask)
@@ -48,7 +66,7 @@ class TestViTGiant(unittest.TestCase):
         for i in range(self.total_iters):
             rand_width = np.random.randint(256, 512)
             rand_height = np.random.randint(256, 512)
-            input = torch.rand(1, 3, 16, rand_height, rand_width).cuda()
+            input = torch.rand(1, 3, 16, rand_height, rand_width).to(self.device)
             # Since input is interpolated, output won't be exactly the same
             input_resized_to_square = [
                 torch.nn.functional.interpolate(input[:, :, frame_idx], size=256, mode="bicubic")
@@ -56,7 +74,7 @@ class TestViTGiant(unittest.TestCase):
             ]
             input_resized_to_square = torch.stack(input_resized_to_square, dim=2)
 
-            with torch.cuda.amp.autocast(enabled=True):
+            with torch.autocast(device_type=self.device_type, enabled=True):
                 with torch.no_grad():
                     out1 = self.model_shape_invariant(input).mean(dim=1)
                     out2 = self.model_square(input_resized_to_square).mean(dim=1)

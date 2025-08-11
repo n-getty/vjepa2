@@ -4,17 +4,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
-
-# -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
-try:
-    # -- WARNING: IF DOING DISTRIBUTED TRAINING ON A NON-SLURM CLUSTER, MAKE
-    # --          SURE TO UPDATE THIS TO GET LOCAL-RANK ON NODE, OR ENSURE
-    # --          THAT YOUR JOBS ARE LAUNCHED WITH ONLY 1 DEVICE VISIBLE
-    # --          TO EACH PROCESS
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
-except Exception:
-    pass
-
 import logging
 import pprint
 import random
@@ -42,7 +31,8 @@ _GLOBAL_SEED = 0
 random.seed(_GLOBAL_SEED)
 np.random.seed(_GLOBAL_SEED)
 torch.manual_seed(_GLOBAL_SEED)
-torch.cuda.manual_seed(_GLOBAL_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(_GLOBAL_SEED)
 torch.backends.cudnn.benchmark = True
 
 
@@ -132,11 +122,28 @@ def main(args_eval, resume_preempt=False):
     except Exception:
         pass
 
-    if not torch.cuda.is_available():
-        device = torch.device("cpu")
+    device = args_eval.get("device")
+    device_type = args_eval.get("device_type")
+
+    # -- set device
+    if device_type == "cuda":
+        if not torch.cuda.is_available():
+            device = torch.device("cpu")
+        else:
+            device = torch.device(device)
+            torch.cuda.set_device(device)
+    elif device_type == "xpu":
+        try:
+            import intel_extension_for_pytorch as ipex
+            if not ipex.xpu.is_available():
+                device = torch.device("cpu")
+            else:
+                device = torch.device(device)
+                ipex.xpu.set_device(device)
+        except ImportError:
+            device = torch.device("cpu")
     else:
-        device = torch.device("cuda:0")
-        torch.cuda.set_device(device)
+        device = torch.device("cpu")
 
     world_size, rank = init_distributed()
     logger.info(f"Initialized (rank/world-size) {rank}/{world_size}")
@@ -283,6 +290,7 @@ def main(args_eval, resume_preempt=False):
         iterations_per_epoch=ipe,
         num_epochs=num_epochs,
         use_bfloat16=use_bfloat16,
+        device_type=device_type,
     )
     classifiers = [DistributedDataParallel(c, static_graph=True) for c in classifiers]
 
@@ -479,7 +487,7 @@ def train_one_epoch(
         [s.step() for s in scheduler]
         [wds.step() for wds in wd_scheduler]
 
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_bfloat16):
 
             # Format of udata: ("video", "verb", "noun", "anticipation_time_sec")
             clips = udata[0].to(device)
@@ -550,7 +558,7 @@ def train_one_epoch(
                         max([a["recall"] for a in action_metrics]),
                         max([v["recall"] for v in verb_metrics]),
                         max([n["recall"] for n in noun_metrics]),
-                        torch.cuda.max_memory_allocated() / 1024.0**2,
+                        (torch.cuda.max_memory_allocated() if device_type == 'cuda' else torch.xpu.max_memory_allocated()) / 1024.0**2,
                         data_elapsed_time_meter.avg,
                     )
                 )
@@ -626,7 +634,7 @@ def validate(
             _data_loader = iter(data_loader)
             udata = next(_data_loader)
 
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_bfloat16):
             # Format of udata: ("video", "verb", "noun", "anticipation_time_sec")
             clips = udata[0].to(device)
             anticipation_times = udata[-1].to(device)  # [B]
@@ -683,7 +691,7 @@ def validate(
                         loss,
                         verb_loss,
                         noun_loss,
-                        torch.cuda.max_memory_allocated() / 1024.0**2,
+                        (torch.cuda.max_memory_allocated() if device_type == 'cuda' else torch.xpu.max_memory_allocated()) / 1024.0**2,
                     )
                 )
             else:

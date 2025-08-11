@@ -390,6 +390,61 @@ python -m app.main_distributed \
   --account my_account --qos=my_qos
 ```
 
+### Running on Intel XPU
+
+This project has been updated to support training on Intel XPU devices using `intel_extension_for_pytorch`.
+
+#### Setup
+
+1.  **Install base dependencies:**
+    ```
+    pip install -r requirements.txt
+    ```
+
+2.  **Install XPU-specific dependencies:**
+    ```
+    pip install -r requirements-xpu.txt
+    ```
+
+#### Testing the XPU Setup
+
+A test script `test_xpu.py` is provided to verify that the environment is set up correctly for XPU training. This script will install dependencies, check for available XPU devices, and run a short test training.
+
+```
+python test_xpu.py
+```
+
+#### Single-node training on XPU
+
+To run a single-node training on one or more XPU devices, use the `app/main.py` script.
+
+```
+python -m app.main \
+  --fname configs/train/vitl16/pretrain-256px-16f.yaml \
+  --device_type xpu \
+  --devices xpu:0 xpu:1
+```
+
+#### Distributed training on XPU with MPI
+
+For distributed training across multiple nodes, you can use `mpirun`. The following is an example of how to launch a training run on 2 nodes with 2 devices each.
+
+First, create a hostfile (e.g., `hostfile.txt`) with the hostnames of your nodes:
+```
+node1.example.com
+node2.example.com
+```
+
+Then, launch the training using `mpirun`:
+```
+mpirun -np 4 -ppn 2 -f hostfile.txt \
+  python -m app.main \
+    --fname configs/train/vitl16/pretrain-256px-16f.yaml \
+    --device_type xpu \
+    --devices xpu:0 xpu:1
+```
+Note that the `--devices` argument in this case will be used by each process on each node to select the local devices. The distributed setup is handled by `mpi4py` and `oneccl`.
+
 
 ## Code Structure
 

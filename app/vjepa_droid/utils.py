@@ -211,6 +211,7 @@ def init_opt(
     eps=1e-8,
     zero_init_bias_wd=True,
     enc_lr_scale=1.0,
+    device_type='cuda',
 ):
     param_groups = [
         {
@@ -249,5 +250,14 @@ def init_opt(
         final_wd=final_wd,
         T_max=int(num_epochs * iterations_per_epoch),
     )
-    scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
+    scaler = None
+    if mixed_precision:
+        if device_type == 'cuda':
+            scaler = torch.cuda.amp.GradScaler()
+        elif device_type == 'xpu':
+            try:
+                import intel_extension_for_pytorch as ipex
+                scaler = ipex.xpu.amp.GradScaler()
+            except ImportError:
+                logger.warning("IPEX not found, GradScaler not available for XPU.")
     return optimizer, scaler, scheduler, wd_scheduler

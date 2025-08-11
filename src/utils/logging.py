@@ -11,21 +11,38 @@ import sys
 import torch
 
 
-def gpu_timer(closure, log_timings=True):
+def gpu_timer(closure, log_timings=True, device_type='cuda'):
     """Helper to time gpu-time to execute closure()"""
-    log_timings = log_timings and torch.cuda.is_available()
+    if device_type == 'cuda':
+        log_timings = log_timings and torch.cuda.is_available()
+    elif device_type == 'xpu':
+        try:
+            import intel_extension_for_pytorch as ipex
+            log_timings = log_timings and ipex.xpu.is_available()
+        except ImportError:
+            log_timings = False
+    else:
+        log_timings = False
 
     elapsed_time = -1.0
     if log_timings:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
+        if device_type == 'cuda':
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+        else: # xpu
+            start = torch.xpu.Event(enable_timing=True)
+            end = torch.xpu.Event(enable_timing=True)
+            start.record()
 
     result = closure()
 
     if log_timings:
         end.record()
-        torch.cuda.synchronize()
+        if device_type == 'cuda':
+            torch.cuda.synchronize()
+        else: # xpu
+            torch.xpu.synchronize()
         elapsed_time = start.elapsed_time(end)
 
     return result, elapsed_time

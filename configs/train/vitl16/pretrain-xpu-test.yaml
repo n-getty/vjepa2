@@ -1,0 +1,76 @@
+app: vjepa
+nodes: 1
+tasks_per_node: 1
+cpus_per_task: 12
+mem_per_gpu: 32G
+folder: /tmp/vjepa2-xpu-test
+data:
+  dataset_type: VideoDataset
+  datasets:
+  - dummy_video_paths.csv
+  batch_size: 2
+  crop_size: 224
+  patch_size: 16
+  dataset_fpcs:
+  - 16
+  tubelet_size: 2
+  fps: 4
+  num_workers: 1
+  persistent_workers: false
+  pin_mem: false
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+loss:
+  loss_exp: 1.0
+mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 4
+  spatial_scale:
+  - 0.15
+  - 0.15
+  temporal_scale:
+  - 1.0
+  - 1.0
+meta:
+  dtype: float32
+  eval_freq: 10
+  load_checkpoint: false
+  save_every_freq: -1
+  seed: 42
+  use_sdpa: false
+model:
+  model_name: vit_small
+  pred_depth: 6
+  pred_embed_dim: 192
+  pred_num_heads: 6
+  uniform_power: true
+  use_activation_checkpointing: false
+  use_mask_tokens: true
+  use_rope: true
+  zero_init_mask_tokens: true
+optimization:
+  ema:
+  - 0.99
+  - 0.99
+  epochs: 1
+  final_lr: 0.0001
+  final_weight_decay: 0.04
+  ipe: 10
+  ipe_scale: 1.0
+  lr: 0.0001
+  start_lr: 0.0001
+  warmup: 1
+  weight_decay: 0.04

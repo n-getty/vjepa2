@@ -4,17 +4,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
-
-# -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
-try:
-    # -- WARNING: IF DOING DISTRIBUTED TRAINING ON A NON-SLURM CLUSTER, MAKE
-    # --          SURE TO UPDATE THIS TO GET LOCAL-RANK ON NODE, OR ENSURE
-    # --          THAT YOUR JOBS ARE LAUNCHED WITH ONLY 1 DEVICE VISIBLE
-    # --          TO EACH PROCESS
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
-except Exception:
-    pass
-
 import logging
 import math
 import pprint
@@ -113,11 +102,28 @@ def main(args_eval, resume_preempt=False):
     except Exception:
         pass
 
-    if not torch.cuda.is_available():
-        device = torch.device("cpu")
+    device = args_eval.get("device")
+    device_type = args_eval.get("device_type")
+
+    # -- set device
+    if device_type == "cuda":
+        if not torch.cuda.is_available():
+            device = torch.device("cpu")
+        else:
+            device = torch.device(device)
+            torch.cuda.set_device(device)
+    elif device_type == "xpu":
+        try:
+            import intel_extension_for_pytorch as ipex
+            if not ipex.xpu.is_available():
+                device = torch.device("cpu")
+            else:
+                device = torch.device(device)
+                ipex.xpu.set_device(device)
+        except ImportError:
+            device = torch.device("cpu")
     else:
-        device = torch.device("cuda:0")
-        torch.cuda.set_device(device)
+        device = torch.device("cpu")
 
     world_size, rank = init_distributed()
     logger.info(f"Initialized (rank/world-size) {rank}/{world_size}")
@@ -205,6 +211,7 @@ def main(args_eval, resume_preempt=False):
         iterations_per_epoch=ipe,
         num_epochs=num_epochs,
         use_bfloat16=use_bfloat16,
+        device_type=device_type,
     )
 
     # -- load training checkpoint
@@ -303,7 +310,7 @@ def run_one_epoch(
             [s.step() for s in scheduler]
             [wds.step() for wds in wd_scheduler]
 
-        with torch.cuda.amp.autocast(dtype=torch.float16, enabled=use_bfloat16):
+        with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=use_bfloat16):
             # Load data and put on GPU
             clips = [
                 [dij.to(device, non_blocking=True) for dij in di]  # iterate over spatial views of clip
@@ -349,7 +356,7 @@ def run_one_epoch(
                     _agg_top1.max(),
                     _agg_top1.mean(),
                     _agg_top1.min(),
-                    torch.cuda.max_memory_allocated() / 1024.0**2,
+                    (torch.cuda.max_memory_allocated() if device_type == 'cuda' else torch.xpu.max_memory_allocated()) / 1024.0**2,
                 )
             )
 
@@ -465,7 +472,7 @@ def make_dataloader(
     return data_loader, data_sampler
 
 
-def init_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs, use_bfloat16=False):
+def init_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs, use_bfloat16=False, device_type='cuda'):
     optimizers, schedulers, wd_schedulers, scalers = [], [], [], []
     for c, kwargs in zip(classifiers, opt_kwargs):
         param_groups = [
@@ -483,7 +490,19 @@ def init_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs, use_bflo
         optimizers += [torch.optim.AdamW(param_groups)]
         schedulers += [WarmupCosineLRSchedule(optimizers[-1], T_max=int(num_epochs * iterations_per_epoch))]
         wd_schedulers += [CosineWDSchedule(optimizers[-1], T_max=int(num_epochs * iterations_per_epoch))]
-        scalers += [torch.cuda.amp.GradScaler() if use_bfloat16 else None]
+
+        scaler = None
+        if use_bfloat16:
+            if device_type == 'cuda':
+                scaler = torch.cuda.amp.GradScaler()
+            elif device_type == 'xpu':
+                try:
+                    import intel_extension_for_pytorch as ipex
+                    scaler = ipex.xpu.amp.GradScaler()
+                except ImportError:
+                    logger.warning("IPEX not found, GradScaler not available for XPU.")
+        scalers.append(scaler)
+
     return optimizers, scalers, schedulers, wd_schedulers
 
 
