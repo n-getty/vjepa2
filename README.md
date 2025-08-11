@@ -394,21 +394,23 @@ python -m app.main_distributed \
 
 This project has been updated to support training on Intel XPU devices using `intel_extension_for_pytorch`.
 
-#### Setup
+#### Setup on Aurora
 
-1.  **Install base dependencies:**
+On the Aurora supercomputer, the necessary libraries for XPU support are provided through a module system. You do not need to install them via `pip`.
+
+1.  **Load the frameworks module:**
+    ```
+    module load frameworks
+    ```
+
+2.  **Install other dependencies:**
     ```
     pip install -r requirements.txt
     ```
 
-2.  **Install XPU-specific dependencies:**
-    ```
-    pip install -r requirements-xpu.txt
-    ```
-
 #### Testing the XPU Setup
 
-A test script `test_xpu.py` is provided to verify that the environment is set up correctly for XPU training. This script will install dependencies, check for available XPU devices, and run a short test training.
+A test script `test_xpu.py` is provided to verify that the environment is set up correctly for XPU training. This script will check for available XPU devices, set the recommended environment variables, and run a short distributed test using `mpirun` to ensure that `oneccl` is functioning correctly.
 
 ```
 python test_xpu.py

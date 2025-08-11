@@ -13,16 +13,7 @@ def run_command(command, env=None):
 
 def main():
     """Main function to run the XPU test."""
-    # 1. Install dependencies
-    print("Installing dependencies...")
-    if run_command("pip install -r requirements.txt") != 0:
-        print("Error installing base requirements.")
-        sys.exit(1)
-    if run_command("pip install -r requirements-xpu.txt") != 0:
-        print("Error installing XPU requirements.")
-        sys.exit(1)
-
-    # 2. Check for XPU device
+    # 1. Check for XPU device
     try:
         import torch
         import intel_extension_for_pytorch as ipex
@@ -32,13 +23,13 @@ def main():
         num_devices = ipex.xpu.device_count()
         print(f"Found {num_devices} XPU devices.")
     except ImportError:
-        print("Intel Extension for PyTorch not found. Skipping test.")
+        print("Intel Extension for PyTorch not found. Please ensure that the 'frameworks' module is loaded. Skipping test.")
         sys.exit(0)
     except Exception as e:
         print(f"An error occurred while checking for XPU devices: {e}")
         sys.exit(1)
 
-    # 3. Set environment variables for oneCCL
+    # 2. Set environment variables for oneCCL
     env = os.environ.copy()
     env.update({
         "CCL_PROCESS_LAUNCHER": "pmix",
@@ -53,7 +44,7 @@ def main():
         "CCL_KVS_USE_MPI_RANKS": "1",
     })
 
-    # 4. Run the oneCCL test
+    # 3. Run the oneCCL test
     print("Launching oneCCL test...")
     # Use all available devices for the test
     mpirun_command = f"mpirun -np {num_devices} python test_oneccl.py"
