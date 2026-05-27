@@ -7,17 +7,16 @@ import os
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
 try:
-    # -- WARNING: IF DOING DISTRIBUTED TRAINING ON A NON-SLURM CLUSTER, MAKE
-    # --          SURE TO UPDATE THIS TO GET LOCAL-RANK ON NODE, OR ENSURE
-    # --          THAT YOUR JOBS ARE LAUNCHED WITH ONLY 1 DEVICE VISIBLE
-    # --          TO EACH PROCESS
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
+    local_rank = os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID"))
+    if local_rank is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = local_rank
 except Exception:
     pass
 
 import logging
 import math
 import pprint
+import time
 
 import numpy as np
 import torch
@@ -27,6 +26,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from evals.video_classification_frozen.models import init_module
 from evals.video_classification_frozen.utils import make_transforms
+from src.datasets.backbone_feature_cache import make_backbone_feature_cache
 from src.datasets.data_manager import init_data
 from src.models.attentive_pooler import AttentiveClassifier
 from src.utils.checkpoint_loader import robust_checkpoint_loader
@@ -43,6 +43,40 @@ torch.manual_seed(_GLOBAL_SEED)
 torch.backends.cudnn.benchmark = True
 
 pp = pprint.PrettyPrinter(indent=4)
+
+
+def unwrap_module(module):
+    return module.module if isinstance(module, DistributedDataParallel) else module
+
+
+def is_main_process():
+    return (
+        (not torch.distributed.is_available())
+        or (not torch.distributed.is_initialized())
+        or torch.distributed.get_rank() == 0
+    )
+
+
+def maybe_sync(device, enabled):
+    if enabled and torch.cuda.is_available() and str(device).startswith("cuda"):
+        torch.cuda.synchronize(device)
+
+
+def adapt_state_dict_for_model(model, state_dict):
+    model_keys = list(model.state_dict().keys())
+    ckpt_keys = list(state_dict.keys())
+
+    if not model_keys or not ckpt_keys:
+        return state_dict
+
+    model_has_module_prefix = all(k.startswith("module.") for k in model_keys)
+    ckpt_has_module_prefix = all(k.startswith("module.") for k in ckpt_keys)
+
+    if ckpt_has_module_prefix and not model_has_module_prefix:
+        return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+    if model_has_module_prefix and not ckpt_has_module_prefix:
+        return {f"module.{k}": v for k, v in state_dict.items()}
+    return state_dict
 
 
 def main(args_eval, resume_preempt=False):
@@ -82,6 +116,10 @@ def main(args_eval, resume_preempt=False):
     num_classes = args_data.get("num_classes")
     train_data_path = [args_data.get("dataset_train")]
     val_data_path = [args_data.get("dataset_val")]
+    train_cache_root = args_data.get("train_cache_root", None)
+    val_cache_root = args_data.get("val_cache_root", None)
+    cache_num_workers = args_data.get("cache_num_workers", 1)
+    cache_require_complete = args_data.get("cache_require_complete", True)
     resolution = args_data.get("resolution", 224)
     num_segments = args_data.get("num_segments", 1)
     frames_per_clip = args_data.get("frames_per_clip", 16)
@@ -95,6 +133,10 @@ def main(args_eval, resume_preempt=False):
     batch_size = args_opt.get("batch_size")
     num_epochs = args_opt.get("num_epochs")
     use_bfloat16 = args_opt.get("use_bfloat16")
+    profile_timing = args_opt.get("profile_timing", False)
+    profile_log_interval = args_opt.get("profile_log_interval", 10)
+    profile_warmup_iters = args_opt.get("profile_warmup_iters", 5)
+    profile_cuda_sync = args_opt.get("profile_cuda_sync", True)
     opt_kwargs = [
         dict(
             ref_wd=kwargs.get("weight_decay"),
@@ -133,7 +175,14 @@ def main(args_eval, resume_preempt=False):
 
     # -- make csv_logger
     if rank == 0:
-        csv_logger = CSVLogger(log_file, ("%d", "epoch"), ("%.5f", "train_acc"), ("%.5f", "val_acc"))
+        csv_logger = CSVLogger(
+            log_file,
+            ("%d", "epoch"),
+            ("%.5f", "train_loss"),
+            ("%.5f", "train_acc"),
+            ("%.5f", "val_loss"),
+            ("%.5f", "val_acc"),
+        )
 
     # Initialize model
 
@@ -158,10 +207,15 @@ def main(args_eval, resume_preempt=False):
         ).to(device)
         for _ in opt_kwargs
     ]
-    classifiers = [DistributedDataParallel(c, static_graph=True) for c in classifiers]
+    use_ddp = world_size > 1 and torch.distributed.is_available() and torch.distributed.is_initialized()
+    if use_ddp:
+        classifiers = [DistributedDataParallel(c, static_graph=True) for c in classifiers]
+        logger.info("Using DistributedDataParallel for probe classifiers")
+    else:
+        logger.info("Running probe classifiers without DistributedDataParallel")
     print(classifiers[0])
 
-    train_loader, train_sampler = make_dataloader(
+    train_loader, train_sampler, train_uses_cached_features = make_probe_dataloader(
         dataset_type=dataset_type,
         root_path=train_data_path,
         img_size=resolution,
@@ -177,8 +231,11 @@ def main(args_eval, resume_preempt=False):
         training=True,
         num_workers=num_workers,
         normalization=normalization,
+        cache_root=train_cache_root,
+        cache_num_workers=cache_num_workers,
+        cache_require_complete=cache_require_complete,
     )
-    val_loader, _ = make_dataloader(
+    val_loader, _, val_uses_cached_features = make_probe_dataloader(
         dataset_type=dataset_type,
         root_path=val_data_path,
         img_size=resolution,
@@ -194,9 +251,14 @@ def main(args_eval, resume_preempt=False):
         training=False,
         num_workers=num_workers,
         normalization=normalization,
+        cache_root=val_cache_root,
+        cache_num_workers=cache_num_workers,
+        cache_require_complete=cache_require_complete,
     )
     ipe = len(train_loader)
     logger.info(f"Dataloader created... iterations per epoch: {ipe}")
+    logger.info(f"Offline train cache enabled: {train_uses_cached_features}")
+    logger.info(f"Offline val cache enabled: {val_uses_cached_features}")
 
     # -- optimizer and scheduler
     optimizer, scaler, scheduler, wd_scheduler = init_opt(
@@ -223,7 +285,7 @@ def main(args_eval, resume_preempt=False):
             [wds.step() for wds in wd_scheduler]
 
     def save_checkpoint(epoch):
-        all_classifier_dicts = [c.state_dict() for c in classifiers]
+        all_classifier_dicts = [unwrap_module(c).state_dict() for c in classifiers]
         all_opt_dicts = [o.state_dict() for o in optimizer]
 
         save_dict = {
@@ -243,8 +305,9 @@ def main(args_eval, resume_preempt=False):
         train_sampler.set_epoch(epoch)
         if val_only:
             train_acc = -1.0
+            train_loss = -1.0
         else:
-            train_acc = run_one_epoch(
+            train_acc, train_loss = run_one_epoch(
                 device=device,
                 training=True,
                 encoder=encoder,
@@ -255,9 +318,14 @@ def main(args_eval, resume_preempt=False):
                 wd_scheduler=wd_scheduler,
                 data_loader=train_loader,
                 use_bfloat16=use_bfloat16,
+                use_cached_features=train_uses_cached_features,
+                profile_timing=profile_timing,
+                profile_log_interval=profile_log_interval,
+                profile_warmup_iters=profile_warmup_iters,
+                profile_cuda_sync=profile_cuda_sync,
             )
 
-        val_acc = run_one_epoch(
+        val_acc, val_loss = run_one_epoch(
             device=device,
             training=False,
             encoder=encoder,
@@ -268,11 +336,19 @@ def main(args_eval, resume_preempt=False):
             wd_scheduler=wd_scheduler,
             data_loader=val_loader,
             use_bfloat16=use_bfloat16,
+            use_cached_features=val_uses_cached_features,
+            profile_timing=profile_timing,
+            profile_log_interval=profile_log_interval,
+            profile_warmup_iters=profile_warmup_iters,
+            profile_cuda_sync=profile_cuda_sync,
         )
 
-        logger.info("[%5d] train: %.3f%% test: %.3f%%" % (epoch + 1, train_acc, val_acc))
+        logger.info(
+            "[%5d] train: %.3f%% (loss: %.3f) test: %.3f%% (loss: %.3f)"
+            % (epoch + 1, train_acc, train_loss, val_acc, val_loss)
+        )
         if rank == 0:
-            csv_logger.log(epoch + 1, train_acc, val_acc)
+            csv_logger.log(epoch + 1, train_loss, train_acc, val_loss, val_acc)
 
         if val_only:
             return
@@ -291,6 +367,11 @@ def run_one_epoch(
     wd_scheduler,
     data_loader,
     use_bfloat16,
+    use_cached_features=False,
+    profile_timing=False,
+    profile_log_interval=10,
+    profile_warmup_iters=5,
+    profile_cuda_sync=True,
 ):
 
     for c in classifiers:
@@ -298,29 +379,68 @@ def run_one_epoch(
 
     criterion = torch.nn.CrossEntropyLoss()
     top1_meters = [AverageMeter() for _ in classifiers]
+    loss_meters = [AverageMeter() for _ in classifiers]
+    timing_meters = {
+        "data": AverageMeter(),
+        "transfer": AverageMeter(),
+        "encoder": AverageMeter(),
+        "head": AverageMeter(),
+        "loss": AverageMeter(),
+        "backward": AverageMeter(),
+        "total": AverageMeter(),
+    }
+    prev_iter_end_time = time.perf_counter()
     for itr, data in enumerate(data_loader):
+        iter_start_time = time.perf_counter()
+        data_wait_time = iter_start_time - prev_iter_end_time
+        timed_iteration = profile_timing and itr >= profile_warmup_iters
+
         if training:
             [s.step() for s in scheduler]
             [wds.step() for wds in wd_scheduler]
 
+        maybe_sync(device, timed_iteration and profile_cuda_sync)
+        transfer_start_time = time.perf_counter()
         with torch.cuda.amp.autocast(dtype=torch.float16, enabled=use_bfloat16):
-            # Load data and put on GPU
-            clips = [
-                [dij.to(device, non_blocking=True) for dij in di]  # iterate over spatial views of clip
-                for di in data[0]  # iterate over temporal index of clip
-            ]
-            clip_indices = [d.to(device, non_blocking=True) for d in data[2]]
+            if use_cached_features:
+                features = data[0].to(device, non_blocking=True)
+                clips = None
+                clip_indices = None
+            else:
+                clips = [
+                    [dij.to(device, non_blocking=True) for dij in di]
+                    for di in data[0]
+                ]
+                clip_indices = [d.to(device, non_blocking=True) for d in data[2]]
             labels = data[1].to(device)
             batch_size = len(labels)
+        maybe_sync(device, timed_iteration and profile_cuda_sync)
+        transfer_time = time.perf_counter() - transfer_start_time
 
-            # Forward and prediction
-            with torch.no_grad():
-                outputs = encoder(clips, clip_indices)
-                if not training:
-                    outputs = [[c(o) for o in outputs] for c in classifiers]
+        if use_cached_features:
+            outputs = [features[:, view_idx] for view_idx in range(features.shape[1])]
+            encoder_time = 0.0
+        else:
+            maybe_sync(device, timed_iteration and profile_cuda_sync)
+            encoder_start_time = time.perf_counter()
+            with torch.cuda.amp.autocast(dtype=torch.float16, enabled=use_bfloat16):
+                with torch.no_grad():
+                    outputs = encoder(clips, clip_indices)
+            maybe_sync(device, timed_iteration and profile_cuda_sync)
+            encoder_time = time.perf_counter() - encoder_start_time
+
+        maybe_sync(device, timed_iteration and profile_cuda_sync)
+        head_start_time = time.perf_counter()
+        with torch.cuda.amp.autocast(dtype=torch.float16, enabled=use_bfloat16):
+            if not training:
+                outputs = [[c(o) for o in outputs] for c in classifiers]
             if training:
                 outputs = [[c(o) for o in outputs] for c in classifiers]
+        maybe_sync(device, timed_iteration and profile_cuda_sync)
+        head_time = time.perf_counter() - head_start_time
 
+        maybe_sync(device, timed_iteration and profile_cuda_sync)
+        loss_start_time = time.perf_counter()
         # Compute loss
         losses = [[criterion(o, labels) for o in coutputs] for coutputs in outputs]
         with torch.no_grad():
@@ -329,8 +449,16 @@ def run_one_epoch(
             top1_accs = [float(AllReduce.apply(t1a)) for t1a in top1_accs]
             for t1m, t1a in zip(top1_meters, top1_accs):
                 t1m.update(t1a)
+            loss_vals = [sum([float(AllReduce.apply(lij)) for lij in li]) / len(li) for li in losses]
+            for lm, lv in zip(loss_meters, loss_vals):
+                lm.update(lv)
+        maybe_sync(device, timed_iteration and profile_cuda_sync)
+        loss_time = time.perf_counter() - loss_start_time
 
+        backward_time = 0.0
         if training:
+            maybe_sync(device, timed_iteration and profile_cuda_sync)
+            backward_start_time = time.perf_counter()
             if use_bfloat16:
                 [[s.scale(lij).backward() for lij in li] for s, li in zip(scaler, losses)]
                 [s.step(o) for s, o in zip(scaler, optimizer)]
@@ -339,21 +467,64 @@ def run_one_epoch(
                 [[lij.backward() for lij in li] for li in losses]
                 [o.step() for o in optimizer]
             [o.zero_grad() for o in optimizer]
+            maybe_sync(device, timed_iteration and profile_cuda_sync)
+            backward_time = time.perf_counter() - backward_start_time
+
+        iter_total_time = time.perf_counter() - iter_start_time
+
+        if timed_iteration:
+            timing_meters["data"].update(data_wait_time)
+            timing_meters["transfer"].update(transfer_time)
+            timing_meters["encoder"].update(encoder_time)
+            timing_meters["head"].update(head_time)
+            timing_meters["loss"].update(loss_time)
+            timing_meters["backward"].update(backward_time)
+            timing_meters["total"].update(iter_total_time)
 
         _agg_top1 = np.array([t1m.avg for t1m in top1_meters])
+        _agg_loss = np.array([lm.avg for lm in loss_meters])
         if itr % 10 == 0:
             logger.info(
-                "[%5d] %.3f%% [%.3f%% %.3f%%] [mem: %.2e]"
+                "[%5d] %.3f%% [%.3f%% %.3f%%] loss: %.3f [mem: %.2e]"
                 % (
                     itr,
                     _agg_top1.max(),
                     _agg_top1.mean(),
                     _agg_top1.min(),
+                    _agg_loss.max(),
                     torch.cuda.max_memory_allocated() / 1024.0**2,
                 )
             )
+        if profile_timing and timed_iteration and (itr % profile_log_interval == 0) and is_main_process():
+            total_avg = max(timing_meters["total"].avg, 1e-9)
+            logger.info(
+                (
+                    "TIMING[%5d][%s] data=%.3fs (%.1f%%) h2d=%.3fs (%.1f%%) "
+                    "encoder=%.3fs (%.1f%%) head=%.3fs (%.1f%%) loss=%.3fs (%.1f%%) "
+                    "backward=%.3fs (%.1f%%) total=%.3fs"
+                )
+                % (
+                    itr,
+                    "train" if training else "val",
+                    timing_meters["data"].avg,
+                    100.0 * timing_meters["data"].avg / total_avg,
+                    timing_meters["transfer"].avg,
+                    100.0 * timing_meters["transfer"].avg / total_avg,
+                    timing_meters["encoder"].avg,
+                    100.0 * timing_meters["encoder"].avg / total_avg,
+                    timing_meters["head"].avg,
+                    100.0 * timing_meters["head"].avg / total_avg,
+                    timing_meters["loss"].avg,
+                    100.0 * timing_meters["loss"].avg / total_avg,
+                    timing_meters["backward"].avg,
+                    100.0 * timing_meters["backward"].avg / total_avg,
+                    timing_meters["total"].avg,
+                )
+            )
 
-    return _agg_top1.max()
+        prev_iter_end_time = time.perf_counter()
+
+    return _agg_top1.max(), _agg_loss.max()
 
 
 def load_checkpoint(device, r_path, classifiers, opt, scaler, val_only=False):
@@ -362,7 +533,10 @@ def load_checkpoint(device, r_path, classifiers, opt, scaler, val_only=False):
 
     # -- loading encoder
     pretrained_dict = checkpoint["classifiers"]
-    msg = [c.load_state_dict(pd) for c, pd in zip(classifiers, pretrained_dict)]
+    msg = [
+        c.load_state_dict(adapt_state_dict_for_model(c, pd))
+        for c, pd in zip(classifiers, pretrained_dict)
+    ]
 
     if val_only:
         logger.info(f"loaded pretrained classifier from epoch with msg: {msg}")
@@ -463,6 +637,60 @@ def make_dataloader(
         subset_file=subset_file,
     )
     return data_loader, data_sampler
+
+
+def make_probe_dataloader(
+    root_path,
+    batch_size,
+    world_size,
+    rank,
+    dataset_type="VideoDataset",
+    img_size=224,
+    frames_per_clip=16,
+    frame_step=4,
+    num_segments=8,
+    eval_duration=None,
+    num_views_per_segment=1,
+    allow_segment_overlap=True,
+    training=False,
+    num_workers=12,
+    normalization=None,
+    cache_root=None,
+    cache_num_workers=1,
+    cache_require_complete=True,
+):
+    if cache_root is not None:
+        _, data_loader, data_sampler = make_backbone_feature_cache(
+            cache_root=cache_root,
+            batch_size=batch_size,
+            training=training,
+            rank=rank,
+            world_size=world_size,
+            num_workers=cache_num_workers,
+            pin_mem=True,
+            persistent_workers=True,
+            require_complete_export=cache_require_complete,
+        )
+        return data_loader, data_sampler, True
+
+    data_loader, data_sampler = make_dataloader(
+        root_path=root_path,
+        batch_size=batch_size,
+        world_size=world_size,
+        rank=rank,
+        dataset_type=dataset_type,
+        img_size=img_size,
+        frames_per_clip=frames_per_clip,
+        frame_step=frame_step,
+        num_segments=num_segments,
+        eval_duration=eval_duration,
+        num_views_per_segment=num_views_per_segment,
+        allow_segment_overlap=allow_segment_overlap,
+        training=training,
+        num_workers=num_workers,
+        normalization=normalization,
+    )
+    return data_loader, data_sampler, False
 
 
 def init_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs, use_bfloat16=False):

@@ -21,6 +21,7 @@ class ImageNet(torchvision.datasets.ImageFolder):
     def __init__(
         self,
         root,
+        image_folder="imagenet_full_size/061417/",
         tar_file="imagenet_full_size-061417.tar.gz",
         transform=None,
         train=True,
@@ -34,14 +35,16 @@ class ImageNet(torchvision.datasets.ImageFolder):
         Dataset wrapper
 
         :param root: root network directory for ImageNet data
+        :param image_folder: path to images inside root network directory
         :param tar_file: zipped image_folder inside root network directory
         :param train: whether to load train data (or validation)
         :param job_id: scheduler job-id used to create dir on local machine
         :param index_targets: whether to index the id of each labeled image
         """
 
+        image_folder = image_folder or "imagenet_full_size/061417/"
         suffix = "train/" if train else "val/"
-        data_path = os.path.join(root, suffix)
+        data_path = os.path.join(root, image_folder, suffix)
         logger.info(f"data-path {data_path}")
 
         super(ImageNet, self).__init__(root=data_path, transform=transform)
@@ -118,6 +121,7 @@ def make_imagenet1k(
     world_size=1,
     rank=0,
     root_path=None,
+    image_folder=None,
     training=True,
     drop_last=True,
     persistent_workers=False,
@@ -125,6 +129,7 @@ def make_imagenet1k(
 ):
     dataset = ImageNet(
         root=root_path,
+        image_folder=image_folder,
         transform=transform,
         train=training,
         index_targets=False,

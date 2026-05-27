@@ -3,6 +3,11 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# decord registers CPU dispatchers via a legacy path that conflicts with
+# numpy when imported after it. Force decord to load first so its dispatcher
+# wins. Also runs in mp.spawn workers because Python re-imports this module.
+import decord  # noqa: F401  -- MUST stay first
+
 import argparse
 import multiprocessing as mp
 import os

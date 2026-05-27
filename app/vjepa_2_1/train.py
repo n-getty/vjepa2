@@ -28,13 +28,14 @@ from app.vjepa_2_1.utils import (
     init_opt,
     init_video_model,
     load_checkpoint,
+    load_pretrained,
     normalize_nested,
 )
 from src.datasets.data_manager import init_data
 from src.masks.multiseq_multiblock3d import MaskCollator
 from src.masks.utils import apply_masks
 from src.utils.distributed import init_distributed
-from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
+from src.utils.logging import AverageMeter, CSVLogger, PhaseTimer, get_logger, gpu_timer
 from torch.nn.parallel import DistributedDataParallel
 
 
@@ -64,6 +65,10 @@ def main(args, resume_preempt=False):
     cfgs_meta = args.get("meta")
     load_model = cfgs_meta.get("load_checkpoint") or resume_preempt
     r_file = cfgs_meta.get("read_checkpoint", None)
+    p_file = cfgs_meta.get("pretrain_checkpoint", None)
+    load_predictor = cfgs_meta.get("load_predictor", True)
+    context_encoder_key = cfgs_meta.get("context_encoder_key", "encoder")
+    target_encoder_key = cfgs_meta.get("target_encoder_key", "target_encoder")
     seed = cfgs_meta.get("seed", _GLOBAL_SEED)
     save_every_freq = cfgs_meta.get("save_every_freq", -1)
     skip_batches = cfgs_meta.get("skip_batches", -1)
@@ -323,6 +328,11 @@ def main(args, resume_preempt=False):
         ("%d", "iter-time(ms)"),
         ("%d", "gpu-time(ms)"),
         ("%d", "dataload-time(ms)"),
+        ("%.2f", "fwd-target-ms"),
+        ("%.2f", "fwd-context-ms"),
+        ("%.2f", "backward-ms"),
+        ("%.2f", "opt-step-ms"),
+        ("%.2f", "ema-ms"),
     )
 
     # -- init model
@@ -443,6 +453,18 @@ def main(args, resume_preempt=False):
     target_encoder = DistributedDataParallel(target_encoder)
     for p in target_encoder.parameters():
         p.requires_grad = False
+
+    if p_file:
+        encoder, predictor, target_encoder = load_pretrained(
+            r_path=p_file,
+            encoder=encoder,
+            predictor=predictor,
+            target_encoder=target_encoder,
+            context_encoder_key=context_encoder_key,
+            target_encoder_key=target_encoder_key,
+            load_predictor=load_predictor,
+            load_encoder=True,
+        )
 
     # -- momentum schedule
     momentum_scheduler = (
@@ -584,9 +606,12 @@ def main(args, resume_preempt=False):
                 logger.info("Running garbage collection...")
                 gc.collect()
 
+            phase_timer = PhaseTimer(enabled=True)
+
             def train_step():
                 _new_lr = scheduler.step()
                 _new_wd = wd_scheduler.step()
+                phase_timer.mark("start")
 
                 def forward_target(c, embed_dim=embed_dim_encoder):
                     with torch.no_grad():
@@ -677,6 +702,7 @@ def main(args, resume_preempt=False):
                 # Step 1. Forward
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
                     h = forward_target(clips)
+                    phase_timer.mark("fwd_target_done")
                     z_pred, z_context = forward_context(clips)
                     loss = 0
                     loss_pred = loss_fn(
@@ -702,6 +728,8 @@ def main(args, resume_preempt=False):
                             lambda_value_step = lambda_value
                         loss += loss_context * lambda_value_step
 
+                phase_timer.mark("fwd_context_done")
+
                 # Step 2. Backward & step
                 run_step = True
                 if loss_reg_std_mult is not None:
@@ -726,12 +754,16 @@ def main(args, resume_preempt=False):
                         scaler.unscale_(optimizer)
                     else:
                         loss.backward()
+                    phase_timer.mark("backward_done")
                     if mixed_precision:
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         optimizer.step()
+                else:
+                    phase_timer.mark("backward_done")
                 optimizer.zero_grad()
+                phase_timer.mark("opt_step_done")
 
                 # Step 3. momentum update of target encoder
                 m = min(next(momentum_scheduler), ema[1])
@@ -745,6 +777,7 @@ def main(args, resume_preempt=False):
                         params_q.append(param_q)
                     torch._foreach_mul_(params_k, m)
                     torch._foreach_add_(params_k, params_q, alpha=1 - m)
+                phase_timer.mark("ema_done")
 
                 return (
                     float(loss),
@@ -760,6 +793,12 @@ def main(args, resume_preempt=False):
                 run_step,
             ), gpu_etime_ms = gpu_timer(train_step)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
+            phase_times = phase_timer.to_dict()
+            phase_fwd_target = phase_times.get("start->fwd_target_done", 0.0)
+            phase_fwd_context = phase_times.get("fwd_target_done->fwd_context_done", 0.0)
+            phase_backward = phase_times.get("fwd_context_done->backward_done", 0.0)
+            phase_opt_step = phase_times.get("backward_done->opt_step_done", 0.0)
+            phase_ema = phase_times.get("opt_step_done->ema_done", 0.0)
             loss_meter.update(loss)
             iter_time_meter.update(iter_elapsed_time_ms)
             gpu_time_meter.update(gpu_etime_ms)
@@ -786,6 +825,11 @@ def main(args, resume_preempt=False):
                     iter_elapsed_time_ms,
                     gpu_etime_ms,
                     data_elapsed_time_ms,
+                    phase_fwd_target,
+                    phase_fwd_context,
+                    phase_backward,
+                    phase_opt_step,
+                    phase_ema,
                 )
                 if (
                     (itr % log_freq == 0)

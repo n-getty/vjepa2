@@ -31,6 +31,38 @@ def gpu_timer(closure, log_timings=True):
     return result, elapsed_time
 
 
+class PhaseTimer:
+    """Record CUDA-event-based elapsed-times around named phases of train_step.
+
+    Cheaper than torch.cuda.synchronize() at each phase boundary because we
+    enqueue events on the default stream and only sync once at the very end
+    (the outer gpu_timer call already does that). Returns a dict[name -> ms].
+    """
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled and torch.cuda.is_available()
+        self.events = []
+        self.names = []
+
+    def mark(self, name):
+        if not self.enabled:
+            return
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        self.events.append(ev)
+        self.names.append(name)
+
+    def to_dict(self):
+        if not self.enabled or len(self.events) < 2:
+            return {}
+        torch.cuda.synchronize()
+        out = {}
+        for i in range(len(self.events) - 1):
+            label = f"{self.names[i]}->{self.names[i+1]}"
+            out[label] = self.events[i].elapsed_time(self.events[i + 1])
+        return out
+
+
 LOG_FORMAT = "[%(levelname)-8s][%(asctime)s][%(name)-20s][%(funcName)-25s] %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 

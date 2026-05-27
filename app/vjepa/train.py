@@ -27,11 +27,11 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
 from app.vjepa.transforms import make_transforms
-from app.vjepa.utils import init_opt, init_video_model, load_checkpoint
+from app.vjepa.utils import checkpoint_state_dict, init_opt, init_video_model, load_checkpoint, load_pretrained
 from src.datasets.data_manager import init_data
 from src.masks.multiseq_multiblock3d import MaskCollator
 from src.masks.utils import apply_masks
-from src.utils.distributed import init_distributed
+from src.utils.distributed import init_distributed, is_dist_initialized
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
 
 # --
@@ -61,6 +61,10 @@ def main(args, resume_preempt=False):
     cfgs_meta = args.get("meta")
     load_model = cfgs_meta.get("load_checkpoint") or resume_preempt
     r_file = cfgs_meta.get("read_checkpoint", None)
+    p_file = cfgs_meta.get("pretrain_checkpoint", None)
+    load_predictor = cfgs_meta.get("load_predictor", True)
+    context_encoder_key = cfgs_meta.get("context_encoder_key", "encoder")
+    target_encoder_key = cfgs_meta.get("target_encoder_key", "target_encoder")
     seed = cfgs_meta.get("seed", _GLOBAL_SEED)
     save_every_freq = cfgs_meta.get("save_every_freq", -1)
     skip_batches = cfgs_meta.get("skip_batches", -1)
@@ -114,6 +118,7 @@ def main(args, resume_preempt=False):
     pin_mem = cfgs_data.get("pin_mem", False)
     num_workers = cfgs_data.get("num_workers", 1)
     persistent_workers = cfgs_data.get("persistent_workers", True)
+    filter_long_videos = cfgs_data.get("filter_long_videos", int(1e9))
 
     # -- DATA AUGS
     cfgs_data_aug = args.get("data_aug")
@@ -181,7 +186,7 @@ def main(args, resume_preempt=False):
                 load_path = anneal_ckpt
                 resume_anneal = False
         else:
-            load_path = r_file if r_file is not None else latest_path
+            load_path = os.path.join(folder, r_file) if r_file is not None else latest_path
         if not os.path.exists(load_path):
             load_path = None
             load_model = False
@@ -253,6 +258,7 @@ def main(args, resume_preempt=False):
         training=True,
         dataset_fpcs=dataset_fpcs,
         fps=fps,
+        filter_long_videos=filter_long_videos,
         transform=transform,
         rank=rank,
         world_size=world_size,
@@ -289,11 +295,30 @@ def main(args, resume_preempt=False):
         betas=betas,
         eps=eps,
     )
-    encoder = DistributedDataParallel(encoder, static_graph=True)
-    predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
-    target_encoder = DistributedDataParallel(target_encoder)
+    if is_dist_initialized():
+        encoder = DistributedDataParallel(encoder, static_graph=True)
+        predictor = DistributedDataParallel(
+            predictor,
+            static_graph=False,
+            find_unused_parameters=True,
+        )
+        target_encoder = DistributedDataParallel(target_encoder)
+    else:
+        logger.info("Distributed process group not initialized; running without DistributedDataParallel")
     for p in target_encoder.parameters():
         p.requires_grad = False
+
+    if p_file:
+        encoder, predictor, target_encoder = load_pretrained(
+            r_path=p_file,
+            encoder=encoder,
+            predictor=predictor,
+            target_encoder=target_encoder,
+            context_encoder_key=context_encoder_key,
+            target_encoder_key=target_encoder_key,
+            load_predictor=load_predictor,
+            load_encoder=True,
+        )
 
     # -- momentum schedule
     momentum_scheduler = (
@@ -303,7 +328,7 @@ def main(args, resume_preempt=False):
 
     start_epoch = 0
     # -- load training checkpoint
-    if load_model or os.path.exists(latest_path):
+    if load_model:
         (
             encoder,
             predictor,
@@ -331,11 +356,11 @@ def main(args, resume_preempt=False):
         if rank != 0:
             return
         save_dict = {
-            "encoder": encoder.state_dict(),
-            "predictor": predictor.state_dict(),
+            "encoder": checkpoint_state_dict(encoder),
+            "predictor": checkpoint_state_dict(predictor),
             "opt": optimizer.state_dict(),
             "scaler": None if scaler is None else scaler.state_dict(),
-            "target_encoder": target_encoder.state_dict(),
+            "target_encoder": checkpoint_state_dict(target_encoder),
             "epoch": epoch,
             "loss": loss_meter.avg,
             "batch_size": batch_size,

@@ -5,8 +5,25 @@
 
 import argparse
 import multiprocessing as mp
+import os
 import pprint
 from pathlib import Path
+
+
+def _configure_threading_env():
+    thread_defaults = {
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+        "VECLIB_MAXIMUM_THREADS": "1",
+        "BLIS_NUM_THREADS": "1",
+    }
+    for key, value in thread_defaults.items():
+        os.environ.setdefault(key, value)
+
+
+_configure_threading_env()
 
 import yaml
 
@@ -80,5 +97,16 @@ if __name__ == "__main__":
     else:
         num_gpus = len(args.devices)
         mp.set_start_method("spawn")
+        processes = []
         for rank in range(num_gpus):
-            mp.Process(target=process_main, args=(rank, args.fname, num_gpus, args.devices)).start()
+            process = mp.Process(target=process_main, args=(rank, args.fname, num_gpus, args.devices))
+            process.start()
+            processes.append(process)
+
+        exit_codes = []
+        for process in processes:
+            process.join()
+            exit_codes.append(process.exitcode)
+
+        if any(code != 0 for code in exit_codes):
+            raise SystemExit(f"Training worker failed with exit codes: {exit_codes}")

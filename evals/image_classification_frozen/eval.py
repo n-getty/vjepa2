@@ -7,11 +7,9 @@ import os
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
 try:
-    # -- WARNING: IF DOING DISTRIBUTED TRAINING ON A NON-SLURM CLUSTER, MAKE
-    # --          SURE TO UPDATE THIS TO GET LOCAL-RANK ON NODE, OR ENSURE
-    # --          THAT YOUR JOBS ARE LAUNCHED WITH ONLY 1 DEVICE VISIBLE
-    # --          TO EACH PROCESS
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
+    local_rank = os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID"))
+    if local_rank is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = local_rank
 except Exception:
     pass
 
@@ -44,6 +42,27 @@ torch.manual_seed(_GLOBAL_SEED)
 torch.backends.cudnn.benchmark = True
 
 pp = pprint.PrettyPrinter(indent=4)
+
+
+def unwrap_module(module):
+    return module.module if isinstance(module, DistributedDataParallel) else module
+
+
+def adapt_state_dict_for_model(model, state_dict):
+    model_keys = list(model.state_dict().keys())
+    ckpt_keys = list(state_dict.keys())
+
+    if not model_keys or not ckpt_keys:
+        return state_dict
+
+    model_has_module_prefix = all(k.startswith("module.") for k in model_keys)
+    ckpt_has_module_prefix = all(k.startswith("module.") for k in ckpt_keys)
+
+    if ckpt_has_module_prefix and not model_has_module_prefix:
+        return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+    if model_has_module_prefix and not ckpt_has_module_prefix:
+        return {f"module.{k}": v for k, v in state_dict.items()}
+    return state_dict
 
 
 def main(args_eval, resume_preempt=False):
@@ -81,6 +100,7 @@ def main(args_eval, resume_preempt=False):
     dataset_name = args_data.get("dataset_name")
     num_classes = args_data.get("num_classes")
     root_path = args_data.get("root_path", None)
+    image_folder = args_data.get("image_folder", None)
     resolution = args_data.get("resolution", 224)
     normalization = args_data.get("normalization", None)
 
@@ -149,13 +169,16 @@ def main(args_eval, resume_preempt=False):
         ).to(device)
         for _ in opt_kwargs
     ]
-    classifiers = [DistributedDataParallel(c, static_graph=True) for c in classifiers]
+    use_ddp = world_size > 1 and torch.distributed.is_available() and torch.distributed.is_initialized()
+    if use_ddp:
+        classifiers = [DistributedDataParallel(c, static_graph=True) for c in classifiers]
     print(classifiers[0])
 
     train_loader, train_sampler = make_dataloader(
         dataset_name=dataset_name,
         root_path=root_path,
         img_size=resolution,
+        image_folder=image_folder,
         batch_size=batch_size,
         world_size=world_size,
         rank=rank,
@@ -166,6 +189,7 @@ def main(args_eval, resume_preempt=False):
         dataset_name=dataset_name,
         root_path=root_path,
         img_size=resolution,
+        image_folder=image_folder,
         batch_size=batch_size,
         world_size=world_size,
         rank=rank,
@@ -200,7 +224,7 @@ def main(args_eval, resume_preempt=False):
             [wds.step() for wds in wd_scheduler]
 
     def save_checkpoint(epoch):
-        all_classifier_dicts = [c.state_dict() for c in classifiers]
+        all_classifier_dicts = [unwrap_module(c).state_dict() for c in classifiers]
         all_opt_dicts = [o.state_dict() for o in optimizer]
 
         save_dict = {
@@ -326,7 +350,10 @@ def load_checkpoint(device, r_path, classifiers, opt, scaler, val_only=False):
     logger.info(f"read-path: {r_path}")
 
     # -- loading encoder
-    msg = [c.load_state_dict(pd) for c, pd in zip(classifiers, checkpoint["classifiers"])]
+    msg = [
+        c.load_state_dict(adapt_state_dict_for_model(c, pd))
+        for c, pd in zip(classifiers, checkpoint["classifiers"])
+    ]
 
     if val_only:
         logger.info(f"loaded pretrained classifier from epoch with msg: {msg}")
@@ -351,6 +378,7 @@ DEFAULT_NORMALIZATION = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 def make_dataloader(
     dataset_name,
     root_path,
+    image_folder,
     batch_size,
     world_size,
     rank,
@@ -392,6 +420,7 @@ def make_dataloader(
         world_size=world_size,
         rank=rank,
         root_path=root_path,
+        image_folder=image_folder,
         training=training,
         drop_last=False,
         subset_file=subset_file,

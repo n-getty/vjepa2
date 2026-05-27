@@ -30,3 +30,14 @@ app/vjepa_droid_v2/local/
 app/vjepa_droid_v3/local/
 app/vjepa_droid_v4/local/
 configs/local
+
+# Polaris runtime artifacts and local working state
+.runtime_configs/
+.codex/
+checkpoints/
+head_phases/
+*.pt
+*.pth
+*.pth.tar
+*.e[0-9]*
+*.o[0-9]*

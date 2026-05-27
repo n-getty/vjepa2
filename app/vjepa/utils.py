@@ -22,6 +22,75 @@ logger = logging.getLogger()
 MAX_RETRIES = 3
 
 
+def _has_ddp_prefix(state_dict):
+    first_key = next(iter(state_dict), None)
+    return (first_key is not None) and first_key.startswith("module.")
+
+
+def _align_state_dict_for_module(module, state_dict):
+    module_is_wrapped = hasattr(module, "module")
+    state_dict_has_ddp_prefix = _has_ddp_prefix(state_dict)
+
+    if module_is_wrapped and not state_dict_has_ddp_prefix:
+        logger.info("Adapting checkpoint keys for DistributedDataParallel-wrapped module")
+        return {f"module.{k}": v for k, v in state_dict.items()}
+
+    if (not module_is_wrapped) and state_dict_has_ddp_prefix:
+        logger.info("Adapting DistributedDataParallel checkpoint keys for unwrapped module")
+        return {k.removeprefix("module."): v for k, v in state_dict.items()}
+
+    return state_dict
+
+
+def checkpoint_state_dict(module):
+    if hasattr(module, "module"):
+        return module.module.state_dict()
+    return module.state_dict()
+
+
+def load_pretrained(
+    r_path,
+    encoder=None,
+    predictor=None,
+    target_encoder=None,
+    context_encoder_key="encoder",
+    target_encoder_key="target_encoder",
+    load_predictor=True,
+    load_encoder=True,
+):
+    logger.info(f"Loading pretrained model from {r_path}")
+    checkpoint = robust_checkpoint_loader(r_path, map_location=torch.device("cpu"))
+
+    epoch = checkpoint.get("epoch", "unknown")
+
+    if load_encoder and encoder is not None:
+        pretrained_dict = _align_state_dict_for_module(encoder, checkpoint[context_encoder_key])
+        pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
+        msg = encoder.load_state_dict(pretrained_dict, strict=False)
+        logger.info(f"loaded pretrained encoder from epoch {epoch} with msg: {msg}")
+
+    if load_predictor and predictor is not None and "predictor" in checkpoint:
+        pretrained_dict = _align_state_dict_for_module(predictor, checkpoint["predictor"])
+        pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
+        msg = predictor.load_state_dict(pretrained_dict, strict=False)
+        logger.info(f"loaded pretrained predictor from epoch {epoch} with msg: {msg}")
+
+    if load_encoder and target_encoder is not None:
+        checkpoint_key = target_encoder_key if target_encoder_key in checkpoint else context_encoder_key
+        pretrained_dict = _align_state_dict_for_module(target_encoder, checkpoint[checkpoint_key])
+        pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
+        msg = target_encoder.load_state_dict(pretrained_dict, strict=False)
+        logger.info(f"loaded pretrained target encoder from epoch {epoch} with msg: {msg}")
+
+    del checkpoint
+
+    return (
+        encoder,
+        predictor,
+        target_encoder,
+    )
+
+
 def build_eval_args(
     model_name,
     patch_size,
@@ -104,19 +173,19 @@ def load_checkpoint(
         epoch = checkpoint["epoch"]
 
     # -- loading encoder
-    pretrained_dict = checkpoint["encoder"]
+    pretrained_dict = _align_state_dict_for_module(encoder, checkpoint["encoder"])
     msg = encoder.load_state_dict(pretrained_dict)
     logger.info(f"loaded pretrained encoder from epoch {epoch} with msg: {msg}")
 
     # -- loading predictor
-    pretrained_dict = checkpoint["predictor"]
+    pretrained_dict = _align_state_dict_for_module(predictor, checkpoint["predictor"])
     msg = predictor.load_state_dict(pretrained_dict)
     logger.info(f"loaded pretrained predictor from epoch {epoch} with msg: {msg}")
 
     # -- loading target_encoder
     if target_encoder is not None:
         print(list(checkpoint.keys()))
-        pretrained_dict = checkpoint["target_encoder"]
+        pretrained_dict = _align_state_dict_for_module(target_encoder, checkpoint["target_encoder"])
         msg = target_encoder.load_state_dict(pretrained_dict)
         logger.info(f"loaded pretrained target encoder from epoch {epoch} with msg: {msg}")
 
