@@ -30,3 +30,15 @@ app/vjepa_droid_v2/local/
 app/vjepa_droid_v3/local/
 app/vjepa_droid_v4/local/
 configs/local
+
+# Aurora port: runtime artifacts (regenerated each run)
+checkpoints/
+.runtime_configs/
+.claude/
+
+# Aurora port: held-node iteration scripts and their output (dev-only,
+# not part of the upstreamable surface)
+experiments/
+
+# Project memory / development context (per-checkout, not part of the port)
+CLAUDE.md

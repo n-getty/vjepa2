@@ -12,23 +12,80 @@ import torch
 
 
 def gpu_timer(closure, log_timings=True):
-    """Helper to time gpu-time to execute closure()"""
-    log_timings = log_timings and torch.cuda.is_available()
+    """Helper to time gpu-time to execute closure(). Works on CUDA or XPU."""
+    if torch.cuda.is_available():
+        _events = torch.cuda
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        _events = torch.xpu
+    else:
+        _events = None
+    log_timings = log_timings and _events is not None
 
     elapsed_time = -1.0
     if log_timings:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = _events.Event(enable_timing=True)
+        end = _events.Event(enable_timing=True)
         start.record()
 
     result = closure()
 
     if log_timings:
         end.record()
-        torch.cuda.synchronize()
+        _events.synchronize()
         elapsed_time = start.elapsed_time(end)
 
     return result, elapsed_time
+
+
+class PhaseTimer:
+    """Record device-event-based elapsed-times around named phases of train_step.
+
+    Cheaper than torch.cuda.synchronize() at each phase boundary because we
+    enqueue events on the default stream and only sync once at the very end
+    (the outer gpu_timer call already does that). Returns a dict[name -> ms].
+
+    Works on CUDA and XPU. Silently disabled when neither accelerator is present.
+    """
+
+    def __init__(self, enabled=True):
+        if torch.cuda.is_available():
+            self._device = "cuda"
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            self._device = "xpu"
+        else:
+            self._device = None
+        self.enabled = enabled and self._device is not None
+        self.events = []
+        self.names = []
+
+    def _new_event(self):
+        if self._device == "cuda":
+            return torch.cuda.Event(enable_timing=True)
+        return torch.xpu.Event(enable_timing=True)
+
+    def _sync(self):
+        if self._device == "cuda":
+            torch.cuda.synchronize()
+        else:
+            torch.xpu.synchronize()
+
+    def mark(self, name):
+        if not self.enabled:
+            return
+        ev = self._new_event()
+        ev.record()
+        self.events.append(ev)
+        self.names.append(name)
+
+    def to_dict(self):
+        if not self.enabled or len(self.events) < 2:
+            return {}
+        self._sync()
+        out = {}
+        for i in range(len(self.events) - 1):
+            label = f"{self.names[i]}->{self.names[i+1]}"
+            out[label] = self.events[i].elapsed_time(self.events[i + 1])
+        return out
 
 
 LOG_FORMAT = "[%(levelname)-8s][%(asctime)s][%(name)-20s][%(funcName)-25s] %(message)s"

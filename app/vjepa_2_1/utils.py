@@ -24,6 +24,48 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
 
 
+def _normalize_state_dict_keys(state_dict):
+    normalized = {}
+    for key, val in state_dict.items():
+        if key.startswith("module."):
+            key = key.removeprefix("module.")
+        if key.startswith("backbone."):
+            key = key.removeprefix("backbone.")
+        normalized[key] = val
+    return normalized
+
+
+def _target_state_dict_prefix(module):
+    first_key = next(iter(module.state_dict()), "")
+    if first_key.startswith("module.backbone."):
+        return "module.backbone."
+    if first_key.startswith("backbone."):
+        return "backbone."
+    if first_key.startswith("module."):
+        return "module."
+    return ""
+
+
+def _prepare_state_dict_for_module(module, pretrained_dict):
+    prefix = _target_state_dict_prefix(module)
+    normalized = _normalize_state_dict_keys(pretrained_dict)
+    return {f"{prefix}{k}": v for k, v in normalized.items()}
+
+
+def _load_pretrained_module(module, pretrained_dict, module_name, epoch):
+    prepared_dict = _prepare_state_dict_for_module(module, pretrained_dict)
+    for key, value in module.state_dict().items():
+        if key not in prepared_dict:
+            logger.info(f'key "{key}" could not be found in loaded state dict')
+        elif prepared_dict[key].shape != value.shape:
+            logger.info(
+                f'key "{key}" is of different shape in model and loaded state dict'
+            )
+            prepared_dict[key] = value
+    msg = module.load_state_dict(prepared_dict, strict=False)
+    logger.info(f"loaded pretrained {module_name} from epoch {epoch} with msg: {msg}")
+
+
 def normalize_and_concat(tensor, embed_dim):
     """Split tensor into 4 chunks of size embed_dim along the last axis,
     apply LayerNorm to each chunk, then concatenate back."""
@@ -178,6 +220,59 @@ def load_checkpoint(
         opt,
         scaler,
         epoch,
+    )
+
+
+def load_pretrained(
+    r_path,
+    encoder=None,
+    predictor=None,
+    target_encoder=None,
+    context_encoder_key="encoder",
+    target_encoder_key="target_encoder",
+    load_predictor=True,
+    load_encoder=True,
+):
+    logger.info(f"Loading pretrained model from {r_path}")
+    checkpoint = robust_checkpoint_loader(r_path, map_location=torch.device("cpu"))
+
+    epoch = checkpoint.get("epoch", "unknown")
+
+    if load_encoder and encoder is not None:
+        _load_pretrained_module(
+            encoder,
+            checkpoint[context_encoder_key],
+            "encoder",
+            epoch,
+        )
+
+    if load_predictor and predictor is not None and "predictor" in checkpoint:
+        _load_pretrained_module(
+            predictor,
+            checkpoint["predictor"],
+            "predictor",
+            epoch,
+        )
+
+    if load_encoder and target_encoder is not None:
+        checkpoint_key = (
+            target_encoder_key
+            if target_encoder_key in checkpoint
+            else context_encoder_key
+        )
+        _load_pretrained_module(
+            target_encoder,
+            checkpoint[checkpoint_key],
+            "target encoder",
+            epoch,
+        )
+
+    del checkpoint
+
+    return (
+        encoder,
+        predictor,
+        target_encoder,
     )
 
 

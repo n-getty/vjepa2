@@ -1,0 +1,140 @@
+app: vjepa_2_1
+# Aurora: 12 tiles/node via ZE_FLAT_DEVICE_HIERARCHY=FLAT.
+nodes: 1
+tasks_per_node: 12
+cpus_per_task: 8
+mem_per_gpu: 40G
+folder: ./checkpoints/aurora/pretrain_2_1/vitl_256px_16f
+data:
+  # WebDataset shards live as directories (each with metadata.json + .tar files).
+  # The launcher's --stage_data path rsyncs these to /tmp/vjepa_data/<job>/<name>
+  # on each node and rewrites these paths at runtime; without --stage_data the
+  # absolute /flare paths below are used directly.
+  dataset_type: webdataset
+  datasets:
+  - /flare/AuroraGPT/ngetty/data/webdataset/CRCD
+  - /flare/AuroraGPT/ngetty/data/webdataset/SITL
+  - /flare/AuroraGPT/ngetty/data/webdataset/surgenet_robotic
+  - /flare/AuroraGPT/ngetty/data/webdataset/surgtoolloc2022
+  datasets_weights:
+  - 1.0
+  - 1.0
+  - 1.0
+  - 1.0
+  # Per-rank batch must be >= 2 (the d_weights path in app/vjepa_2_1/train.py
+  # crashes at bs=1 — d_ij.unsqueeze(2) IndexError, per CLAUDE.md gotcha).
+  # bs=16 is the verified upper bound on Aurora Max 1550 tile (~55 GB used /
+  # 64 GB available); bs=18+ either OOMs or hits the level_zero PDE limit.
+  # Throughput at bs=16: ~59 clips/sec/node (4.4x Polaris 1n4 baseline).
+  batch_size: 16
+  crop_size: 256
+  patch_size: 16
+  dataset_fpcs:
+  - 16
+  - 16
+  - 16
+  - 16
+  tubelet_size: 2
+  fps: 4
+  num_workers: 6
+  persistent_workers: true
+  pin_mem: true
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+loss:
+  loss_exp: 1.0
+  predict_all: true
+  reg_coeff: 0.0
+  shift_by_n: 0
+  weight_distance_loss: true
+mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 8
+  spatial_scale:
+  - 0.15
+  - 0.15
+  temporal_scale:
+  - 1.0
+  - 1.0
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 2
+  spatial_scale:
+  - 0.7
+  - 0.7
+  temporal_scale:
+  - 1.0
+  - 1.0
+meta:
+  dtype: bfloat16
+  eval_freq: 100
+  load_checkpoint: true
+  read_checkpoint: null
+  save_every_freq: 50
+  seed: 239
+  use_sdpa: true
+model:
+  # torch.compile is not viable on XPU multi-node (per CLAUDE.md).
+  compile_model: false
+  has_cls_first: false
+  img_temporal_dim_size: 1
+  interpolate_rope: true
+  is_causal: false
+  lambda_value_img: 0.5
+  lambda_value_vid: 0.5
+  local_window:
+  - -1
+  - -1
+  - -1
+  modality_embedding: true
+  model_name: vit_large
+  n_registers: 0
+  n_registers_predictor: 0
+  normalize_predictor: false
+  pred_depth: 24
+  pred_embed_dim: 384
+  pred_is_causal: false
+  pred_local_window:
+  - -1
+  - -1
+  - -1
+  pred_num_heads: 12
+  uniform_power: true
+  # Aurora Max 1550 has 64 GB/tile; at bs=16 the saved activations only push
+  # us to ~55 GB, so disabling activation checkpointing skips the bwd
+  # recompute and shaves ~18% off iter time (measured 2026-05-27).
+  use_activation_checkpointing: false
+  use_mask_tokens: true
+  use_rope: true
+  vit_conv: false
+  zero_init_mask_tokens: true
+optimization:
+  ema:
+  - 0.99925
+  - 0.99925
+  epochs: 1000
+  final_lr: 0.0006
+  final_weight_decay: 0.04
+  ipe: 300
+  ipe_scale: 1.25
+  lr: 0.0006
+  start_lr: 0.0001
+  warmup: 40
+  weight_decay: 0.04
