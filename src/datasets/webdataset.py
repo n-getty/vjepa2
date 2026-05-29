@@ -25,6 +25,11 @@ _GLOBAL_SEED = 0
 logger = getLogger()
 
 
+def _not_none(sample):
+    # Module-level so DataLoader workers can pickle it (num_workers > 0).
+    return sample is not None
+
+
 class VideoDecoder:
     """
     Custom WebDataset decoder to replicate the logic from VideoDataset.
@@ -529,7 +534,7 @@ def make_webdataset(
         wds.tarfile_to_samples(handler=wds.warn_and_continue),
         wds.shuffle(1000),  # <--- NEW: Buffer 1000 samples to smooth IO/randomness
         wds.map(video_decoder),
-        wds.select(lambda x: x is not None),
+        wds.select(_not_none),
     )
 
     # 4. Create the final DataLoader
