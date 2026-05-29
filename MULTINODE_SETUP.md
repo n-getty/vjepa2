@@ -46,7 +46,7 @@ after the previous succeeds.
 | `VJEPA_TIME_MIN` | `720` | Walltime in minutes |
 | `VJEPA_FILESYSTEMS` | `home:eagle` | PBS `-l filesystems=` |
 | `VJEPA_FOLDER_BASE` | unset | If set, replaces the YAML's `folder:` with `<base>/<basename(folder)>` |
-| `VJEPA_STAGE_DATA` | `0` | `1` to rsync `data.datasets` to `/local/scratch` per node (WebDataset shards only — does NOT work for the current CSV-of-videos configs) |
+| `VJEPA_STAGE_DATA` | `0` | `1` to rsync `data.datasets` to `/local/scratch` per node. Works with `dataset_type: WebDataset` configs (each entry is a shard directory). Does NOT work for `dataset_type: VideoDataset` configs that list CSVs — the CSVs would get staged but the absolute video paths inside them still point at `/eagle`. |
 | `VJEPA_DISABLE_AWS_OFI` | `0` | `1` to disable the AWS OFI NCCL plugin (only set if you see NCCL hangs) |
 | `VJEPA_DRY_RUN` | `0` | `1` builds PBS scripts but doesn't qsub |
 
@@ -94,6 +94,43 @@ The AWS OFI plugin recovers the inter-node penalty almost entirely. The bottlene
 without it is NCCL allreduce latency in `backward()` — confirmed via phase-level
 CUDA-event timing (`src/utils/logging.py:PhaseTimer`, CSV columns
 `fwd-target-ms`, `fwd-context-ms`, `backward-ms`, `opt-step-ms`, `ema-ms`).
+
+## WebDataset (for `--stage_data`)
+
+The `dataset_type: WebDataset` path lets you read video pretraining data from
+`.tar` shards instead of CSV-of-video-paths. It's the only `data.datasets`
+shape that `--stage_data` / `VJEPA_STAGE_DATA=1` can actually rsync to
+`/local/scratch` and rebind to via `--local_data_root`.
+
+Build shards from CSV manifests with `app/create_webdataset.py` (each input
+CSV becomes its own subdirectory of `.tar` shards plus a `metadata.json`):
+
+```bash
+python -m app.create_webdataset \
+    --csvs path_<dataset_a>.csv path_<dataset_b>.csv ... \
+    --output_dir /eagle/<project>/<you>/data/webdataset \
+    --samples_per_shard 1000
+```
+
+The resulting layout is what `dataset_type: WebDataset` expects (each input
+CSV becomes a subdirectory named after its stem):
+
+```
+/eagle/<project>/<you>/data/webdataset/
+  <dataset_a>/
+    <dataset_a>-000000.tar
+    <dataset_a>-000001.tar
+    ...
+    metadata.json
+  <dataset_b>/
+    ...
+```
+
+In the YAML, point `data.datasets` at the per-dataset directories and set
+`dataset_type: WebDataset`. Then either run as-is, or pass
+`VJEPA_STAGE_DATA=1` to copy them to `/local/scratch` per node before training.
+
+Sanity-check shards with `app/check_webdataset.py` before a long run.
 
 ## Hardware note
 
