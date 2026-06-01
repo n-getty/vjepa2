@@ -1,3 +1,11 @@
+> 🛠️ **[Live tool] V-JEPA 2.1 Ablation Builder** — author multi-phase
+> ablation experiments in your browser and export ready-to-run YAML configs
+> + launcher script as a ZIP. **No install required.**
+> 👉 **[Open the Ablation Builder](https://borgioli.github.io/vjepa2/)**
+> &nbsp;·&nbsp; [source & docs](tools/ablation_builder/)
+
+---
+
 
 🆕 **[2026-03-16]:** :fire: V-JEPA 2.1 is released :fire: A new familly of models trained with a novel recipe that learns high quality and temporolly consistent dense features !!!
 
