@@ -15,27 +15,23 @@ _IS_XPU = hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
 def _sdpa(q, k, v, dropout_p=0.0, is_causal=False):
-    """Device-agnostic SDPA. On XPU, transposes to BSHD so FlashAttentionXPU
-    is picked instead of the math fallback (measured ~40x faster). On CUDA,
-    PyTorch's dispatcher already picks flash-attention from BHND.
+    """Device-agnostic SDPA. Inputs/outputs are BHND ([B, num_heads, N, D]).
 
-    Inputs Q/K/V are expected in BHND layout. Returns output also in BHND.
+    F.scaled_dot_product_attention attends over dim -2 by contract, so BHND is
+    the correct layout on every backend; the dispatcher selects the fast kernel
+    (FlashAttentionXPU on XPU, flash/efficient on CUDA) from the BHND inputs.
+
+    NOTE: an earlier XPU branch transposed to BSHD before calling SDPA, on the
+    theory that FlashAttentionXPU "requires" that layout. That transpose moved
+    the sequence axis onto the heads dim, so attention was computed over heads
+    and the N tokens were treated as heads -- silently scrambling every
+    attention output (cos~0.02 vs reference) on XPU, with no error and a
+    plausible-looking loss. Do not reintroduce it. See
+    tests/models/test_sdpa_layout.py for the regression guard.
     """
-    if _IS_XPU:
-        # FlashAttentionXPU requires BSHD ((B, N, H, D)) per the warning in
-        # torch-xpu-ops/.../flash_attn/utils.h:127. Transpose in, transpose out.
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        out = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=dropout_p, is_causal=is_causal
-        )
-        return out.transpose(1, 2)
-    # CUDA path: keep the original sdp_kernel context to preserve A100 perf.
-    with torch.backends.cuda.sdp_kernel():
-        return F.scaled_dot_product_attention(
-            q, k, v, dropout_p=dropout_p, is_causal=is_causal
-        )
+    return F.scaled_dot_product_attention(
+        q, k, v, dropout_p=dropout_p, is_causal=is_causal
+    )
 
 
 def rotate_queries_or_keys(x, pos, n_registers, has_cls_first):
