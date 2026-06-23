@@ -783,13 +783,17 @@ def main(args, resume_preempt=False):
                         )
 
                 if run_step:
-                    if mixed_precision:
+                    # Branch on the scaler's presence, not on mixed_precision:
+                    # the scaler is now None for bf16 (no loss scaling needed)
+                    # and only non-None for fp16. Using `mixed_precision` here
+                    # would call scaler.scale() on None under bf16.
+                    if scaler is not None:
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
                     else:
                         loss.backward()
                     phase_timer.mark("backward_done")
-                    if mixed_precision:
+                    if scaler is not None:
                         scaler.step(optimizer)
                         scaler.update()
                     else:
