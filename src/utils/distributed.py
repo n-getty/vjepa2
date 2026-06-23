@@ -77,11 +77,28 @@ def _select_backend():
             import oneccl_bindings_for_pytorch  # noqa: F401
             return "ccl"
         except Exception as e:
-            logger.warning(
-                "XPU detected but neither xccl nor oneccl_bindings_for_pytorch "
-                f"is available ({e}); falling back to gloo."
+            # Do NOT silently fall back to gloo on XPU: gloo runs collectives on
+            # the CPU and handles bf16 poorly, so a "successful" run would
+            # quietly route every gradient AllReduce through CPU/fp32 at a
+            # fraction of the throughput — looking like a slow run, not a
+            # misconfiguration. Fail loud instead. Set VJEPA_ALLOW_GLOO=1 only
+            # for deliberate CPU-collective debugging.
+            if os.environ.get("VJEPA_ALLOW_GLOO") == "1":
+                logger.warning(
+                    "XPU detected but neither xccl nor oneccl_bindings_for_pytorch "
+                    f"is available ({e}); VJEPA_ALLOW_GLOO=1 set, using gloo "
+                    "(CPU collectives — expect degraded throughput)."
+                )
+                return "gloo"
+            raise RuntimeError(
+                "XPU is available but no XPU-capable distributed backend was "
+                f"found: torch.distributed.is_xccl_available() is False and "
+                f"`import oneccl_bindings_for_pytorch` failed ({e}). Refusing to "
+                "fall back to gloo (CPU collectives) on XPU. Check that the "
+                "`frameworks` module is loaded and oneCCL is on PYTHONPATH "
+                "(see python-env-shadowing-hpc). Set VJEPA_ALLOW_GLOO=1 to "
+                "override for debugging only."
             )
-            return "gloo"
     if torch.cuda.is_available():
         return "nccl"
     return "gloo"

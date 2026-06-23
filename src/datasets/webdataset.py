@@ -4,31 +4,74 @@
 # LICENSE file in the root directory of this source tree.
 
 import io
+import json
 import math
 import os
 import pathlib
-import warnings
+import tarfile
+import tempfile
 from logging import getLogger
-import json
-import random
 
 import numpy as np
 import torch
 import torchvision
-from decord import VideoReader, cpu
-import tempfile
-
 import webdataset as wds
+from decord import VideoReader, cpu
 
 _GLOBAL_SEED = 0
 logger = getLogger()
+
+
+def compute_mixing_probs(sample_counts, datasets_weights=None, temperature=0.5):
+    """Per-sample source-selection probabilities for ``wds.RandomMix``.
+
+    ``RandomMix`` picks a *source* per emitted sample with probability
+    ``probs[i] / sum(probs)`` — independent of how many samples each source
+    holds (every stream here is ``resampled=True``, i.e. infinite/with-
+    replacement). So passing uniform ``datasets_weights`` makes an 8-clip set
+    contribute the same fraction of training as a 136k-clip set, oversampling
+    the tiny one by ~10^4 and collapsing the effective corpus onto a handful of
+    memorized clips. (This silently corrupted all prior surgical pretraining.)
+
+    Semantics (mirrors the standard multilingual temperature-sampling recipe):
+
+      base_i  = sample_count_i ** temperature   (× datasets_weights_i if given)
+      prob_i  = base_i / sum_j base_j
+
+    - ``temperature == 1.0``: size-proportional → the realized sample
+      distribution is *uniform over the true corpus* (no over/under-sampling).
+    - ``temperature == 0.5`` (default): sqrt-size sampling — down-weights tiny
+      sets without erasing them; keeps a surgical-heavy mix without memorization.
+    - ``temperature == 0.0``: recovers the old uniform-per-source behavior
+      (each source 1/N regardless of size) — kept only for explicit opt-in.
+    - ``0 < temperature < 1``: gently up-weights small sources without the
+      catastrophic blow-up of full uniform (e.g. 0.5 ≈ sqrt-size sampling).
+    - ``datasets_weights`` (optional): per-source multipliers applied on top,
+      for deliberate domain up/down-weighting (e.g. surgical vs kinetics).
+
+    Returns a list of probabilities summing to 1.0.
+    """
+    n = len(sample_counts)
+    if n == 0:
+        return []
+    counts = [max(1.0, float(c or 0)) for c in sample_counts]
+    if datasets_weights is None:
+        datasets_weights = [1.0] * n
+    if len(datasets_weights) != n:
+        raise ValueError("datasets_weights length must match sample_counts")
+    base = [w * (c ** float(temperature)) for w, c in zip(datasets_weights, counts)]
+    s = float(sum(base))
+    if s <= 0:
+        # Degenerate (all weights zero) — fall back to uniform-per-source.
+        return [1.0 / n] * n
+    return [b / s for b in base]
 
 
 class VideoDecoder:
     """
     Custom WebDataset decoder to replicate the logic from VideoDataset.
     It decodes the video from bytes, samples frames, and applies transforms.
-    
+
     Args:
         frames_per_clip (int): Number of frames to sample.
         frame_step (int): Step between sampled frames (from original VideoDataset).
@@ -65,40 +108,26 @@ class VideoDecoder:
         self.filter_long_videos = filter_long_videos
         self.transform = transform
         self.shared_transform = shared_transform
-        
-        # Validation (same as original)
+
         if sum([v is not None for v in (fps, duration, frame_step)]) != 1:
             raise ValueError(f"Must specify exactly one of either {fps=}, {duration=}, or {frame_step=}.")
-        
-        # This will be set by the dataloader when it maps over the dataset
-        self.dataset_fpcs = None
 
     def loadvideo_decord(self, video_bytes, fpc):
         """
         Load video content using Decord from a byte buffer.
         Replicates the logic from `VideoDataset.loadvideo_decord`.
         """
-        
-        # Check file size filter
-        #if len(video_bytes) > self.filter_long_videos:
-        #    logger.warning(f"skipping long video of size {len(video_bytes)} bytes")
-        #    return [], None
-        
-        # Use io.BytesIO to treat the byte buffer as a file
         try:
             vr = VideoReader(io.BytesIO(video_bytes), num_threads=1, ctx=cpu(0))
         except Exception as e:
-            # Fallback: write to temp file
             try:
                 logger.info(f"Fallback: Writing {len(video_bytes)} bytes to temp file")
                 with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
                     tmp_name = tmp.name
                     tmp.write(video_bytes)
                     tmp.flush()
-                
-                # Close file before reading
                 vr = VideoReader(tmp_name, num_threads=1, ctx=cpu(0))
-                os.remove(tmp_name) # Cleanup
+                os.remove(tmp_name)
             except Exception as e2:
                 if 'tmp_name' in locals() and os.path.exists(tmp_name):
                     os.remove(tmp_name)
@@ -106,8 +135,7 @@ class VideoDecoder:
                 return [], None
 
         fstp = self.frame_step
-        
-        # Calculate frame step based on duration or fps if specified
+
         if self.duration is not None or self.fps is not None:
             try:
                 video_fps = math.ceil(vr.get_avg_fps())
@@ -121,7 +149,7 @@ class VideoDecoder:
             else:
                 assert self.duration is None
                 fstp = max(1, video_fps // self.fps)
-        
+
         assert fstp is not None and fstp > 0, "frame_step must be set"
         clip_len = int(fpc * fstp)
 
@@ -131,7 +159,6 @@ class VideoDecoder:
 
         vr.seek(0)
 
-        # Partition video into equal sized segments and sample each clip
         partition_len = len(vr) // self.num_clips
 
         all_indices, clip_indices = [], []
@@ -177,166 +204,88 @@ class VideoDecoder:
         return buffer, clip_indices
 
     def loadimage(self, image_bytes, fpc):
-        """
-        Load image content from bytes.
-        Replicates the logic from `VideoDataset.get_item_image`.
-        """
         try:
-            # Decode image from bytes
             image_tensor = torchvision.io.decode_image(
                 torch.frombuffer(image_bytes, dtype=torch.uint8),
-                mode=torchvision.io.ImageReadMode.RGB
+                mode=torchvision.io.ImageReadMode.RGB,
             )
         except Exception as e:
-            # Assuming 'url' here refers to the sample key or a general identifier
-            # as it's not directly available in loadimage.
-            # Using a placeholder for now, or consider passing sample key.
             print(f"Failed to decode image: {e}", flush=True)
             return [], None
 
         clip_indices = [np.arange(start=0, stop=fpc, dtype=np.int32)]
-
-        # Expanding the input image [3, H, W] ==> [T, 3, H, W]
         buffer = image_tensor.unsqueeze(dim=0).repeat((fpc, 1, 1, 1))
-        buffer = buffer.permute((0, 2, 3, 1))  # [T, 3, H, W] ==> [T H W 3]
+        buffer = buffer.permute((0, 2, 3, 1))
         buffer = buffer.numpy()
-
         return buffer, clip_indices
 
-    def _get_dataset_name_from_url(self, url):
-        """
-        Extract dataset name from the shard URL.
-        Assumes the URL structure is: /path/to/dataset_name/shard_xxxx.tar
-        """
-        if url is None:
-            return None
-        
-        # Get the parent directory name
-        path_obj = pathlib.Path(url)
-        dataset_name = path_obj.parent.name
-        return dataset_name
-
-    def __call__(self, sample):
-        """
-        WebDataset map function.
-        `sample` is a dict from webdataset, e.g.,
-        { "__key__": "...", "video.mp4": b"...", "label.txt": b"0", "__url__": "..." }
-        """
+    def decode(self, sample, frames_per_clip):
+        """Decode a webdataset sample dict into (clips, label, clip_indices)."""
         try:
-            # 1. Get dataset name from the shard URL
-            shard_url = sample.get("__url__")
-            if shard_url is None:
-                logger.warning(f"No __url__ found in sample with key {sample.get('__key__', 'N/A')}")
-                return None
-            
-            dataset_name = self._get_dataset_name_from_url(shard_url)
-            
-            if self.dataset_fpcs is None:
-                logger.error("VideoDecoder.dataset_fpcs was not initialized by the loader!")
-                return None
-
-            if dataset_name not in self.dataset_fpcs:
-                logger.warning(
-                    f"Dataset name '{dataset_name}' from URL '{shard_url}' not found in fpc map. "
-                    f"Available: {list(self.dataset_fpcs.keys())}"
-                )
-                return None
-                
-            frames_per_clip = self.dataset_fpcs[dataset_name]
-            
-            # 2. Decode label - check all possible label key formats
+            # 1. label
             label_bytes = None
-            # Check for compound extensions first, then simple ones
-            label_keys = ["label.txt", "label", "txt", "cls", "class.txt", "class"]
-            for key in label_keys:
+            for key in ("label.txt", "label", "txt", "cls", "class.txt", "class"):
                 if key in sample:
                     label_bytes = sample[key]
                     break
-            
             if label_bytes is None:
-                # Debug: print all available keys
                 available_keys = [k for k in sample.keys() if not k.startswith("__")]
                 logger.warning(
-                    f"No label found for key {sample['__key__']}. "
-                    f"Available keys: {available_keys}"
+                    f"No label for key {sample.get('__key__', 'N/A')}. Available: {available_keys}"
                 )
                 return None
-            
             try:
-                label = int(label_bytes.decode('utf-8').strip())
+                label = int(label_bytes.decode("utf-8").strip())
             except (ValueError, AttributeError) as e:
-                logger.warning(f"Failed to decode label for key {sample['__key__']}: {e}")
+                logger.warning(f"Failed to decode label for key {sample.get('__key__', 'N/A')}: {e}")
                 return None
 
-            # 3. Determine if this is an image or video and get media bytes
-            is_image = False
+            # 2. media (video preferred, then image)
             media_bytes = None
-            media_key = None
-            
-            # Check for video formats (compound extensions first)
-            video_keys = [
-                "video.mp4", "video.avi", "video.mov", "video.webm", "video.mkv",
-                "mp4", "avi", "mov", "webm", "mkv", "flv"
-            ]
-            for key in video_keys:
+            is_image = False
+            for key in ("video.mp4", "video.avi", "video.mov", "video.webm", "video.mkv",
+                        "mp4", "avi", "mov", "webm", "mkv", "flv"):
                 if key in sample:
                     media_bytes = sample[key]
-                    media_key = key
-                    is_image = False
                     break
-            
-            # Check for image formats if no video found
             if media_bytes is None:
-                image_keys = [
-                    "image.jpg", "image.jpeg", "image.png", "image.bmp",
-                    "jpg", "jpeg", "png", "bmp", "gif"
-                ]
-                for key in image_keys:
+                for key in ("image.jpg", "image.jpeg", "image.png", "image.bmp",
+                            "jpg", "jpeg", "png", "bmp", "gif"):
                     if key in sample:
                         media_bytes = sample[key]
-                        media_key = key
                         is_image = True
                         break
-            
             if media_bytes is None:
-                # Debug: print all available keys (excluding metadata keys)
                 available_keys = [k for k in sample.keys() if not k.startswith("__")]
                 logger.warning(
-                    f"No media (video/image) found for key {sample['__key__']}. "
-                    f"Available keys: {available_keys}"
+                    f"No media for key {sample.get('__key__', 'N/A')}. Available: {available_keys}"
                 )
                 return None
 
-            # 4. Load media
+            # 3. decode
             if is_image:
                 buffer, clip_indices = self.loadimage(media_bytes, frames_per_clip)
             else:
                 buffer, clip_indices = self.loadvideo_decord(media_bytes, frames_per_clip)
-            
             if len(buffer) == 0:
-                logger.warning(f"Failed to load {media_key} media: {sample['__key__']}")
                 return None
 
-            # 5. Apply transforms (mirroring VideoDataset.get_item_video)
+            # 4. transforms
             def split_into_clips(video):
                 fpc = frames_per_clip
                 nc = self.num_clips
-                return [video[i * fpc : (i + 1) * fpc] for i in range(nc)]
+                return [video[i * fpc:(i + 1) * fpc] for i in range(nc)]
 
             if self.shared_transform is not None:
                 buffer = self.shared_transform(buffer)
-            
-            # Only split into clips for videos, not images
             if not is_image:
                 buffer = split_into_clips(buffer)
             else:
-                buffer = [buffer]  # Wrap in list for consistency
-            
+                buffer = [buffer]
             if self.transform is not None:
                 buffer = [self.transform(clip) for clip in buffer]
 
             return buffer, label, clip_indices
-        
         except Exception as e:
             logger.error(f"Error processing sample {sample.get('__key__', 'N/A')}: {e}")
             import traceback
@@ -344,100 +293,147 @@ class VideoDecoder:
             return None
 
 
-
-
-class _WeightedShardSampler(torch.utils.data.IterableDataset):
-    """
-    Infinite Weighted Shard Sampler.
-    Yields shards indefinitely based on dataset weights.
-    """
-    def __init__(self, dataset_metas, dataset_weights, rank, world_size, seed=0):
-        super().__init__()
-        self.rank = rank
-        self.world_size = world_size
-        self.seed = seed
-        self.dataset_names = [meta["name"] for meta in dataset_metas]
-        self.dataset_shard_urls = [meta["urls"] for meta in dataset_metas]
-        self.dataset_weights = dataset_weights
-        self.epoch = 0
-
-    def set_epoch(self, epoch):
-        self.epoch = epoch
-
-    def __iter__(self):
-        # Worker isolation
-        worker_info = torch.utils.data.get_worker_info()
-        worker_id = worker_info.id if worker_info else 0
-        
-        # Create a distinct seed per rank AND per worker to ensuring unique shard coverage
-        # epoch is included to shift the RNG state every training epoch
-        rng_seed = self.seed + (self.rank * 1000) + worker_id + (self.epoch * 10000)
-        rng = random.Random(rng_seed)
-
-        while True:
-            # 1. Pick a dataset based on weights
-            # random.choices is fast and handles weights natively
-            ds_idx = rng.choices(range(len(self.dataset_names)), weights=self.dataset_weights, k=1)[0]
-            
-            # 2. Pick a random shard from that dataset
-            shards = self.dataset_shard_urls[ds_idx]
-            if not shards: 
-                continue
-            
-            url = rng.choice(shards)
-            yield {"url": url}
-
-
-class UniformShardSampler(torch.utils.data.IterableDataset):
-    def __init__(self, urls, rank, world_size, seed=0):
-        self.urls = urls
-        self.rank = rank
-        self.world_size = world_size
-        self.seed = seed
-        self.epoch = 0
-        self.worker_shards = [] # Initialize here
-        self.worker_id = 0 # Initialize here
-
-    def set_epoch(self, epoch):
-        self.epoch = epoch
-    
-    def __iter__(self):
-        # Worker isolation
-        worker_info = torch.utils.data.get_worker_info()
-        num_workers = worker_info.num_workers if worker_info else 1
-        self.worker_id = worker_info.id if worker_info else 0
-
-        # Shuffle URLs based on epoch
-        rng = random.Random(self.seed + self.epoch)
-        shuffled_urls = self.urls.copy()
-        rng.shuffle(shuffled_urls)
-        
-        # Filter shards for this rank and worker
-        self.worker_shards = [] # Reset for each epoch
-        for i, url in enumerate(shuffled_urls):
-            # First split by rank
-            if i % self.world_size == self.rank:
-                # Then split by worker (within the rank's subset)
-                rank_local_idx = i // self.world_size
-                if rank_local_idx % num_workers == self.worker_id:
-                    self.worker_shards.append(url)
-        
-        # If this worker has no shards, return immediately to avoid busy loop
-        if not self.worker_shards:
-            logger.info(f"Rank {self.rank} Worker {self.worker_id} has NO shards. Returning.")
-            return
-
-        logger.info(f"Rank {self.rank} Worker {self.worker_id} initialized with {len(self.worker_shards)} shards.")
-
-        # Infinite loop over the worker's shards
-        while True:
-            random.shuffle(self.worker_shards) # Shuffle worker's shards for better mixing
-            for url in self.worker_shards:
-                yield {"url": url}
-
-
 def is_not_none(x):
     return x is not None
+
+
+class _NoOpSampler:
+    """Stub returned in place of a DistributedSampler to satisfy trainer code
+    that calls ``set_epoch`` / ``increase_epoch`` on the sampler."""
+
+    def __init__(self):
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def increase_epoch(self):
+        self.epoch += 1
+
+
+def _count_samples_in_tar(tar_path):
+    """Count distinct sample keys in one tar (members sharing a key but
+    differing by extension count once)."""
+    seen = set()
+    with tarfile.open(tar_path, "r|") as tf:
+        for member in tf:
+            if not member.isfile():
+                continue
+            name = member.name
+            dot = name.find(".")
+            key = name[:dot] if dot > 0 else name
+            seen.add(key)
+    return len(seen)
+
+
+def _load_or_build_metadata(path):
+    """Return metadata dict (with ``shard_urls`` populated). Reads
+    ``metadata.json`` if present; otherwise estimates sample_count from one
+    shard and writes a cache file for next time.
+
+    The cache is best-effort: if the dir is read-only we skip the write and
+    keep the in-memory result.
+    """
+    meta_path = os.path.join(path, "metadata.json")
+    shard_files = sorted(f for f in os.listdir(path) if f.endswith(".tar"))
+    if not shard_files:
+        raise FileNotFoundError(f"No .tar shards found under {path}")
+
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        # Patch in current shard listing in case it has changed since the cache.
+        meta["shard_count"] = len(shard_files)
+        meta["shard_urls"] = shard_files
+        meta.setdefault("name", os.path.basename(os.path.normpath(path)))
+        return meta
+
+    name = os.path.basename(os.path.normpath(path))
+    probe_shard = os.path.join(path, shard_files[0])
+    samples_in_probe = _count_samples_in_tar(probe_shard)
+    sample_count = samples_in_probe * len(shard_files)
+    logger.info(
+        f"[{name}] no metadata.json; estimated sample_count={sample_count} "
+        f"from {len(shard_files)} shards x {samples_in_probe} samples/shard"
+    )
+    meta = {
+        "name": name,
+        "shard_count": len(shard_files),
+        "sample_count": int(sample_count),
+        "shard_urls": shard_files,
+        "estimated": True,
+    }
+    try:
+        with open(meta_path, "w") as f:
+            json.dump({k: v for k, v in meta.items() if k != "shard_urls"}, f, indent=2)
+    except OSError as e:
+        logger.warning(f"[{name}] could not cache metadata.json: {e}")
+    return meta
+
+
+class _PerSampleDecode:
+    """Picklable wrapper binding (decoder, fpc) for use in WDS .map().
+
+    A closure inside _make_stream would not survive multiprocessing.spawn
+    (DataLoader workers re-execute the parent script's __main__ on Aurora
+    where 'fork' is unsafe), so we use a regular class instead.
+    """
+
+    def __init__(self, decoder, fpc):
+        self.decoder = decoder
+        self.fpc = fpc
+
+    def __call__(self, sample):
+        return self.decoder.decode(sample, self.fpc)
+
+
+def _make_stream(meta, dataset_dir, decoder, fpc, shuffle_buffer=1000,
+                 rank=None, world_size=None):
+    """Build one WDS pipeline for a single dataset that yields decoded samples.
+
+    When (rank, world_size) is provided, we slice the URL list to this rank's
+    shards BEFORE handing it to WebDataset, and disable WDS's own nodesplitter.
+    Combined with per-node shard staging (each node holds the union of its
+    LOCAL_WORLD_SIZE ranks' slices), this guarantees every rank only ever opens
+    a shard that lives on its local node's /tmp.
+
+    Per-node staging override: when WDS_LOCAL_SLICING=1 is set, we slice by
+    *local* rank/world_size instead of global. The local node's data dir holds
+    exactly the union of shards its LOCAL_WORLD_SIZE ranks need, so slicing
+    across local ranks gives disjoint coverage with no cross-node misses.
+
+    Datasets with fewer shards than world_size keep the full URL list per rank
+    (the alternative would starve most ranks of any shard at all).
+    """
+    if os.environ.get("WDS_LOCAL_SLICING", "0") == "1":
+        # Prefer the launcher-exported local ids; fall back to common PMI vars.
+        local_rank = int(os.environ.get(
+            "LOCAL_RANK", os.environ.get("PALS_LOCAL_RANKID",
+            os.environ.get("PMI_LOCAL_RANK", "0"))))
+        local_world = int(os.environ.get(
+            "LOCAL_WORLD_SIZE", os.environ.get("PALS_LOCAL_SIZE",
+            os.environ.get("PMI_LOCAL_SIZE", "1"))))
+        slice_rank, slice_ws = local_rank, local_world
+    else:
+        slice_rank, slice_ws = rank, world_size
+
+    urls = [os.path.join(dataset_dir, u) for u in meta["shard_urls"]]
+    if slice_rank is not None and slice_ws is not None and slice_ws > 1:
+        if len(urls) >= slice_ws:
+            urls = urls[slice_rank::slice_ws]
+        # else: keep full list — tiny dataset, every rank uses all shards.
+        nodesplitter = None
+    else:
+        nodesplitter = wds.split_by_node
+    stream = wds.WebDataset(
+        urls,
+        resampled=True,
+        shardshuffle=True,
+        nodesplitter=nodesplitter,
+        workersplitter=wds.split_by_worker,
+        handler=wds.warn_and_continue,
+    ).shuffle(shuffle_buffer).map(_PerSampleDecode(decoder, fpc)).select(is_not_none)
+    return stream
 
 
 def make_webdataset(
@@ -458,6 +454,7 @@ def make_webdataset(
     rank=0,
     world_size=1,
     datasets_weights=None,
+    sampling_temperature=0.5,
     collator=None,
     drop_last=True,
     num_workers=10,
@@ -465,73 +462,27 @@ def make_webdataset(
     persistent_workers=True,
     deterministic=True,
     log_dir=None,
+    ipe=None,
+    shuffle_buffer=1000,
 ):
+    """Create a WebDataset-based DataLoader honoring rank/world_size via
+    ``wds.split_by_node`` and per-dataset frames_per_clip.
+
+    Returns ``(stream, data_loader, dummy_sampler)`` matching the 3-tuple
+    contract of the other loaders in this package.
     """
-    Create a WebDataset-based data loader that replicates VideoDataset functionality.
-    
-    Note: MonitoredDataset is not supported with WebDataset as it's designed for
-    map-style datasets. Resource monitoring should be done at the training loop level.
-    """
-    
     if not isinstance(data_paths, (list, tuple)):
         data_paths = [data_paths]
-        
+
     if dataset_fpcs is None:
         dataset_fpcs = [frames_per_clip for _ in data_paths]
-    else:
-        if len(dataset_fpcs) != len(data_paths):
-            raise ValueError("Frames per clip not properly specified for data paths")
+    elif len(dataset_fpcs) != len(data_paths):
+        raise ValueError("dataset_fpcs length must match data_paths")
 
-    # 1. Load metadata for all datasets
-    dataset_metas = []
-    dataset_fpcs_map = {}
-    total_shards = 0
-    total_samples = 0
+    if datasets_weights is not None and len(datasets_weights) != len(data_paths):
+        raise ValueError("datasets_weights length must match data_paths")
 
-    for i, path in enumerate(data_paths):
-        meta_path = os.path.join(path, "metadata.json")
-        if not os.path.exists(meta_path):
-            raise FileNotFoundError(
-                f"metadata.json not found in {path}. "
-                "Please run your WebDataset creation script to generate metadata."
-            )
-        
-        with open(meta_path, 'r') as f:
-            meta = json.load(f)
-        
-        # Find all .tar files in the directory
-        shard_urls = sorted([
-            os.path.join(path, f) for f in os.listdir(path) if f.endswith('.tar')
-        ])
-        meta["urls"] = shard_urls
-        
-        if len(shard_urls) != meta["shard_count"]:
-            logger.warning(
-                f"Metadata for {meta['name']} says {meta['shard_count']} shards, "
-                f"but found {len(shard_urls)} .tar files. Using actual count."
-            )
-            meta["shard_count"] = len(shard_urls)
-            
-        dataset_metas.append(meta)
-        total_shards += meta["shard_count"]
-        total_samples += meta["sample_count"]
-        
-        # Map the dataset name to its frames_per_clip
-        dataset_fpcs_map[meta['name']] = dataset_fpcs[i]
-
-    logger.info(
-        f"Loaded {len(dataset_metas)} WebDataset manifests. "
-        f"Total shards: {total_shards}, Total samples: {total_samples}"
-    )
-    logger.info(f"Dataset FPC mapping: {dataset_fpcs_map}")
-    
-    # Estimate total number of shards to sample per epoch
-    # Use a multiplier for better shuffling
-    nshards_per_epoch = total_shards * 2
-    logger.info(f"Setting nshards_per_epoch to {nshards_per_epoch}")
-
-    # 2. Create the video decoder
-    video_decoder = VideoDecoder(
+    decoder = VideoDecoder(
         frames_per_clip=frames_per_clip,
         frame_step=frame_step,
         duration=duration,
@@ -544,95 +495,135 @@ def make_webdataset(
         transform=transform,
         shared_transform=shared_transform,
     )
-    # Give the decoder the FPC map
-    video_decoder.dataset_fpcs = dataset_fpcs_map
 
-    # 3. Create the shard sampler and processing pipeline
-    if datasets_weights is not None:
-        logger.info("Using weighted sampling (_WeightedShardSampler)...")
-        dist_sampler = _WeightedShardSampler(
-            dataset_metas=dataset_metas,
-            dataset_weights=datasets_weights,
-            rank=rank,
-            world_size=world_size,
-            seed=_GLOBAL_SEED,
-        )
-    else:
-        logger.info("Using uniform sampling (simple shard list)...")
-        all_shard_urls = [url for meta in dataset_metas for url in meta["urls"]]
-        
-        # Create a simple iterable that yields shard URLs
-        # For uniform sampling, we just cycle through all shards
-        
-        dist_sampler = UniformShardSampler(
-            urls=all_shard_urls,
-            rank=rank,
-            world_size=world_size,
-            seed=_GLOBAL_SEED,
-        )
-    
-    pipeline = wds.DataPipeline(
-        dist_sampler,
-        wds.tarfile_to_samples(handler=wds.warn_and_continue),
-        wds.shuffle(100),  # Reduced buffer size for smaller datasets
-        wds.map(video_decoder),
-        wds.select(is_not_none),
+    streams = []
+    total_samples = 0
+    total_shards = 0
+    summary = []
+    per_dataset_counts = []
+    for path, fpc in zip(data_paths, dataset_fpcs):
+        meta = _load_or_build_metadata(path)
+        streams.append(_make_stream(
+            meta, path, decoder, fpc, shuffle_buffer,
+            rank=rank, world_size=world_size,
+        ))
+        total_samples += int(meta.get("sample_count", 0))
+        total_shards += int(meta.get("shard_count", 0))
+        per_dataset_counts.append(int(meta.get("sample_count", 0)))
+        summary.append((meta["name"], meta.get("shard_count"), meta.get("sample_count")))
+
+    logger.info(
+        f"WebDataset: {len(streams)} stream(s), {total_shards} shards, "
+        f"~{total_samples} samples; per-dataset: {summary}"
     )
 
-    # 4. Create the final DataLoader
+    if len(streams) == 1:
+        mixed = streams[0]
+    else:
+        sample_counts = [int(m or 0) for m in per_dataset_counts]
+        probs = compute_mixing_probs(
+            sample_counts,
+            datasets_weights=datasets_weights,
+            temperature=sampling_temperature,
+        )
+        # Log the REALIZED training mixture vs the true corpus fractions so an
+        # oversampling regression (like the old uniform-per-source default that
+        # gave an 8-clip set 9% of all training) is visible on iteration 0.
+        total = float(sum(sample_counts)) or 1.0
+        logger.info(
+            "WebDataset mixing (temperature=%.3f): realized per-source sample "
+            "fractions vs true corpus fractions:", sampling_temperature
+        )
+        # Tripwire: expected #times each *individual* clip is shown per epoch =
+        # (samples drawn from this source per epoch) / (unique clips it has).
+        # This is the quantity that maps directly to memorization, independent
+        # of temperature. The old uniform default drove this into the hundreds
+        # for tiny sets (e.g. 8-clip endovis15 each clip ~hundreds of times per
+        # epoch) while kinetics clips were seen <1x.
+        names = [s[0] for s in summary]
+        epoch_samples = total  # ~one pass over the corpus per nominal epoch
+        reps_per_clip = []
+        for name, cnt, p in zip(names, sample_counts, probs):
+            reps = (p * epoch_samples / cnt) if cnt > 0 else float("inf")
+            reps_per_clip.append((name, cnt, p, reps))
+            logger.info(
+                "  %-24s n=%-8d true=%6.2f%%  realized=%6.2f%%  "
+                "reps/clip/epoch=%.2f",
+                name, cnt, 100.0 * cnt / total, 100.0 * p, reps,
+            )
+        # Two-level guard on per-clip repetition (the memorization signature).
+        # WARN: any tiny set whose clips repeat a lot — visible but allowed,
+        #   since keeping micro-datasets under temperature sampling is a
+        #   deliberate choice (e.g. endovis15's 8 clips ~80x/epoch at T=0.5).
+        # FAIL: an egregious level that only the broken uniform-per-source
+        #   default produced (tiny sets in the thousands of reps/epoch) — that
+        #   is never intentional and indicates a temperature/weights regression.
+        warn_reps = float(os.environ.get("VJEPA_WARN_REPS_PER_CLIP", "50"))
+        fail_reps = float(os.environ.get("VJEPA_MAX_REPS_PER_CLIP", "1000"))
+        worst = max(reps_per_clip, key=lambda r: r[3])
+        if worst[3] > fail_reps:
+            raise RuntimeError(
+                f"Dataset mixing tripwire: source '{worst[0]}' ({worst[1]} "
+                f"unique clips) would show each clip ~{worst[3]:.0f} times per "
+                f"epoch (realized share {100*worst[2]:.1f}%), exceeding the "
+                f"hard limit {fail_reps:.0f}. This is the oversampling/"
+                f"memorization regression (the old uniform default did this). "
+                f"Fix sampling_temperature/datasets_weights, drop the micro-"
+                f"dataset, or raise VJEPA_MAX_REPS_PER_CLIP if truly intended."
+            )
+        for name, cnt, p, reps in reps_per_clip:
+            if reps > warn_reps:
+                logger.warning(
+                    "Dataset mixing: '%s' (%d clips) repeats each clip ~%.0fx "
+                    "per epoch (share %.1f%%) — memorization risk; kept by "
+                    "config (temperature=%.2f).",
+                    name, cnt, reps, 100.0 * p, sampling_temperature,
+                )
+        mixed = wds.RandomMix(streams, probs=probs)
+
+    if ipe is None:
+        if total_samples > 0 and world_size > 0 and batch_size > 0:
+            samples_per_rank = max(1, total_samples // world_size)
+            ipe = max(1, samples_per_rank // batch_size)
+        else:
+            ipe = 1
+    ipe = int(ipe)
+
+    # Build the WebLoader WITHOUT .with_epoch(ipe). The trainer's outer loop
+    # (`for itr in range(ipe)`) drives epoch boundaries; the loader is purely
+    # infinite (sources are resampled=True). Adding .with_epoch makes the
+    # iterator raise StopIteration after ipe batches; at 192 ranks, the
+    # subsequent `iter(unsupervised_loader)` re-entry hangs after the first
+    # successful re-iter — phase-1 job 8527315 (2026-06-06) hung permanently
+    # at the 2nd epoch boundary and wasted ~4h of walltime.
     data_loader = wds.WebLoader(
-        pipeline,
+        mixed,
         collate_fn=collator,
         batch_size=batch_size,
-        shuffle=False,  # Shuffling is handled by the shard sampler
+        shuffle=False,
         drop_last=drop_last,
         pin_memory=pin_mem,
         num_workers=num_workers,
-        prefetch_factor=2, # Load 4 batches ahead per worker (adjust as needed)
+        prefetch_factor=2,
         persistent_workers=(num_workers > 0) and persistent_workers,
     )
-    
-    # Calculate total samples across all datasets
-    total_samples = sum([meta["sample_count"] for meta in dataset_metas])
-    
-    # Calculate batches per rank
-    # We divide by world_size because each rank sees a subset of shards (roughly)
-    # We divide by batch_size to get number of steps
-    if total_samples > 0:
-        # If we have the total count, we can calculate exact batches
-        # We assume drop_last=True behavior for the loader if we want exact sync
-        samples_per_rank = total_samples // world_size
-        batches_per_rank = samples_per_rank // batch_size
-        # Safety margin: reduce by 1 to handle uneven shard sizes or dropped samples
-        if batches_per_rank > 0:
-            batches_per_rank -= 1
-    else:
-        batches_per_rank = math.ceil((total_samples / world_size) / batch_size)
-    
-    # Increase virtual epoch length to amortize dataloader overhead
-    # Since we use infinite sampling, this just means more steps per "epoch"
-    batches_per_rank *= 10
-    
-    # Ensure at least 1 batch
-    batches_per_rank = max(1, batches_per_rank)
-    
-    data_loader = data_loader.with_epoch(batches_per_rank)
-    
-    # Monkey patch __len__ since WebLoader/Processor might not expose it
-    # This is needed for eval.py to calculate iterations_per_epoch
-    class LenWrapper:
+
+    class _LenWrapper:
         def __init__(self, loader, length):
             self.loader = loader
             self.length = length
+
         def __iter__(self):
             return iter(self.loader)
+
         def __len__(self):
             return self.length
+
         def __getattr__(self, name):
             return getattr(self.loader, name)
 
-    data_loader = LenWrapper(data_loader, batches_per_rank)
+    data_loader = _LenWrapper(data_loader, ipe)
+    logger.info(f"WebDataset loader ready: batches_per_rank={ipe}, batch_size={batch_size}")
 
-    logger.info(f"WebDataset data loader created. Virtual Epoch Steps: {batches_per_rank}")
-
-    return dist_sampler, data_loader, dist_sampler
+    sampler = _NoOpSampler()
+    return mixed, data_loader, sampler

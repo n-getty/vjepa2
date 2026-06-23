@@ -34,9 +34,12 @@ def init_data(
     filter_short_videos=False,
     filter_long_videos=int(1e9),
     datasets_weights=None,
+    sampling_temperature=0.5,
     persistent_workers=False,
     deterministic=True,
     log_dir=None,
+    sequence_labels=False,
+    return_sample_path=False,
 ):
     if data.lower() == "imagenet":
         from src.datasets.imagenet1k import make_imagenet1k
@@ -83,6 +86,8 @@ def init_data(
             rank=rank,
             deterministic=deterministic,
             log_dir=log_dir,
+            sequence_labels=sequence_labels,
+            return_sample_path=return_sample_path,
         )
 
     elif data.lower() == "webdataset":
@@ -104,6 +109,7 @@ def init_data(
             shared_transform=shared_transform,
             transform=transform,
             datasets_weights=datasets_weights,
+            sampling_temperature=sampling_temperature,
             collator=collator,
             num_workers=num_workers,
             pin_mem=pin_mem,

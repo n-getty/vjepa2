@@ -21,6 +21,11 @@ data:
   - 1.0
   - 1.0
   - 1.0
+  # Source-mixing temperature for RandomMix (src/datasets/webdataset.py
+  # compute_mixing_probs). 0.5 = sqrt-size sampling. The old implicit default
+  # was 0.0 (uniform-per-source), which oversampled tiny sets (e.g. CRCD=207
+  # got the same share as surgtoolloc2022=24686, a ~120x oversample).
+  sampling_temperature: 0.5
   # Per-rank batch must be >= 2 (the d_weights path in app/vjepa_2_1/train.py
   # crashes at bs=1 — d_ij.unsqueeze(2) IndexError, per CLAUDE.md gotcha).
   # bs=16 is the verified upper bound on Aurora Max 1550 tile (~55 GB used /

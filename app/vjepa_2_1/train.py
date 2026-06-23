@@ -133,6 +133,11 @@ def main(args, resume_preempt=False):
     dataset_type = cfgs_data.get("dataset_type", "videodataset")
     dataset_paths = cfgs_data.get("datasets", [])
     datasets_weights = cfgs_data.get("datasets_weights")
+    # Per-sample source-selection temperature for WebDataset RandomMix.
+    # 1.0 = size-proportional (uniform over true corpus); 0.5 = sqrt-size
+    # (default, down-weights tiny sets without erasing them); 0.0 = the old
+    # uniform-per-source behavior that catastrophically oversampled tiny sets.
+    sampling_temperature = cfgs_data.get("sampling_temperature", 0.5)
     dataset_fpcs = cfgs_data.get("dataset_fpcs")
     max_num_frames = max(dataset_fpcs)
     batch_size = cfgs_data.get("batch_size")
@@ -338,6 +343,9 @@ def main(args, resume_preempt=False):
         ("%.2f", "backward-ms"),
         ("%.2f", "opt-step-ms"),
         ("%.2f", "ema-ms"),
+        ("%.5f", "loss-pred"),
+        ("%.5f", "loss-context"),
+        ("%.5f", "lambda"),
     )
 
     # -- init model
@@ -413,6 +421,7 @@ def main(args, resume_preempt=False):
         rank=data_rank,
         world_size=data_world_size,
         datasets_weights=datasets_weights,
+        sampling_temperature=sampling_temperature,
         collator=mask_collator,
         num_workers=num_workers,
         pin_mem=pin_mem,
@@ -448,6 +457,8 @@ def main(args, resume_preempt=False):
         num_epochs=num_epochs,
         ipe_scale=ipe_scale,
         mixed_precision=mixed_precision,
+        dtype=dtype,
+        device=device,
         betas=betas,
         eps=eps,
     )
@@ -732,6 +743,8 @@ def main(args, resume_preempt=False):
                     loss += loss_pred
 
                     # Context loss
+                    loss_context = torch.zeros((), device=loss_pred.device)
+                    lambda_value_step = 0.0
                     if predict_all:
                         distance_weights = compute_mask_distance(
                             masks_pred, masks_enc, grid_size, offset_context_loss
@@ -802,6 +815,9 @@ def main(args, resume_preempt=False):
 
                 return (
                     float(loss),
+                    float(loss_pred),
+                    float(loss_context),
+                    float(lambda_value_step),
                     _new_lr,
                     _new_wd,
                     run_step,
@@ -809,6 +825,9 @@ def main(args, resume_preempt=False):
 
             (
                 loss,
+                loss_pred_val,
+                loss_context_val,
+                lambda_value_step_val,
                 _new_lr,
                 _new_wd,
                 run_step,
@@ -851,6 +870,9 @@ def main(args, resume_preempt=False):
                     phase_backward,
                     phase_opt_step,
                     phase_ema,
+                    loss_pred_val,
+                    loss_context_val,
+                    lambda_value_step_val,
                 )
                 if (
                     (itr % log_freq == 0)
@@ -859,7 +881,7 @@ def main(args, resume_preempt=False):
                     or np.isinf(loss)
                 ):
                     logger.info(
-                        "[%d, %5d] loss: %.3f "
+                        "[%d, %5d] loss: %.3f (pred=%.3f ctx=%.3f λ=%.3f) "
                         "masks: %s "
                         "[wd: %.2e] [lr: %.2e] "
                         "[mem: %.2e] "
@@ -870,6 +892,9 @@ def main(args, resume_preempt=False):
                             epoch + 1,
                             itr,
                             loss_meter.avg,
+                            loss_pred_val,
+                            loss_context_val,
+                            lambda_value_step_val,
                             "["
                             + ", ".join(
                                 [

@@ -52,18 +52,57 @@ def _prepare_state_dict_for_module(module, pretrained_dict):
     return {f"{prefix}{k}": v for k, v in normalized.items()}
 
 
-def _load_pretrained_module(module, pretrained_dict, module_name, epoch):
+def _load_pretrained_module(
+    module, pretrained_dict, module_name, epoch, min_match_frac=0.5
+):
     prepared_dict = _prepare_state_dict_for_module(module, pretrained_dict)
-    for key, value in module.state_dict().items():
+    model_keys = module.state_dict()
+    missing, shape_mismatch, matched = [], [], 0
+    for key, value in model_keys.items():
         if key not in prepared_dict:
-            logger.info(f'key "{key}" could not be found in loaded state dict')
+            missing.append(key)
         elif prepared_dict[key].shape != value.shape:
-            logger.info(
-                f'key "{key}" is of different shape in model and loaded state dict'
-            )
-            prepared_dict[key] = value
+            shape_mismatch.append(key)
+            prepared_dict[key] = value  # keep model's init tensor on mismatch
+        else:
+            matched += 1
+
+    n_total = max(1, len(model_keys))
+    match_frac = matched / n_total
+    # A wrong key-prefix guess or an unexpected checkpoint layout makes (almost)
+    # every key "missing"; load_state_dict(strict=False) then swallows it and
+    # the module silently TRAINS FROM INIT while the loss curve still looks
+    # plausible (EMA self-distillation from init falls smoothly but wrongly).
+    # Fail loud instead of logging at INFO and moving on. This is exactly the
+    # silent-corruption class that the SDPA bug taught us to refuse.
+    if match_frac < min_match_frac:
+        raise RuntimeError(
+            f"load_pretrained: only {matched}/{n_total} keys "
+            f"({match_frac:.1%}) of '{module_name}' matched the checkpoint "
+            f"(epoch {epoch}); {len(missing)} missing, "
+            f"{len(shape_mismatch)} shape-mismatched. This almost always means "
+            f"a wrong checkpoint key or prefix — the module would train from "
+            f"init. First few missing: {missing[:5]}. "
+            f"First few checkpoint keys: {list(prepared_dict)[:5]}."
+        )
+
+    if missing:
+        logger.warning(
+            "load_pretrained[%s]: %d/%d keys missing from checkpoint "
+            "(kept at init). First few: %s",
+            module_name, len(missing), n_total, missing[:5],
+        )
+    if shape_mismatch:
+        logger.warning(
+            "load_pretrained[%s]: %d keys shape-mismatched (kept at init): %s",
+            module_name, len(shape_mismatch), shape_mismatch[:5],
+        )
     msg = module.load_state_dict(prepared_dict, strict=False)
-    logger.info(f"loaded pretrained {module_name} from epoch {epoch} with msg: {msg}")
+    logger.info(
+        "loaded pretrained %s from epoch %s: matched %d/%d keys (%.1f%%); "
+        "load_state_dict msg: %s",
+        module_name, epoch, matched, n_total, 100.0 * match_frac, msg,
+    )
 
 
 def normalize_and_concat(tensor, embed_dim):
@@ -387,6 +426,8 @@ def init_opt(
     final_wd=1e-6,
     final_lr=0.0,
     mixed_precision=False,
+    dtype=None,
+    device=None,
     ipe_scale=1.25,
     betas=(0.9, 0.999),
     eps=1e-8,
@@ -459,5 +500,26 @@ def init_opt(
         T_max=int(ipe_scale * num_epochs * iterations_per_epoch),
     )
 
-    scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
+    # Loss scaling is only meaningful for fp16; bf16 has fp32-range exponent and
+    # needs none. The old `torch.cuda.amp.GradScaler()` is silently DISABLED on
+    # a CUDA-less box (XPU): scale/unscale/step/update all become no-ops with
+    # only a warning. That's fine for bf16 (the only dtype we run today) but a
+    # silent footgun for fp16 — gradients would underflow with no scaling and
+    # no error. Make the scaler device-aware and only enable it for fp16, then
+    # assert it is actually enabled so an fp16 run can't silently train unscaled.
+    scaler = None
+    if mixed_precision and dtype == torch.float16:
+        _dev = device.type if device is not None else (
+            "cuda" if torch.cuda.is_available()
+            else ("xpu" if hasattr(torch, "xpu") and torch.xpu.is_available()
+                  else "cpu")
+        )
+        scaler = torch.amp.GradScaler(device=_dev)
+        if not scaler.is_enabled():
+            raise RuntimeError(
+                f"float16 training requires an enabled GradScaler, but it is "
+                f"disabled on device '{_dev}'. Loss scaling would be a no-op "
+                f"and fp16 gradients would underflow. Use bfloat16 or a device "
+                f"with GradScaler support."
+            )
     return optimizer, scaler, scheduler, wd_scheduler
