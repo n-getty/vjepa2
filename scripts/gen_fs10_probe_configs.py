@@ -32,6 +32,10 @@ CACHE = "/flare/ModCon/ngetty/surg_2_1_v2_final/probes/fs10_cache"
 
 V2 = "/flare/ModCon/ngetty/checkpoints/surg_2_1_v2_final/lr75e6_wu2_decay_n16g12_weak"
 V1 = "/flare/ModCon/ngetty/checkpoints/surg_2_1_v1/phase2_main_n16g12_weak"
+# v3 = lambda-off, BLACK-CLIP-FILTERED data, otherwise identical to v2 (gb384,
+# lr7.5e-5 wu2, 256px). Probing v3 e9 vs v2 e9 (63.74) isolates the data fix;
+# e4 vs e9 reads the WITHIN-version trend (does v3 decline like v1/v2 did?).
+V3 = "/flare/ModCon/ngetty/checkpoints/surg_2_1_v3_lambdaoff_cleandata/lr75e6_wu2_256_n16g12_weak"
 META = "/flare/ModCon/ngetty/checkpoints/vjepa2_1_vitl_dist_vitG_384.pt"
 
 # (tag, checkpoint, checkpoint_key)
@@ -41,6 +45,9 @@ SPECS = [
     ("v2_e19", f"{V2}/e19.pth.tar", "target_encoder"),
     ("v1_e9", f"{V1}/e9.pth.tar", "target_encoder"),
     ("v1_e29", f"{V1}/e29.pth.tar", "target_encoder"),
+    ("v3_e4", f"{V3}/e4.pth.tar", "target_encoder"),
+    ("v3_e9", f"{V3}/e9.pth.tar", "target_encoder"),
+    ("v3_e19", f"{V3}/e19.pth.tar", "target_encoder"),
 ]
 
 
