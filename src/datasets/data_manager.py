@@ -35,6 +35,7 @@ def init_data(
     filter_long_videos=int(1e9),
     datasets_weights=None,
     sampling_temperature=0.5,
+    min_clip_std=None,
     persistent_workers=False,
     deterministic=True,
     log_dir=None,
@@ -118,6 +119,7 @@ def init_data(
             rank=rank,
             deterministic=deterministic,
             log_dir=log_dir,
+            **({} if min_clip_std is None else {"min_clip_std": min_clip_std}),
         )
 
     return (data_loader, dist_sampler)

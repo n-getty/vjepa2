@@ -21,6 +21,69 @@ from decord import VideoReader, cpu
 _GLOBAL_SEED = 0
 logger = getLogger()
 
+# Default per-pixel std (on the raw 0-255 uint8 buffer) below which a decoded
+# clip is treated as degenerate (e.g. a pure-black or frozen frame). ~19% of
+# surgvu24 clips are one byte-identical pure-black mp4 (decoded std == 0.0);
+# at the realized mix that was ~4.4% of every training batch, a degenerate
+# masked-prediction target that drives collapse pressure compounding with
+# epochs. We reject any clip whose decoded std is below this floor. The floor
+# is well below any genuine surgical clip (the most static real source,
+# surgvu24's non-black clips, sits far above 1.0) so real data is never
+# dropped. Override via VJEPA_MIN_CLIP_STD.
+_DEFAULT_MIN_CLIP_STD = float(os.environ.get("VJEPA_MIN_CLIP_STD", "1.0"))
+
+# --- Batch-source / clip-variance instrumentation -------------------------
+# Per-process (DataLoader worker) diagnostics. Two purposes:
+#   1. Mechanism-check: log the source + raw per-pixel std of the first
+#      VJEPA_LOG_FIRST_N decoded clips so a corrupted source (e.g. surgvu24's
+#      pure-black clips, std==0) is visible at training start.
+#   2. Permanent tripwire: aggregate kept/dropped counts per source so the
+#      drop rate (degenerate-clip prevalence) is observable in logs over a run.
+# Workers are separate processes; each logs independently. We restrict the
+# verbose per-sample log to the canonical worker (global rank 0, worker 0) to
+# avoid 24x-duplicated lines, but every worker keeps its own drop/keep tally.
+_LOG_FIRST_N = int(os.environ.get("VJEPA_LOG_FIRST_N", "64"))
+_clip_diag = {"seen": 0, "dropped": {}, "kept": {}}
+
+
+def _is_canonical_worker():
+    """True only on global rank 0's first DataLoader worker (or main process)."""
+    rank = os.environ.get("RANK", os.environ.get("PMI_RANK",
+           os.environ.get("PALS_RANKID", "0")))
+    if str(rank) != "0":
+        return False
+    info = torch.utils.data.get_worker_info()
+    return info is None or info.id == 0
+
+
+def _record_kept_clip(source_name, clip_std):
+    src = source_name or "?"
+    _clip_diag["kept"][src] = _clip_diag["kept"].get(src, 0) + 1
+    if _clip_diag["seen"] < _LOG_FIRST_N and _is_canonical_worker():
+        _clip_diag["seen"] += 1
+        logger.info(
+            "[clip-diag] #%d source=%-24s raw_std=%.3f keep "
+            "(per-source kept=%d dropped=%d)",
+            _clip_diag["seen"], src, clip_std,
+            _clip_diag["kept"].get(src, 0), _clip_diag["dropped"].get(src, 0),
+        )
+
+
+def _record_dropped_clip(source_name, clip_std):
+    src = source_name or "?"
+    _clip_diag["dropped"][src] = _clip_diag["dropped"].get(src, 0) + 1
+    # Always surface a periodic per-source drop tally (first few + every 50)
+    # so a high-prevalence corrupt source is unmissable past the first-N window.
+    d = _clip_diag["dropped"][src]
+    if d <= 5 or d % 50 == 0:
+        k = _clip_diag["kept"].get(src, 0)
+        total = d + k
+        logger.warning(
+            "[clip-diag] source=%s cumulative dropped=%d kept=%d "
+            "(%.1f%% degenerate)",
+            src, d, k, 100.0 * d / total if total else 0.0,
+        )
+
 
 def compute_mixing_probs(sample_counts, datasets_weights=None, temperature=0.5):
     """Per-sample source-selection probabilities for ``wds.RandomMix``.
@@ -96,7 +159,9 @@ class VideoDecoder:
         filter_long_videos=int(10**9),
         transform=None,
         shared_transform=None,
+        min_clip_std=_DEFAULT_MIN_CLIP_STD,
     ):
+        self.min_clip_std = float(min_clip_std)
         self.frames_per_clip = frames_per_clip
         self.frame_step = frame_step
         self.duration = duration
@@ -219,8 +284,13 @@ class VideoDecoder:
         buffer = buffer.numpy()
         return buffer, clip_indices
 
-    def decode(self, sample, frames_per_clip):
-        """Decode a webdataset sample dict into (clips, label, clip_indices)."""
+    def decode(self, sample, frames_per_clip, source_name=None):
+        """Decode a webdataset sample dict into (clips, label, clip_indices).
+
+        ``source_name`` (the originating dataset, e.g. ``surgvu24``) is used
+        only for diagnostics — black-clip rejection logging and the optional
+        rank-0 batch-source instrumentation. It does not affect decoding.
+        """
         try:
             # 1. label
             label_bytes = None
@@ -269,6 +339,26 @@ class VideoDecoder:
                 buffer, clip_indices = self.loadvideo_decord(media_bytes, frames_per_clip)
             if len(buffer) == 0:
                 return None
+
+            # 3b. Degenerate-clip reject (run on the RAW 0-255 buffer, BEFORE
+            # transforms — normalization would erase the black signal). A clip
+            # whose per-pixel std is below the floor is pure-black / frozen and
+            # is a degenerate masked-prediction target. We drop it (return None
+            # -> .select(is_not_none) skips it -> resampled stream draws the
+            # next sample). Skip for images (single repeated frame -> 0 temporal
+            # variance is expected and benign for the image branch).
+            if not is_image and self.min_clip_std > 0.0:
+                clip_std = float(np.asarray(buffer, dtype=np.float32).std())
+                if clip_std < self.min_clip_std:
+                    key = sample.get("__key__", "N/A")
+                    logger.warning(
+                        "Dropping degenerate clip (std=%.4f < %.4f) "
+                        "source=%s key=%s — likely black/frozen frame.",
+                        clip_std, self.min_clip_std, source_name or "?", key,
+                    )
+                    _record_dropped_clip(source_name, clip_std)
+                    return None
+                _record_kept_clip(source_name, clip_std)
 
             # 4. transforms
             def split_into_clips(video):
@@ -379,12 +469,13 @@ class _PerSampleDecode:
     where 'fork' is unsafe), so we use a regular class instead.
     """
 
-    def __init__(self, decoder, fpc):
+    def __init__(self, decoder, fpc, source_name=None):
         self.decoder = decoder
         self.fpc = fpc
+        self.source_name = source_name
 
     def __call__(self, sample):
-        return self.decoder.decode(sample, self.fpc)
+        return self.decoder.decode(sample, self.fpc, source_name=self.source_name)
 
 
 def _make_stream(meta, dataset_dir, decoder, fpc, shuffle_buffer=1000,
@@ -432,7 +523,9 @@ def _make_stream(meta, dataset_dir, decoder, fpc, shuffle_buffer=1000,
         nodesplitter=nodesplitter,
         workersplitter=wds.split_by_worker,
         handler=wds.warn_and_continue,
-    ).shuffle(shuffle_buffer).map(_PerSampleDecode(decoder, fpc)).select(is_not_none)
+    ).shuffle(shuffle_buffer).map(
+        _PerSampleDecode(decoder, fpc, source_name=meta.get("name"))
+    ).select(is_not_none)
     return stream
 
 
@@ -449,6 +542,7 @@ def make_webdataset(
     allow_clip_overlap=False,
     filter_short_videos=False,
     filter_long_videos=int(10**9),
+    min_clip_std=_DEFAULT_MIN_CLIP_STD,
     transform=None,
     shared_transform=None,
     rank=0,
@@ -492,6 +586,7 @@ def make_webdataset(
         allow_clip_overlap=allow_clip_overlap,
         filter_short_videos=filter_short_videos,
         filter_long_videos=filter_long_videos,
+        min_clip_std=min_clip_std,
         transform=transform,
         shared_transform=shared_transform,
     )

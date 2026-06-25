@@ -1,0 +1,187 @@
+# V3 — lambda-OFF, CLEANED-DATA short CPT from the Meta distilled ViT-L.
+#
+# PURPOSE (isolation run): does surgical JEPA *prediction-loss* continuation on
+# CLEANED data help the downstream probe — separated from (a) the untested
+# context-loss branch and (b) the black-clip corruption?
+#
+# This is a controlled ablation against the EXISTING dirty-data v2 checkpoints:
+#   - v2_e9  (fs10 63.74) and v2_e19 (fs10 61.13) were trained with the SAME
+#     recipe (16x12 bs2 = gb384, ipe500, lr7.5e-5 wu2, 256px, ema flat 0.99925)
+#     and were ALSO lambda=0 at those epochs (the v2 lambda ramp starts ~e30).
+#   - The ONLY differences here are: (1) lambda explicitly held at 0 for the
+#     whole run, and (2) the degenerate-clip reject is ON (min_clip_std=1.0),
+#     so surgvu24's ~19% byte-identical pure-black clips never enter a batch.
+#   => Probing this run's e9/e19 vs the dirty v2 e9/e19 isolates the DATA FIX.
+#
+# Everything else is held identical to configs/.../v2_final_lr75e6.yaml on
+# purpose — do NOT also change resolution / EMA / LR schedule here, or the
+# comparison reintroduces the multi-axis confound. Recipe improvements
+# (384px, anchored EMA, LR cooldown) belong in a SEPARATE run.
+#
+# Comparability REQUIRES the same topology (16 nodes x 12 tasks x bs2 = gb384,
+# ipe500) so e9/e19 land at the same optimizer-step counts as v2.
+app: vjepa_2_1
+nodes: 16
+tasks_per_node: 12
+cpus_per_task: 16
+mem_per_gpu: 40G
+folder: /flare/ModCon/ngetty/checkpoints/surg_2_1_v3_lambdaoff_cleandata/lr75e6_wu2_256
+data:
+  num_clips: 10
+  dataset_type: WebDataset
+  datasets:
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/crcd
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/endovis15
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/jigsaw
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/kinetics400
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/miccai_2017
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/miccai_endoseg
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/sitl
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_robotic
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgtoolloc2022
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvisdom
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvu24
+  datasets_weights:
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  sampling_temperature: 0.5
+  # Degenerate (black/frozen) clip reject floor on the raw 0-255 per-pixel std.
+  # Drops surgvu24's ~19% byte-identical pure-black clips (decoded std==0) and
+  # any other frozen-frame corruption before they reach a batch. Real surgical
+  # clips sit far above 1.0, so genuine data is never dropped. THIS is the data
+  # fix that distinguishes v3 from the dirty-data v2 run. Set 0 to disable.
+  min_clip_std: 1.0
+  batch_size: 2
+  crop_size: 256
+  patch_size: 16
+  dataset_fpcs:
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  tubelet_size: 2
+  fps: 4
+  num_workers: 2
+  persistent_workers: true
+  pin_mem: true
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+loss:
+  loss_exp: 1.0
+  predict_all: true
+  shift_by_n: 0
+  # Held IDENTICAL to v2_final (true). NOTE: this flag does NOT enable/disable
+  # the context loss — loss_context is always computed when predict_all:true;
+  # weight_distance_loss only selects whether distance weighting (d_weights) is
+  # applied inside it. The context loss enters the total ONLY via
+  # `loss += loss_context * lambda_value_step`, and lambda_value_step is 0 for
+  # this whole run (see model.lambda_value_vid). So with lambda=0 the gradient
+  # is identical regardless of this flag; we keep it true to match v2 exactly.
+  weight_distance_loss: true
+mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 8
+  spatial_scale:
+  - 0.15
+  - 0.15
+  temporal_scale:
+  - 1.0
+  - 1.0
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 2
+  spatial_scale:
+  - 0.7
+  - 0.7
+  temporal_scale:
+  - 1.0
+  - 1.0
+meta:
+  context_encoder_key: ema_encoder
+  dtype: bfloat16
+  eval_freq: 1000000000
+  load_checkpoint: true
+  load_predictor: false
+  pretrain_checkpoint: /flare/ModCon/ngetty/checkpoints/vjepa2_1_vitl_dist_vitG_384.pt
+  read_checkpoint: null
+  save_every_freq: 5
+  seed: 239
+  target_encoder_key: ema_encoder
+  # SDPA fix is in the app-local _sdpa (commit 6d483b2); use_sdpa:true now goes
+  # through the corrected (non-transposed) path, same as v2_final.
+  use_sdpa: true
+model:
+  has_cls_first: false
+  img_temporal_dim_size: 1
+  interpolate_rope: true
+  is_causal: false
+  # Context-loss branch held OFF for the whole run (isolation). Two independent
+  # guarantees: (1) lambda_value_vid: 0.0 -> loss_context*0 == 0 even if the
+  # progressive ramp fires; (2) the Lambda_LinearWarmupHold ramp only STARTS at
+  # global iter 15000, and this run is 20ep x 500ipe = 10000 iters total, so the
+  # ramp never begins regardless. Either alone suffices; both = no confound.
+  # (lambda_progressive left at its default True; harmless given the above.)
+  lambda_value_vid: 0.0
+  modality_embedding: true
+  model_name: vit_large
+  n_registers: 0
+  n_registers_predictor: 0
+  normalize_predictor: false
+  pred_depth: 24
+  pred_embed_dim: 384
+  pred_is_causal: false
+  pred_num_heads: 12
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_mask_tokens: true
+  use_rope: true
+  zero_init_mask_tokens: true
+optimization:
+  ema:
+  - 0.99925
+  - 0.99925
+  # Short horizon: both v1 and v2 peaked ~e9 and declined by e19-e29; 20 epochs
+  # covers the e9/e19 comparison points against dirty-data v2 without burning
+  # compute on the long tail. (Held identical otherwise to v2_final.)
+  epochs: 20
+  final_lr: 1.0e-06
+  final_weight_decay: 0.04
+  ipe: 500
+  ipe_scale: 1.0
+  lr: 7.5e-05
+  start_lr: 1.0e-06
+  warmup: 2.0
+  weight_decay: 0.04

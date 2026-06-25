@@ -138,6 +138,11 @@ def main(args, resume_preempt=False):
     # (default, down-weights tiny sets without erasing them); 0.0 = the old
     # uniform-per-source behavior that catastrophically oversampled tiny sets.
     sampling_temperature = cfgs_data.get("sampling_temperature", 0.5)
+    # Degenerate-clip reject floor (raw 0-255 per-pixel std). None -> use the
+    # webdataset module default (env VJEPA_MIN_CLIP_STD, default 1.0). Drops
+    # pure-black/frozen clips (e.g. surgvu24's ~19% byte-identical black mp4)
+    # before they enter a batch. Set 0 in config to disable.
+    min_clip_std = cfgs_data.get("min_clip_std")
     dataset_fpcs = cfgs_data.get("dataset_fpcs")
     max_num_frames = max(dataset_fpcs)
     batch_size = cfgs_data.get("batch_size")
@@ -422,6 +427,7 @@ def main(args, resume_preempt=False):
         world_size=data_world_size,
         datasets_weights=datasets_weights,
         sampling_temperature=sampling_temperature,
+        min_clip_std=min_clip_std,
         collator=mask_collator,
         num_workers=num_workers,
         pin_mem=pin_mem,
