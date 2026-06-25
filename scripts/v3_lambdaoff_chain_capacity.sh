@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# Self-resubmitting clean-test pretraining loop, 1h walltime on debug-scaling.
+# Self-resubmitting v3 isolation run, 24h walltime on the capacity queue.
 #
-# Runs the surg_2_1_v2 "clean bug-fix" experiment: the EXACT regression recipe
-# (lr=5.25e-4 constant, lambda_value_vid=0.5 progressive, bs=2, global 384) but
-# with the SDPA layout fix + temperature-0.5 dataset mixing, from the Meta
-# distilled init. Tests whether the downstream regression still happens once the
-# attention/data bugs are fixed.
+# Runs surg_2_1_v3_lambdaoff_cleandata: lambda OFF + black-clip-filtered data,
+# otherwise byte-identical to v2_final (gb384, lr7.5e-5 wu2, 256px, ema flat
+# 0.99925, 20 epochs). Isolates the DATA FIX (surgvu24 ~19-23% pure-black clips
+# now dropped at decode) vs the existing dirty-data v2 e9/e19 checkpoints.
 #
-# Capacity queue was backed up (~750 nodes queued); debug-scaling backfills 1h
-# jobs faster and is a SEPARATE per-user slot (max_run=1). This chain
-# self-resubmits via afterany so it makes continuous progress 1h at a time;
-# the run is resumable (load_checkpoint: true, save_every_freq=1000 iters).
+# Capacity allows up to 168h walltime (16-node max); a single 24h slice should
+# finish all 20 epochs with NO requeue/re-stage overhead. The chain is kept as
+# crash/walltime insurance only — the run is resumable (load_checkpoint: true,
+# save_every_freq=5 epochs), so a successor picks up latest.pth.tar if a slice
+# dies. Capacity is a SEPARATE per-user slot from debug-scaling.
 #
 # Submit first instance with:
-#   qsub /lus/flare/projects/ModCon/ngetty/vjepa2/scripts/v2_final_chain_debugscaling.sh
+#   qsub /lus/flare/projects/ModCon/ngetty/vjepa2/scripts/v3_lambdaoff_chain_capacity.sh
 #
-#PBS -N v3_loff_chain
+#PBS -N v3_loff_cap
 #PBS -A ModCon
-#PBS -q debug-scaling
+#PBS -q capacity
 #PBS -l select=16
-#PBS -l walltime=01:00:00
+#PBS -l walltime=24:00:00
 #PBS -l filesystems=home:flare
 #PBS -j oe
 #PBS -o /flare/ModCon/ngetty/logs/
@@ -31,7 +31,7 @@ RUNTIME_CFG=$ROOT/.runtime_configs/n16g12_weak/configs/vitl16_surg_vid_webdatase
 PY=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python
 CKPT_DIR=/flare/ModCon/ngetty/checkpoints/surg_2_1_v3_lambdaoff_cleandata/lr75e6_wu2_256_n16g12_weak
 PARAMS=$CKPT_DIR/params-pretrain.yaml
-SELF=$ROOT/scripts/v3_lambdaoff_chain_debugscaling.sh
+SELF=$ROOT/scripts/v3_lambdaoff_chain_capacity.sh
 LOCK=$CKPT_DIR/.training.lock
 mkdir -p $CKPT_DIR /flare/ModCon/ngetty/logs
 
@@ -66,9 +66,12 @@ fi
 # guaranteed by the LOCK guard below, so submit the successor dependency-free:
 # if it starts while this slice is still training, it sees the lock, skips, and
 # rechains. The successor sits queued and backfills after this slice ends.
-DS_QUEUED=$(qstat -u $USER 2>/dev/null | awk '$3=="debug-sca" && $10=="Q"' | wc -l)
-if (( DS_QUEUED >= 1 )); then
-  echo "skip resubmit: $DS_QUEUED debug-scaling job already queued"
+# Count THIS chain's own queued successors by jobname (v3_loff_cap) so we don't
+# stack duplicates and don't miscount unrelated capacity jobs (ind_xattn,
+# colocate_*, etc.). PBS truncates the jobname column, so match the prefix.
+CAP_QUEUED=$(qstat -u $USER 2>/dev/null | awk '$4 ~ /^v3_loff_c/ && $10=="Q"' | wc -l)
+if (( CAP_QUEUED >= 1 )); then
+  echo "skip resubmit: $CAP_QUEUED v3_loff_cap successor already queued"
 else
   NEXT_JOB=$(qsub $SELF)
   echo "Chained next job (no dependency): $NEXT_JOB"
