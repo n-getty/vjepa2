@@ -60,6 +60,25 @@ SPECS = [
 ]
 
 
+def _apply_speed_safe(cfg):
+    """Speed knobs that do NOT change the optimization trajectory (so F1 stays
+    comparable to existing fs10 numbers — no re-anchor needed):
+      - save_every_iters off: the bs2 full run wrote 72x ~2GB Lustre ckpts/epoch
+        mid-training, stalling all ranks. We only need end-of-epoch latest.pt
+        (resume_checkpoint still works). Pure overhead removal.
+      - cache_num_workers up: parallel cache-shard reads (was 1) for the cached
+        path's I/O. No effect on results.
+      - num_workers up: more video-decode parallelism for the full path.
+    NOTE: batch_size / head-LR / use_sdpa are NOT touched here — those change the
+    result and require a benchmark + re-anchor (see scripts/bench_probe_speed.sh).
+    """
+    cfg["save_every_iters"] = 10**9
+    cfg.setdefault("num_workers", 16)
+    cfg["num_workers"] = 16
+    cfg["experiment"]["data"]["cache_num_workers"] = 8
+    return cfg
+
+
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     base = yaml.safe_load(open(TEMPLATE))
@@ -70,6 +89,7 @@ def main():
         common = copy.deepcopy(base)
         common["model_kwargs"]["checkpoint"] = ckpt
         common["model_kwargs"]["pretrain_kwargs"]["encoder"]["checkpoint_key"] = key
+        _apply_speed_safe(common)
         # fs10 subset CSVs
         common["experiment"]["data"]["dataset_train"] = TRAIN_CSV
         common["experiment"]["data"]["dataset_val"] = VAL_CSV
