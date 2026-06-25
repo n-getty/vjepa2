@@ -6,20 +6,22 @@
 # 0.99925, 20 epochs). Isolates the DATA FIX (surgvu24 ~19-23% pure-black clips
 # now dropped at decode) vs the existing dirty-data v2 e9/e19 checkpoints.
 #
-# Capacity allows up to 168h walltime (16-node max); a single 24h slice should
-# finish all 20 epochs with NO requeue/re-stage overhead. The chain is kept as
-# crash/walltime insurance only — the run is resumable (load_checkpoint: true,
-# save_every_freq=5 epochs), so a successor picks up latest.pth.tar if a slice
-# dies. Capacity is a SEPARATE per-user slot from debug-scaling.
+# 8h walltime: backfill-friendly so capacity actually SCHEDULES (24h rarely
+# does). This chain runs ALONGSIDE the debug-scaling chain (v3_loff_chain): both
+# share the same CKPT_DIR + LOCK, so whichever slot frees first trains the next
+# slice from latest.pth.tar and the other skips (lock guard) and rechains. The
+# debug-scaling chain makes steady 1h progress NOW; capacity TAKES OVER with
+# longer 8h slices once/if it starts. Run is resumable (load_checkpoint: true,
+# save_every_freq=5 epochs). Manual resume anytime: just qsub this script.
 #
 # Submit first instance with:
 #   qsub /lus/flare/projects/ModCon/ngetty/vjepa2/scripts/v3_lambdaoff_chain_capacity.sh
 #
-#PBS -N v3_loff_cap
+#PBS -N v3cap
 #PBS -A ModCon
 #PBS -q capacity
 #PBS -l select=16
-#PBS -l walltime=24:00:00
+#PBS -l walltime=08:00:00
 #PBS -l filesystems=home:flare
 #PBS -j oe
 #PBS -o /flare/ModCon/ngetty/logs/
@@ -66,12 +68,14 @@ fi
 # guaranteed by the LOCK guard below, so submit the successor dependency-free:
 # if it starts while this slice is still training, it sees the lock, skips, and
 # rechains. The successor sits queued and backfills after this slice ends.
-# Count THIS chain's own queued successors by jobname (v3_loff_cap) so we don't
-# stack duplicates and don't miscount unrelated capacity jobs (ind_xattn,
-# colocate_*, etc.). PBS truncates the jobname column, so match the prefix.
-CAP_QUEUED=$(qstat -u $USER 2>/dev/null | awk '$4 ~ /^v3_loff_c/ && $10=="Q"' | wc -l)
+# Count THIS chain's own queued successors by jobname (v3cap) so we don't stack
+# duplicates and don't miscount the debug-scaling chain (v3_loff_chain) or
+# unrelated capacity jobs (ind_xattn, colocate_*). The two chains coordinate via
+# the shared LOCK + CKPT_DIR below, NOT via this count — keep the names distinct
+# (v3cap vs v3_loff_chain) so neither guard matches the other.
+CAP_QUEUED=$(qstat -u $USER 2>/dev/null | awk '$4 ~ /^v3cap/ && $10=="Q"' | wc -l)
 if (( CAP_QUEUED >= 1 )); then
-  echo "skip resubmit: $CAP_QUEUED v3_loff_cap successor already queued"
+  echo "skip resubmit: $CAP_QUEUED v3cap successor already queued"
 else
   NEXT_JOB=$(qsub $SELF)
   echo "Chained next job (no dependency): $NEXT_JOB"
