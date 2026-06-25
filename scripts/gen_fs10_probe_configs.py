@@ -32,6 +32,11 @@ CACHE = "/flare/ModCon/ngetty/surg_2_1_v2_final/probes/fs10_cache"
 
 V2 = "/flare/ModCon/ngetty/checkpoints/surg_2_1_v2_final/lr75e6_wu2_decay_n16g12_weak"
 V1 = "/flare/ModCon/ngetty/checkpoints/surg_2_1_v1/phase2_main_n16g12_weak"
+# v1 ran in two phases (epoch counter does NOT continue across phases — phase2
+# starts its own counter at 0). So v1 "e9" = phase2-epoch-10 = ~22 TOTAL
+# surgical epochs (12 phase1 warmup + 10 phase2), trained at 384px. The true
+# epoch+res match to v3 (~10 ep from raw Meta, 256px) is v1 PHASE1/e12.
+V1P1 = "/flare/ModCon/ngetty/checkpoints/surg_2_1_v1/phase1_warmup_n16g12_weak"
 # v3 = lambda-off, BLACK-CLIP-FILTERED data, otherwise identical to v2 (gb384,
 # lr7.5e-5 wu2, 256px). Probing v3 e9 vs v2 e9 (63.74) isolates the data fix;
 # e4 vs e9 reads the WITHIN-version trend (does v3 decline like v1/v2 did?).
@@ -45,6 +50,10 @@ SPECS = [
     ("v2_e19", f"{V2}/e19.pth.tar", "target_encoder"),
     ("v1_e9", f"{V1}/e9.pth.tar", "target_encoder"),
     ("v1_e29", f"{V1}/e29.pth.tar", "target_encoder"),
+    # v1 epoch-match + decline-curve probes (2026-06-25):
+    ("v1p1_e12", f"{V1P1}/e12.pth.tar", "target_encoder"),  # true ~epoch/res match to v3
+    ("v1_e19", f"{V1}/e19.pth.tar", "target_encoder"),      # phase2 decline curve
+    ("v1_e39", f"{V1}/e39.pth.tar", "target_encoder"),      # phase2 decline curve
     ("v3_e4", f"{V3}/e4.pth.tar", "target_encoder"),
     ("v3_e9", f"{V3}/e9.pth.tar", "target_encoder"),
     ("v3_e19", f"{V3}/e19.pth.tar", "target_encoder"),
