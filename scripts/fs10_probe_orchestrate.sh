@@ -9,17 +9,27 @@
 #   3. CLEANUP: delete the per-checkpoint cache_root (bounded storage).
 #
 # Usage:
-#   bash scripts/fs10_probe_orchestrate.sh <tag>
-#   (tag in: metaraw v2_e9 v2_e19 v1_e9 v1_e29)
+#   bash scripts/fs10_probe_orchestrate.sh <tag>                 # fs10 (default)
+#   PROBE_SET=full_cached CACHE_NS=full_cache TAGPFX=full \      # full-data
+#     bash scripts/fs10_probe_orchestrate.sh <tag>
+#   (fs10 tags: metaraw v2_e9 v2_e19 v1_e9 v1_e29 v3_e4 v3_e9 ...)
+#   (full tags: metaraw v3_e9 v1_e9 v1p1_e12 v2_e9)
+#
+# Env overrides (default = fs10): PROBE_SET (config subdir under configs/heads/
+# sarrarp50/), CACHE_NS (cache namespace dir), TAGPFX (the tag: prefix the
+# generator wrote into folder/tag, e.g. fs10- or full-).
 set -uo pipefail
 ROOT=/lus/flare/projects/ModCon/ngetty/vjepa2
 TAG="${1:?usage: fs10_probe_orchestrate.sh <tag>}"
-CFG_DIR=$ROOT/configs/heads/sarrarp50/fs10_cached
+PROBE_SET="${PROBE_SET:-fs10_cached}"
+CACHE_NS="${CACHE_NS:-fs10_cache}"
+TAGPFX="${TAGPFX:-fs10}"
+CFG_DIR=$ROOT/configs/heads/sarrarp50/$PROBE_SET
 EXPORT_CFG=$CFG_DIR/${TAG}_export.yaml
 PROBE_CFG=$CFG_DIR/${TAG}_probe.yaml
-CACHE_DIR=/flare/ModCon/ngetty/surg_2_1_v2_final/probes/fs10_cache/${TAG}
-PROBE_FOLDER=/flare/ModCon/ngetty/surg_2_1_v2_final/probes/fs10_cached/${TAG}
-PROBE_CSV=$PROBE_FOLDER/video_classification_frozen/fs10-${TAG}/log_r0.csv
+CACHE_DIR=/flare/ModCon/ngetty/surg_2_1_v2_final/probes/${CACHE_NS}/${TAG}
+PROBE_FOLDER=/flare/ModCon/ngetty/surg_2_1_v2_final/probes/${PROBE_SET}/${TAG}
+PROBE_CSV=$PROBE_FOLDER/video_classification_frozen/${TAGPFX}-${TAG}/log_r0.csv
 PY=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python
 
 for f in "$EXPORT_CFG" "$PROBE_CFG"; do
