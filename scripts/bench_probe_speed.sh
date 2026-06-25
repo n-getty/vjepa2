@@ -19,7 +19,10 @@ TAG="${2:-metaraw}"
 BS_LIST="${BS_LIST:-2 4 8 12}"
 SDPA_LIST="${SDPA_LIST:-true false}"   # cached mode ignores sdpa (no encoder fwd)
 BENCH_EPOCHS="${BENCH_EPOCHS:-2}"
-SCRATCH=/tmp/probe_bench_${PBS_JOBID:-local}
+# MUST be on shared FS (Lustre) — mpiexec ranks run on compute nodes and read
+# the per-combo config + write logs; node-local /tmp on the head process is
+# invisible to them (earlier bug: FileNotFoundError for the combo yaml).
+SCRATCH=${BENCH_SCRATCH:-/flare/ModCon/ngetty/probe_bench/${PBS_JOBID:-local}}
 mkdir -p "$SCRATCH"
 
 # Base config to mutate per combo.
