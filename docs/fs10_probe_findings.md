@@ -21,8 +21,8 @@
 | v1_e29 | 64.50 | −0.6 | broken sdpa | phase1-warmup → phase2(29ep) |
 | v2_e9 | 63.74 | −1.3 | fixed sdpa | hot-from-raw-Meta (9ep), DIRTY data |
 | v2_e19 | 61.13 | −3.9 | fixed sdpa | hot-from-raw-Meta (19ep), DIRTY data |
+| v3_e4 | 65.79 | +0.7 | fixed sdpa | clean data, e4 (within-version trend) |
 | **v3_e9** | **66.27** | **+1.2** | fixed sdpa | hot-from-raw-Meta (9ep), **CLEAN data (black-clip filtered)** |
-| v3_e4 | pending | — | fixed sdpa | clean data, e4 (within-version trend) |
 | v3_e19 | pending | — | fixed sdpa | clean data, e19 (run reaches e19 soon) |
 
 (Full-data anchors, separate validation: full-data Meta = 78.2 ≈ Leo's 79.38,
@@ -39,6 +39,19 @@ beat Meta then declined to e29; the open question is whether v3 HOLDS (v3_e4 →
 v3_e9 trend + v3_e19) or peaks-early-then-declines like v1/v2. If v3 holds, the
 data fix changed the trajectory; if it declines, black clips were one factor but
 recipe (EMA/LR/horizon) still drives the late decline.
+
+## WITHIN-VERSION TREND (2026-06-25): v3 RISES where v1/v2 DECLINED
+v3_e4 = 65.79 (+0.7) -> v3_e9 = 66.27 (+1.2): trend is **+0.5, UP**. Contrast:
+- v1: e9 66.88 -> e29 64.50 = -2.4 (DOWN)
+- v2: e9 63.74 -> e19 61.13 = -2.6 (DOWN)
+- v3: e4 65.79 -> e9 66.27 = +0.5 (UP), and BOTH points beat Meta (65.06).
+This is the first lineage that IMPROVES with more pretraining. The defining
+regression ("worse with more surgical pretraining") is ABSENT in v3 so far.
+CAVEAT: unequal spans — v3 measured e4->e9 (5 ep) vs v1/v2 over longer horizons;
+v3 could still turn down later. **v3_e19 is the decisive test** (training at
+e11/20, e19 ckpt lands soon). If v3_e19 >= Meta, data fix robustly fixed the
+trajectory; if it drops below Meta like v2, black clips delayed but recipe
+(EMA/LR/horizon) still drives a late decline.
 
 ## Findings
 
