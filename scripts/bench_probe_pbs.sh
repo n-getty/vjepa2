@@ -7,10 +7,12 @@
 #PBS -l filesystems=home:flare
 #PBS -j oe
 #PBS -o /flare/ModCon/ngetty/logs/
-set -uo pipefail
+set -eo pipefail
 ROOT=${PBS_O_WORKDIR:-/lus/flare/projects/ModCon/ngetty/vjepa2}
 cd "$ROOT"
-module load frameworks
+# NOTE: must NOT use `set -u` here — `module load frameworks` references unbound
+# vars (ZSH_EVAL_CONTEXT) and dies under nounset. The working chains use -eo.
+module load frameworks 2>/dev/null || module load frameworks
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT MPICH_GPU_SUPPORT_ENABLED=1
 export CCL_PROCESS_LAUNCHER=pmix CCL_ATL_TRANSPORT=mpi CCL_KVS_MODE=mpi CCL_KVS_USE_MPI_RANKS=1
 export CCL_CONFIGURATION=cpu_gpu_dpcpp CCL_KVS_CONNECTION_TIMEOUT=600 CCL_OP_SYNC=1
