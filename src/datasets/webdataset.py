@@ -39,10 +39,16 @@ _DEFAULT_MIN_CLIP_STD = float(os.environ.get("VJEPA_MIN_CLIP_STD", "1.0"))
 #      pure-black clips, std==0) is visible at training start.
 #   2. Permanent tripwire: aggregate kept/dropped counts per source so the
 #      drop rate (degenerate-clip prevalence) is observable in logs over a run.
-# Workers are separate processes; each logs independently. We restrict the
-# verbose per-sample log to the canonical worker (global rank 0, worker 0) to
-# avoid 24x-duplicated lines, but every worker keeps its own drop/keep tally.
+# Workers are separate processes; each logs independently. ALL logging is
+# restricted to the canonical worker (global rank 0, worker 0) — otherwise the
+# 192 ranks x num_workers processes each emit, flooding the shared training log
+# (observed: surgvu24's ~20-40% drop rate made every dropped clip log from all
+# 384 workers). Every worker still keeps its own in-memory drop/keep tally
+# (cheap, no I/O); only the canonical worker prints. Drops are logged at a
+# coarse milestone (first drop + every VJEPA_DIAG_EVERY) at INFO — degenerate
+# clips are EXPECTED and handled, not a warning condition.
 _LOG_FIRST_N = int(os.environ.get("VJEPA_LOG_FIRST_N", "64"))
+_DIAG_EVERY = int(os.environ.get("VJEPA_DIAG_EVERY", "500"))
 _clip_diag = {"seen": 0, "dropped": {}, "kept": {}}
 
 
@@ -72,13 +78,15 @@ def _record_kept_clip(source_name, clip_std):
 def _record_dropped_clip(source_name, clip_std):
     src = source_name or "?"
     _clip_diag["dropped"][src] = _clip_diag["dropped"].get(src, 0) + 1
-    # Always surface a periodic per-source drop tally (first few + every 50)
-    # so a high-prevalence corrupt source is unmissable past the first-N window.
+    # Canonical-worker only, coarse milestones (first drop + every _DIAG_EVERY)
+    # so a high-prevalence corrupt source stays visible without flooding the log.
+    if not _is_canonical_worker():
+        return
     d = _clip_diag["dropped"][src]
-    if d <= 5 or d % 50 == 0:
+    if d == 1 or d % _DIAG_EVERY == 0:
         k = _clip_diag["kept"].get(src, 0)
         total = d + k
-        logger.warning(
+        logger.info(
             "[clip-diag] source=%s cumulative dropped=%d kept=%d "
             "(%.1f%% degenerate)",
             src, d, k, 100.0 * d / total if total else 0.0,
