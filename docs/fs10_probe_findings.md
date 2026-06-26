@@ -161,7 +161,7 @@ the fs10 ranking on full data and (b) do it fast.
 | metaraw | 71.69 | — | — |
 | v3_e9 | 73.89 | **+2.2** | (+1.2) -> REPRODUCES, stronger |
 | v1_e9 | 69.93 | **-1.8** | (+1.8) -> RANKING FLIPPED |
-| v1p1_e12 | pending | | (new) |
+| v1p1_e12 | 70.95 | -0.7 | (new: v1 true epoch/res match to v3) |
 | v2_e9 | pending | | (-1.3) |
 (Key question: does the full-data ranking REPRODUCE the fs10 ranking? If yes,
 the fast fs10 trend tool is validated. If not, fs10 distorts comparisons.)
