@@ -388,3 +388,19 @@ NEEDED: v3_e4@256 + v3_e14@256 (fill the trajectory; exports needed, 384 caches
 deleted) to get the true 256 shape; Meta-256 anchor (in progress) for v3-vs-Meta.
 The user's original concern STANDS: more surgical data -> downstream still
 declines, even after removing the resolution confound.
+
+## NATIVE-RES (256) DELTAS vs Meta — surgical CPT DOES help, mild decline persists
+Meta@256 = 73.44 (anchor). Full comparison:
+| ckpt   | @256 F1 | vs Meta256 | @384 F1 | vs Meta384(71.69) |
+| v3_e9  | 74.77   | +1.33      | 73.89   | +2.20 |
+| v3_e19 | 74.39   | +0.95      | 71.99   | +0.30 |
+READS:
+1. At NATIVE res, v3 BEATS Meta at BOTH e9 (+1.33) and e19 (+0.95) -- and the
+   win SURVIVES to e19 (vs @384 where it nearly vanished to +0.30). Surgical CPT
+   genuinely helps; resolution mismatch was hiding most of it.
+2. BUT delta-vs-Meta STILL declines e9->e19: +1.33 -> +0.95 = -0.38. Real, mild,
+   monotonic erosion of the ADVANTAGE persists at native res.
+3. Resolution mismatch ~5x-inflated the apparent decline (-1.9@384 vs -0.4@256).
+NET: the steep "regression" was MOSTLY a probe-resolution artifact; a genuine
+MILD ongoing decline remains (leading candidate: residual un-distillation).
+PENDING: v3_e14@256 (node 8568408) -> is the -0.38 a steady slope or front-loaded?
