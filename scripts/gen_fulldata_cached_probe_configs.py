@@ -51,6 +51,8 @@ META = "/flare/ModCon/ngetty/checkpoints/vjepa2_1_vitl_dist_vitG_384.pt"
 SPECS = [
     ("metaraw", META, "ema_encoder"),
     ("v3_e9", f"{V3}/e9.pth.tar", "target_encoder"),
+    ("v3_e14", f"{V3}/e14.pth.tar", "target_encoder"),
+    ("v3_e19", f"{V3}/e19.pth.tar", "target_encoder"),
     ("v1_e9", f"{V1}/e9.pth.tar", "target_encoder"),
     ("v1p1_e12", f"{V1P1}/e12.pth.tar", "target_encoder"),
     ("v2_e9", f"{V2}/e9.pth.tar", "target_encoder"),

@@ -1,0 +1,93 @@
+cpus_per_task: 16
+eval_name: video_classification_frozen
+folder: /flare/ModCon/ngetty/surg_2_1_v2_final/probes/full_cached/v3_e14_export
+mem_per_gpu: 220G
+nodes: 4
+num_workers: 16
+resume_checkpoint: true
+tag: full-v3_e14-export
+tasks_per_node: 4
+model_kwargs:
+  checkpoint: /flare/ModCon/ngetty/checkpoints/surg_2_1_v3_lambdaoff_cleandata/lr75e6_wu2_256_n16g12_weak/e14.pth.tar
+  module_name: evals.video_classification_frozen.modelcustom.vit_encoder_multiclip_v21
+  pretrain_kwargs:
+    encoder:
+      checkpoint_key: target_encoder
+      img_temporal_dim_size: 1
+      model_name: vit_large
+      patch_size: 16
+      tubelet_size: 2
+      uniform_power: true
+      use_rope: true
+      use_sdpa: true
+  wrapper_kwargs:
+    max_frames: 128
+    use_pos_embed: false
+    preserve_clip_dim: true
+experiment:
+  classifier:
+    name: asformer
+    asformer_kwargs:
+      num_clips: 3
+      tokens_per_clip: 8
+      temporal_tokens: 24
+      num_layers: 10
+      num_heads: 8
+      mlp_ratio: 4.0
+      dropout: 0.0
+      return_sequence: true
+  data:
+    dataset_type: VideoDataset
+    dataset_train: /flare/ModCon/ngetty/surg_2_1_v1_probes_aurora/csv/sarrarp50_actions_4fps_asformer_ctx3_seq_train.csv
+    dataset_val: /flare/ModCon/ngetty/surg_2_1_v1_probes_aurora/csv/sarrarp50_actions_4fps_asformer_ctx3_seq_val.csv
+    num_classes: 8
+    frames_per_clip: 16
+    frame_step: 1
+    resolution: 384
+    num_segments: 3
+    num_views_per_segment: 1
+    sequence_labels: true
+    normalization: null
+    class_weights:
+    - 0.250562
+    - 0.662835
+    - 0.169067
+    - 0.171689
+    - 0.187031
+    - 3.65359
+    - 1.720042
+    - 1.185184
+    cache_num_workers: 8
+    train_cache_root: /flare/ModCon/ngetty/surg_2_1_v2_final/probes/full_cache/v3_e14/train
+    val_cache_root: /flare/ModCon/ngetty/surg_2_1_v2_final/probes/full_cache/v3_e14/val
+  optimization:
+    batch_size: 4
+    num_epochs: 20
+    use_bfloat16: true
+    loss_smoothing_weight: 0.15
+    loss_smoothing_threshold: 4.0
+    use_pos_embed: false
+    multihead_kwargs:
+    - warmup: 0.05
+      start_lr: 0.0001
+      lr: 0.001
+      final_lr: 2.0e-05
+      weight_decay: 0.05
+      final_weight_decay: 0.4
+    - warmup: 0.05
+      start_lr: 3.0e-05
+      lr: 0.0003
+      final_lr: 2.0e-05
+      weight_decay: 0.05
+      final_weight_decay: 0.4
+    - warmup: 0.05
+      start_lr: 1.0e-05
+      lr: 0.0001
+      final_lr: 2.0e-05
+      weight_decay: 0.1
+      final_weight_decay: 0.4
+early_stop_patience: 6
+log_val_f1: true
+write_status_json: true
+save_every_iters: 1000000000
+export_cache: true
