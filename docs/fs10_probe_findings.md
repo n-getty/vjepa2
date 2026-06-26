@@ -130,3 +130,38 @@ Do NOT launch more pretraining yet. Fix the black-clip data corruption FIRST (hi
 leverage, unambiguous bug). Then the recipe direction is: gentle warmup->continue (v1-style)
 UNDER fixed engine, at 384px, with anchored/ramped EMA + LR cooldown, short horizon,
 keep kinetics, probe early epochs with seed error bars.
+
+---
+
+# Full-data CACHED probe (2026-06-26) — speed-optimized cross-check
+
+## Why this exists
+Benchmark proved the probe is ENCODER-FLOP-bound, not iteration-bound (batch
+size barely helps; sdpa=true ~halves it; caching removes the encoder cost). We
+extended the cache exporter to the FULL split (sdpa=true, bs4) to (a) cross-check
+the fs10 ranking on full data and (b) do it fast.
+
+## Speed (full-data scale)
+- export (encoder once, bs4 sdpa=true): ~no-OOM, 345GB cache/ckpt, minutes.
+- cached probe: 41 min / 19 epochs = ~2.2 min/epoch. NOT the ~0.5 min/ep of
+  fs10 — at 345GB the probe is now CACHE-I/O-bound (reading features from Lustre
+  each epoch), not encoder-bound. Still ~3x vs optimized non-cached (bs4+sdpa
+  ~6.2 min/ep), ~8x vs original (bs2+sdpa-off ~16.5 min/ep).
+
+## Anchor (re-anchored on the cached recipe)
+| regime | metaraw | note |
+|---|---|---|
+| full-data augmented (non-cached) | 78.2 | headline path (Leo ~79.38) |
+| full-data CACHED (no aug) | **71.69** | new anchor for THIS table; -6.5 = aug-drop |
+| fs10 cached | 65.06 | small-subset anchor |
+
+## Results (best val_macro_f1, vs full-data-cached metaraw anchor 71.69)
+| ckpt | full-cached F1 | dMeta | (fs10 dMeta for cross-check) |
+|---|---|---|---|
+| metaraw | 71.69 | — | — |
+| v3_e9 | pending | | (+1.2) |
+| v1_e9 | pending | | (+1.8) |
+| v1p1_e12 | pending | | (new) |
+| v2_e9 | pending | | (-1.3) |
+(Key question: does the full-data ranking REPRODUCE the fs10 ranking? If yes,
+the fast fs10 trend tool is validated. If not, fs10 distorts comparisons.)
