@@ -331,7 +331,7 @@ probe F1 -> definitive test remains the 256px re-probe (running/next). Predict:
 regression mostly PERSISTS at 256 (un-distillation), maybe small recovery.
 
 ## 256px RE-PROBE — v3_e9 (2026-06-26, definitive F1 test, in progress)
-v3_e9 @256px = 73.73 (vs @384px = 73.89) -> IDENTICAL within noise (Δ0.16).
+v3_e9 @256px = 74.77 (15ep, vs @384px = 73.89) -> 256 is ~+0.9 BETTER, not worse.
 Confirms the cosine test: resolution barely matters for v3_e9. The encoder
 performs the SAME whether probed at its CPT-native 256 or the 384 the probe used.
 => resolution mismatch is NOT meaningfully penalizing v3 downstream.
