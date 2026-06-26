@@ -219,3 +219,11 @@ NOT the v1/v2-style regression (those fell BELOW their anchor; fs10 slopes were
 Decisive test remains v3_e19: hold >=Meta => fixes changed the trajectory; drop
 below => mild late decline persists even in the best recipe. (Caveat: e9 may be a
 local high; e14 within ~1 F1 could be seed/early-stop noise -- single seed.)
+
+## fs10 v3_e14 = 64.57 (-0.5 vs fs10 Meta 65.06) -- 3rd fs10 near-anchor sign flip
+fs10 v3 trajectory: e4 65.79(+0.7), e9 66.27(+1.2), e14 64.57(-0.5 BELOW Meta).
+But FULL-DATA v3_e14 = 73.06 (+1.4 ABOVE Meta). fs10 says v3_e14 dropped below
+Meta; full-data says clearly above. Same near-anchor unreliability seen for v1
+and v2. CONFIRMED PATTERN: fs10 OK only as a coarse screen, full-data is the
+arbiter for sign/order near the anchor. Trust the full-data trajectory
+(e9 +2.2 -> e14 +1.4, both >Meta); v3_e19 (full-data) is the decisive endpoint.
