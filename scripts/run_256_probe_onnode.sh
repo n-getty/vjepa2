@@ -3,7 +3,7 @@
 # interactively on a held node. Usage (ON the node, abs path):
 #   bash /lus/.../scripts/run_256_probe_onnode.sh <tag> <master_port>
 # tag in: v3_e19 metaraw v3_e9 ; uses configs/heads/sarrarp50/full_cached_256/
-set -uo pipefail
+set -o pipefail
 ROOT=/lus/flare/projects/ModCon/ngetty/vjepa2
 TAG="${1:?tag}"; PORT="${2:-29620}"
 CFGD=$ROOT/configs/heads/sarrarp50/full_cached_256
