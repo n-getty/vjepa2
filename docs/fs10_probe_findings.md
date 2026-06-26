@@ -160,8 +160,24 @@ the fs10 ranking on full data and (b) do it fast.
 |---|---|---|---|
 | metaraw | 71.69 | — | — |
 | v3_e9 | 73.89 | **+2.2** | (+1.2) -> REPRODUCES, stronger |
-| v1_e9 | pending | | (+1.8) |
+| v1_e9 | 69.93 | **-1.8** | (+1.8) -> RANKING FLIPPED |
 | v1p1_e12 | pending | | (new) |
 | v2_e9 | pending | | (-1.3) |
 (Key question: does the full-data ranking REPRODUCE the fs10 ranking? If yes,
 the fast fs10 trend tool is validated. If not, fs10 distorts comparisons.)
+
+## RANKING FLIP (2026-06-26): fs10 over-rated v1_e9 — full data reverses it
+| ckpt | fs10 dMeta | full-data dMeta | verdict |
+|---|---|---|---|
+| v3_e9 (clean) | +1.2 | **+2.2** | beats Meta BOTH ways (data fix real) |
+| v1_e9 (dirty/broken) | +1.8 | **-1.8** | fs10 said >Meta; full data says <Meta |
+On fs10, v1_e9 (66.88) > v3_e9 (66.27) -- the puzzling result. On FULL DATA it
+REVERSES: v3_e9 73.89 >> v1_e9 69.93 (v3 +3.96 ahead). Two causes inflated v1 on
+fs10: (1) 10% subset = high-variance head that can't exploit a stronger backbone,
+compressing the ranking; (2) v1_e9 = ~22 surg epochs @384px vs v3_e9 = 10 @256px
+(epoch+res confound favoring v1). With full probe-training signal, the CLEANER
+backbone (v3) wins decisively despite fewer epochs + lower train res.
+IMPLICATION: fs10 is reliable for "does X beat its anchor by a clear margin" but
+NOT for fine cross-lineage ranking (it got v1-vs-v3 order + v1-vs-Meta sign
+wrong). Full data is the arbiter for close calls. The "surgical CPT beats Meta"
+claim now rests on v3 (clean data), NOT the confounded v1.
