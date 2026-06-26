@@ -373,3 +373,18 @@ result already stands without it.
 OPEN Q for next: does v3 at 256 actually IMPROVE over Meta-256 (surgical CPT
 finally helping), or just stay flat? And should we retrain CPT at 384 to match
 the strong init + probe?
+
+## CORRECTION TO THE CORRECTION (2026-06-26): resolution ATTENUATES, does NOT eliminate
+The e9->e19 slope at 256 is -0.38 -- I called it "nearly flat", but:
+1. It is STILL NEGATIVE and monotonic (same direction as -1.90 @384). Resolution
+   changed the magnitude, not the sign.
+2. We only have e9 & e19 @256 -- NOT e4/e14 @256. Cannot claim "flat" from 2
+   points; the 256 curve could still be steadily declining, just less steeply.
+HONEST READ: resolution mismatch explains much of the STEEPNESS, but a real
+(milder) downward trend PERSISTS at native resolution. Regression is ATTENUATED,
+not eliminated. Something still degrades downstream features as surgical CPT
+continues, independent of resolution -- consistent with mild un-distillation.
+NEEDED: v3_e4@256 + v3_e14@256 (fill the trajectory; exports needed, 384 caches
+deleted) to get the true 256 shape; Meta-256 anchor (in progress) for v3-vs-Meta.
+The user's original concern STANDS: more surgical data -> downstream still
+declines, even after removing the resolution confound.
