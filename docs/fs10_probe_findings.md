@@ -227,3 +227,34 @@ Meta; full-data says clearly above. Same near-anchor unreliability seen for v1
 and v2. CONFIRMED PATTERN: fs10 OK only as a coarse screen, full-data is the
 arbiter for sign/order near the anchor. Trust the full-data trajectory
 (e9 +2.2 -> e14 +1.4, both >Meta); v3_e19 (full-data) is the decisive endpoint.
+
+# ============================================================
+# DECISIVE RESULT (2026-06-26): v3 HOLDS above Meta through full run
+# ============================================================
+v3 full-data cached trajectory (vs Meta 71.69):
+  e9  = 73.89 (+2.2)   <- best
+  e14 = 73.06 (+1.4)
+  e19 = 71.99 (+0.3)   <- DECISIVE endpoint, still >= Meta
+
+VERDICT (two true halves):
+1. The CATASTROPHIC REGRESSION IS GONE. The whole investigation started because
+   surgical CPT fell BELOW Meta and worsened with epochs (v2 dirty fs10:
+   -1.3 -> -3.9). With BOTH fixes (SDPA engine + black-clip data filter), v3
+   stays AT/ABOVE Meta the entire run -- never regresses below baseline. The
+   "surgical pretraining hurts on a surgical task" paradox is RESOLVED.
+2. But a GENTLE DOWNWARD DRIFT remains: +2.2 -> +0.3 over e9->e19 (-1.9). v3
+   peaks early (e9) and decays toward Meta by e19. Not collapse, but not
+   improving-with-epochs either. Early checkpoint is best.
+
+TAKEAWAYS:
+- BEST surgical model = v3_e9 (+2.2 over Meta on full data). Early-stop ~e9.
+- Root causes fixed: (a) XPU SDPA layout bug, (b) surgvu24 ~19% black-clip
+  corruption, (c) dataloader oversampling (temperature mixing). Engine fix was
+  the dominant factor; data fix additive (+~1 at matched epoch).
+- Remaining gentle drift points at the CPT RECIPE (flat-high EMA 0.99925, no LR
+  cooldown, over-long horizon) -- the next lever now that data+engine are clean.
+  Hypothesis: anchored/ramped EMA + LR cooldown + short horizon could turn the
+  e9 peak into a sustained gain.
+- METHODOLOGY: fs10 cached probe is only a coarse screen (flipped sign vs full
+  data near the anchor for v1, v2, v3_e14). FULL-DATA cached is the arbiter;
+  ~30-48 min/ckpt with the optimized recipe (cached + sdpa=true + bs4).
