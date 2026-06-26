@@ -484,6 +484,21 @@ def main(args, resume_preempt=False):
         find_unused_parameters=not _pred_static,
         bucket_cap_mb=_bucket_mb,
     )
+    # Optional bf16 gradient-compression comm hook (VJEPA_BF16_COMM=1). Casts
+    # gradients to bf16 before the AllReduce and back to fp32 after — halves the
+    # collective payload, which is the dominant cost in the AllReduce-bound
+    # backward on Aurora xccl (esp. for ViT-g's ~3.3x params). Off by default so
+    # baseline runs are bit-for-bit unchanged; enable only after a loss-curve
+    # sanity check. Params are already bf16-autocast in compute, so the extra
+    # precision loss is on the reduced gradients only.
+    if os.environ.get("VJEPA_BF16_COMM") == "1":
+        from torch.distributed.algorithms.ddp_comm_hooks import (
+            default_hooks as _ddp_hooks,
+        )
+        _pg = None  # default process group
+        encoder.register_comm_hook(_pg, _ddp_hooks.bf16_compress_hook)
+        predictor.register_comm_hook(_pg, _ddp_hooks.bf16_compress_hook)
+        logger.info("DDP bf16_compress_hook registered (encoder+predictor)")
     target_encoder = DistributedDataParallel(target_encoder)
     for p in target_encoder.parameters():
         p.requires_grad = False
