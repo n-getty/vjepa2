@@ -316,3 +316,16 @@ penalty -> partly why v1 looked better.
 DECISIVE CHEAP TEST: re-probe v3_e9 & v3_e19 at 256px (= CPT res, no retrain). If
 regression shrinks at 256 -> resolution mismatch is major (fix: train+probe same
 res, ideally 384). If persists -> un-distillation dominates (fix: distill-anchor).
+
+## RESOLUTION-SENSITIVITY RESULT (2026-06-26) — resolution is MINOR, not the driver
+cos(ckpt, Meta) on same surgical clips at each res:
+| ckpt | @256 | @384 | 384-256 |
+| meta | 1.000 | 1.000 | 0 |
+| e9   | 0.906 | 0.907 | +0.0005 |
+| e19  | 0.864 | 0.859 | -0.005 |
+e9->e19 cos-drop: 0.042 @256 vs 0.047 @384 (only ~12% larger at 384).
+READ: drift from Meta is OVERWHELMINGLY resolution-INDEPENDENT (e19 cos~0.86 at
+both res). Resolution mismatch MILDLY amplifies (~10%) but is NOT the dominant
+driver. Points back to UN-DISTILLATION as primary. CAVEAT: cosine proxy, not
+probe F1 -> definitive test remains the 256px re-probe (running/next). Predict:
+regression mostly PERSISTS at 256 (un-distillation), maybe small recovery.
