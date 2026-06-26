@@ -46,7 +46,7 @@ logging.basicConfig()
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-_GLOBAL_SEED = 0
+_GLOBAL_SEED = int(os.environ.get("VJEPA_PROBE_SEED", "0"))
 np.random.seed(_GLOBAL_SEED)
 torch.manual_seed(_GLOBAL_SEED)
 torch.backends.cudnn.benchmark = True

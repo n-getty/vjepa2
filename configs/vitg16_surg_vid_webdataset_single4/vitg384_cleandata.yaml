@@ -1,0 +1,186 @@
+# ViT-g @ 384 surgical CPT from the Meta V-JEPA 2.1 UNDISTILLED ViT-g checkpoint.
+#
+# RATIONALE (supersedes the ViT-L v3 line):
+#   The v3 ViT-L investigation established two real findings, both of which this
+#   single backbone swap dissolves:
+#     (1) UN-DISTILLATION drift. The ViT-L init is `vitl_dist_vitG` — distilled
+#         FROM ViT-g — so CPT slowly relaxed it OUT of the ViT-g basin (global
+#         drift, cos-to-Meta 1.0->0.84). Starting FROM ViT-g means there is no
+#         ViT-g basin to fall out of: the un-distillation lever is removed by
+#         construction (no distillation-anchoring hack needed).
+#     (2) RESOLUTION mismatch. v3 trained 256 but the strong init + probe were
+#         384, which was the DOMINANT driver of the apparent "regression".
+#         Training at the checkpoint's native 384 removes it end-to-end.
+#   See docs/fs10_probe_findings.md ("RESOLVED" section) and
+#   memory v3-regression-rootcause for the full chain.
+#
+# WHAT CHANGED vs configs/vitl16_surg_vid_webdataset_single4/v3_lambdaoff_cleandata.yaml
+# (verified against the actual checkpoint + configs/train_2_1/vitg16/pretrain-256px-16f.yaml):
+#   - model_name        vit_large        -> vit_giant_xformers   (embed_dim 1024->1408, the official 2.1 ViT-g variant)
+#   - crop_size         256              -> 384                  (native res of vjepa2_1_vitg_384.pt)
+#   - pretrain_checkpoint  vitl_dist_vitG_384.pt -> vitg_384.pt
+#   - context/target_encoder_key  ema_encoder -> encoder/target_encoder
+#       (the ViT-g .pt stores keys 'encoder'/'target_encoder'; the ViT-L file used 'ema_encoder' — VERIFIED by inspecting the checkpoint)
+#   TOPOLOGY unchanged from v3: 16 nodes x 12 tasks (Aurora = 12 tiles/node) x bs2.
+#     The official ViT-g config uses 8 tasks/node (A100 = 8 GPU/node) — that is a
+#     hardware difference, not a recipe choice; we keep Aurora's 12 tiles.
+#   PREDICTOR IS UNCHANGED (pred_depth 24 / pred_embed_dim 384 / pred_num_heads 12):
+#     the predictor I/O auto-inherits the encoder embed_dim (app/vjepa_2_1/utils.py
+#     :376), only its hidden dim is pred_embed_dim. Official ViT-g uses the exact
+#     same predictor block as ViT-L. Masks are also byte-identical to official ViT-g.
+#
+# MEMORY RISK (must smoke-test on 1 node before the 16-node run):
+#   ~3x params (1408 vs 1024, 40 vs 24 layers) x ~2.25x tokens (576 vs 256 at
+#   384/16 vs 256/16) ~= 6-7x the ViT-L@256 footprint. Official ViT-g@256 used
+#   bs=24/rank on A100-80GB; on Aurora PVC tiles (~64GB) at 384 we run bs=2/rank
+#   with activation checkpointing. bs=2 is the FLOOR (CLAUDE.md: the d_weights /
+#   weight_distance_loss path crashes at bs=1) AND likely the ceiling at this res.
+#   If OOM, the only lever left is fewer frames (dataset_fpcs 16->8) — do NOT drop
+#   to bs=1.
+app: vjepa_2_1
+nodes: 16
+tasks_per_node: 12
+cpus_per_task: 16
+mem_per_gpu: 40G
+folder: /flare/ModCon/ngetty/checkpoints/surg_2_1_vitg384_cleandata/vitg384
+data:
+  num_clips: 10
+  dataset_type: WebDataset
+  datasets:
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/crcd
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/endovis15
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/jigsaw
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/kinetics400
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/miccai_2017
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/miccai_endoseg
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/sitl
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_robotic
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgtoolloc2022
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvisdom
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvu24
+  datasets_weights:
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  sampling_temperature: 0.5
+  # Degenerate (black/frozen) clip reject floor on the raw 0-255 per-pixel std.
+  # Drops surgvu24's ~19% byte-identical pure-black clips before they reach a
+  # batch (the v3 data fix; carried forward). Set 0 to disable.
+  min_clip_std: 1.0
+  batch_size: 2
+  crop_size: 384
+  patch_size: 16
+  dataset_fpcs:
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  tubelet_size: 2
+  fps: 4
+  num_workers: 2
+  persistent_workers: true
+  pin_mem: true
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+loss:
+  loss_exp: 1.0
+  predict_all: true
+  shift_by_n: 0
+  weight_distance_loss: true
+mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 8
+  spatial_scale:
+  - 0.15
+  - 0.15
+  temporal_scale:
+  - 1.0
+  - 1.0
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 2
+  spatial_scale:
+  - 0.7
+  - 0.7
+  temporal_scale:
+  - 1.0
+  - 1.0
+meta:
+  context_encoder_key: encoder
+  dtype: bfloat16
+  eval_freq: 1000000000
+  load_checkpoint: true
+  load_predictor: false
+  pretrain_checkpoint: /flare/ModCon/ngetty/checkpoints/vjepa2_1_vitg_384.pt
+  read_checkpoint: null
+  save_every_freq: 5
+  seed: 239
+  target_encoder_key: target_encoder
+  use_sdpa: true
+model:
+  has_cls_first: false
+  img_temporal_dim_size: 1
+  interpolate_rope: true
+  is_causal: false
+  # Context-loss branch held OFF (carried from v3 isolation): lambda stays 0 and
+  # the progressive ramp (starts iter 15000) never fires in a 20ep x 500ipe run.
+  lambda_value_vid: 0.0
+  modality_embedding: true
+  model_name: vit_giant_xformers
+  n_registers: 0
+  n_registers_predictor: 0
+  normalize_predictor: false
+  pred_depth: 24
+  pred_embed_dim: 384
+  pred_is_causal: false
+  pred_num_heads: 12
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_mask_tokens: true
+  use_rope: true
+  zero_init_mask_tokens: true
+optimization:
+  ema:
+  - 0.99925
+  - 0.99925
+  epochs: 20
+  final_lr: 1.0e-06
+  final_weight_decay: 0.04
+  ipe: 500
+  ipe_scale: 1.0
+  lr: 7.5e-05
+  start_lr: 1.0e-06
+  warmup: 2.0
+  weight_decay: 0.04
