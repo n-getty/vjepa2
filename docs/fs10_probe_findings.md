@@ -288,3 +288,31 @@ during CPT (distill-while-adapt) or regularize features/weights toward Meta;
 heavily-anchored adaptation (e9 peak is the ceiling); (3) anchored/frozen EMA
 (teacher~=Meta) as a cheap partial version of (1).
 
+
+## FEATURE DIAGNOSIS (2026-06-26, @256px) — drift is GLOBAL, not surgical-specific
+Token/clip metrics across Meta->e4->e9->e14->e19 (target_encoder, 256px inference):
+cos-to-Meta:  surg 1.00->0.961->0.888->0.858->0.838 ; gen(kin) 1.00->0.951->0.863->0.818->0.793
+tok_eff_rank: surg 511->484->480->474->465 (-9%)    ; gen 433->412->400->392->386 (-11%)
+anisotropy:   surg 0.531->...->0.602 (rising = tokens more similar)
+READS:
+1. Drift is GLOBAL: kinetics features drift from Meta AS MUCH/more than surgical
+   (gen cos 0.793 < surg 0.838 @e19). NOT surgical-domain overfitting -> supports
+   UN-DISTILLATION (losing general ViT-G-distilled structure everywhere).
+2. Gradual EROSION not collapse: rank -9..11%, anisotropy mild rise. Encoder
+   slowly relaxes OUT of the Meta(ViT-G-distilled) basin toward weaker native
+   ViT-L self-SSL. cos-to-Meta falls monotonically 1.0->0.84, tracking the
+   downstream decline.
+
+## RESOLUTION MISMATCH (flagged 2026-06-26) — SECOND stacked driver
+CPT trains at 256 but init is 384 AND probe is 384:
+  Meta init 384 -> v3 CPT 256 -> probe 384.  (256 inherited from upstream/v2 configs.)
+So every CPT epoch adapts the encoder to 256 statistics (patch content, RoPE scale)
+while the probe reads 384 (RoPE interpolated) -> a resolution penalty that GROWS
+each epoch, independent of un-distillation. The @256 diagnosis above still shows
+global drift, so un-distillation is real on its own; resolution mismatch is an
+ADDITIONAL penalty the 384-probe sees that the 256-diagnosis cannot. Likely TWO
+stacked monotonic effects. Leo v1 (train 384/probe 384, matched) had no such
+penalty -> partly why v1 looked better.
+DECISIVE CHEAP TEST: re-probe v3_e9 & v3_e19 at 256px (= CPT res, no retrain). If
+regression shrinks at 256 -> resolution mismatch is major (fix: train+probe same
+res, ideally 384). If persists -> un-distillation dominates (fix: distill-anchor).
