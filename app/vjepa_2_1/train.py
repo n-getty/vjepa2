@@ -520,7 +520,19 @@ def main(args, resume_preempt=False):
         ema[0] + i * (ema[1] - ema[0]) / (ipe * num_epochs * ipe_scale)
         for i in range(int(ipe * num_epochs) + 1)
     )
-    lambda_sched = Lambda_LinearWarmupHold(lambda_value=lambda_value)
+    # Context-loss (lambda) warmup-hold schedule. Defaults match Meta's published
+    # ~300k-iter run (ramp iters 15k->30k); for short CPT runs those bounds never
+    # fire, so allow the YAML to override them (model.lambda_start_iter /
+    # model.lambda_end_iter) to keep the same proportional ramp on fewer iters.
+    _lambda_start = int(cfgs_model.get("lambda_start_iter", 15_000))
+    _lambda_end = int(cfgs_model.get("lambda_end_iter", 30_000))
+    lambda_sched = Lambda_LinearWarmupHold(
+        lambda_value=lambda_value, start_iter=_lambda_start, end_iter=_lambda_end
+    )
+    logger.info(
+        f"Lambda_LinearWarmupHold: value={lambda_value} ramp "
+        f"[{_lambda_start}, {_lambda_end}] iters (progressive)"
+    )
 
     start_epoch = 0
     # -- load training checkpoint

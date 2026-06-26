@@ -142,7 +142,12 @@ meta:
   dtype: bfloat16
   eval_freq: 1000000000
   load_checkpoint: true
-  load_predictor: false
+  # Warm-start the predictor from Meta's trained ViT-g predictor (verified: loads
+  # into our pred_depth24/embed384 arch with 0 missing keys; includes the
+  # predictor_proj_context head the context loss needs). v3 used false because it
+  # was an ablation; for the optimal run we keep Meta's predictor to avoid
+  # injecting a random-predictor signal into the EMA target early.
+  load_predictor: true
   pretrain_checkpoint: /flare/ModCon/ngetty/checkpoints/vjepa2_1_vitg_384.pt
   read_checkpoint: null
   save_every_freq: 5
@@ -154,9 +159,14 @@ model:
   img_temporal_dim_size: 1
   interpolate_rope: true
   is_causal: false
-  # Context-loss branch held OFF (carried from v3 isolation): lambda stays 0 and
-  # the progressive ramp (starts iter 15000) never fires in a 20ep x 500ipe run.
-  lambda_value_vid: 0.0
+  # Context (dense-prediction) loss — the defining V-JEPA 2.1 feature. Meta's
+  # published ViT-g uses 0.5; v3 set 0.0 only because it was an isolation ablation
+  # vs dirty-data v2. For the optimal run we match Meta. The Lambda_LinearWarmupHold
+  # ramp is rescaled to our 10k-iter run (Meta ramps iters 15k->30k of a ~300k run
+  # = start at 5%, full by 10%; here start 500, full 1500) via lambda_start/end_iter.
+  lambda_value_vid: 0.5
+  lambda_start_iter: 500
+  lambda_end_iter: 1500
   modality_embedding: true
   model_name: vit_giant_xformers
   n_registers: 0
