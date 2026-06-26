@@ -159,7 +159,7 @@ the fs10 ranking on full data and (b) do it fast.
 | ckpt | full-cached F1 | dMeta | (fs10 dMeta for cross-check) |
 |---|---|---|---|
 | metaraw | 71.69 | — | — |
-| v3_e9 | pending | | (+1.2) |
+| v3_e9 | 73.89 | **+2.2** | (+1.2) -> REPRODUCES, stronger |
 | v1_e9 | pending | | (+1.8) |
 | v1p1_e12 | pending | | (new) |
 | v2_e9 | pending | | (-1.3) |
