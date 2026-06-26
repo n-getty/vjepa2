@@ -101,6 +101,16 @@ def main():
     args = ap.parse_args()
     dev = torch.device("xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cpu")
     print(f"device={dev}")
+    # Fail loudly on CPU fallback: a 300M ViT over ~190 clips x 5 ckpts on CPU is
+    # hours, not minutes. Almost always a broken ZE_AFFINITY_MASK (use 0, not 0.0).
+    # Override with VJEPA_ALLOW_CPU=1 if a CPU run is genuinely intended.
+    import os as _os
+    if dev.type == "cpu" and _os.environ.get("VJEPA_ALLOW_CPU") != "1":
+        raise RuntimeError(
+            "XPU not available -> would run on CPU (hours). Check ZE_AFFINITY_MASK "
+            "(use '0' not '0.0' under FLAT) / module load frameworks. "
+            "Set VJEPA_ALLOW_CPU=1 to force CPU."
+        )
 
     # Sample clips ONCE (same inputs for every checkpoint -> fair comparison).
     print("=== sampling clips (fixed across checkpoints) ===")
