@@ -339,3 +339,37 @@ STILL NEEDED for the regression-slope decision: v3_e19 @256 (+ Meta @256 anchor)
 If v3_e19 @256 also ~matches v3_e19 @384 (71.99), the e9->e19 regression slope is
 the SAME at native resolution -> resolution definitively ruled out, un-distillation
 is THE driver. (next hold queued for v3_e19-256 + Meta-256)
+
+# ============================================================
+# MAJOR CORRECTION (2026-06-26): the regression is LARGELY a RESOLUTION artifact
+# ============================================================
+256px re-probe (CPT-NATIVE resolution) vs the 384px probe:
+| ckpt   | @384  | @256  |
+| v3_e9  | 73.89 | 74.77 |
+| v3_e19 | 71.99 | 74.39 |
+| Meta   | 71.69 | (pending, walltime-killed; re-probing from cache) |
+e9->e19 SLOPE:  @384 = -1.90 (the "regression")  vs  @256 = -0.38 (NEARLY FLAT).
+
+CONCLUSION: probing at the resolution the model was TRAINED at (256) makes the
+monotonic regression LARGELY VANISH. v3_e19 jumps +2.4 (71.99->74.39) just from
+native-res probing. The steep e9->e19 decline was substantially the
+train-256/probe-384 MISMATCH growing with epochs, NOT (primarily) un-distillation
+or surgical overfitting.
+
+METHODOLOGY MEA CULPA: the cosine-similarity proxy (res_sensitivity.py) said
+resolution was "minor / resolution-independent" -- it was WRONG. Small cosine
+diffs (e19 cos 0.86 @both) masked a large F1 effect. The real F1 re-probe (the
+user-suggested experiment) is the arbiter; the cheap proxy misled. Trust the
+metric, not the proxy.
+
+REVISED ROOT-CAUSE RANKING:
+1. RESOLUTION MISMATCH (train256/probe384) -- PRIMARY driver of the apparent
+   regression. Fix is trivial: probe (and report) at 256, OR train CPT at 384.
+2. Un-distillation drift is real (cos 1.0->0.84, global incl kinetics) but mostly
+   BENIGN for downstream AT NATIVE RES -- the 384 probe converted it to an F1 hit.
+3. EMA/LR/temporal-mask: second-order.
+PENDING: Meta-256 anchor (node 8568302) for v3-vs-Meta deltas at 256. Slope
+result already stands without it.
+OPEN Q for next: does v3 at 256 actually IMPROVE over Meta-256 (surgical CPT
+finally helping), or just stay flat? And should we retrain CPT at 384 to match
+the strong init + probe?
