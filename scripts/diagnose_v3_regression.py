@@ -113,17 +113,24 @@ def main():
         )
 
     # Sample clips ONCE (same inputs for every checkpoint -> fair comparison).
+    # Use frame_step=1 so the min-length requirement is just frames_per_clip (16),
+    # NOT 16*4=64 -- kinetics clips are only ~18 frames and were ALL being skipped
+    # by sample_clips' default (frame_step=4) -> 'gen: 0 clips' bug. 16-of-18 with
+    # step 1 matches how the model samples short clips (index-clamped).
     print("=== sampling clips (fixed across checkpoints) ===")
     clip_sets = {}
     for label, srcs in (("surg", SURG), ("gen", GEN)):
         clips = []
         for name, path in srcs:
             try:
-                clips += sample_clips(path, args.n, target_hw=256)
+                clips += sample_clips(path, args.n, frames_per_clip=16,
+                                      frame_step=1, target_hw=256)
             except Exception as e:
                 print(f"  skip {name}: {e}")
         clip_sets[label] = clips
         print(f"  {label}: {len(clips)} clips")
+        if len(clips) == 0:
+            raise RuntimeError(f"domain '{label}' sampled 0 clips -- check sources {srcs}")
 
     results = {}
     meta_pooled = {}  # for cosine drift
