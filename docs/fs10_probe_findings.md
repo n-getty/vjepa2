@@ -258,3 +258,32 @@ TAKEAWAYS:
 - METHODOLOGY: fs10 cached probe is only a coarse screen (flipped sign vs full
   data near the anchor for v1, v2, v3_e14). FULL-DATA cached is the arbiter;
   ~30-48 min/ckpt with the optimized recipe (cached + sdpa=true + bs4).
+
+## ROOT-CAUSE HYPOTHESIS (2026-06-26): we are UN-DISTILLING a ViT-G->ViT-L init
+The Meta init `vjepa2_1_vitl_dist_vitG_384` is a ViT-L DISTILLED FROM ViT-G. Its
+strength is ViT-G-quality features compressed into ViT-L weights -- it punches
+above ViT-L's self-SSL weight class (off-the-shelf 71.69 full-data).
+Our CPT uses target_encoder_key=ema_encoder = EMA of OUR ViT-L student (verified;
+EMA teacher ~= student, gap 0.002 @e19). So CPT REPLACES the ViT-G teacher with a
+self-teacher on a WEAKER objective (ViT-L masked-pred) over NARROWER data. Every
+step relaxes the ViT-L weights AWAY from the ViT-G-distilled solution toward what
+a ViT-L can self-supervise alone = lower capacity. => "un-distillation".
+
+This UNIFIES the evidence:
+- loss plateaus e5 but downstream falls: the ViT-L pretext saturates fast while
+  the ViT-G-distilled structure keeps eroding.
+- downstream degrades even as weight-motion -> 0 (e14->e19 step 0.009): drift is
+  DIRECTIONAL (away from ViT-G basin), magnitude-independent.
+- monotonic not collapse: smooth reversion ViT-G-quality -> native-ViT-L-SSL.
+- EMA no anchor: teacher is the decaying student, not ViT-G.
+
+KEY DISCRIMINATOR (diagnosis running): is the feature decline SURGICAL-SPECIFIC
+or GLOBAL (kinetics too)? Global decline => un-distillation (general capability
+loss) confirmed; surgical-only => domain overfitting instead.
+
+IMPLIED FIX (different from EMA/LR/temporal-mask tweaks): PRESERVE the distillation
+signal. Options: (1) keep original Meta ViT-L FROZEN as a distillation teacher
+during CPT (distill-while-adapt) or regularize features/weights toward Meta;
+(2) accept ViT-L can't self-improve from a distilled init -> only very-short
+heavily-anchored adaptation (e9 peak is the ceiling); (3) anchored/frozen EMA
+(teacher~=Meta) as a cheap partial version of (1).
