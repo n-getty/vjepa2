@@ -404,3 +404,27 @@ READS:
 NET: the steep "regression" was MOSTLY a probe-resolution artifact; a genuine
 MILD ongoing decline remains (leading candidate: residual un-distillation).
 PENDING: v3_e14@256 (node 8568408) -> is the -0.38 a steady slope or front-loaded?
+
+## RESOLVED (2026-06-26): v3_e14@256 = 74.36 -> decline is FRONT-LOADED, NOT steady
+The missing midpoint is in. Full 256 trajectory vs Meta256 (73.44):
+| ckpt   | @256 F1 | vs Meta256 | delta from prev |
+| v3_e9  | 74.77   | +1.33      | --              |
+| v3_e14 | 74.36   | +0.92      | -0.41           |
+| v3_e19 | 74.39   | +0.95      | +0.03           |
+(v3_e14 probe-only from persistent 256 cache, 12 ranks/1 node, early-stop best
+@ep16; train acc saturated 99.9% = head fully converged. Node 8568721.)
+
+VERDICT: The advantage drops ONCE (e9->e14, -0.41) then is FLAT (e14->e19, +0.03,
+within noise). This is a ONE-TIME SETTLE, not ongoing monotonic un-distillation.
+The earlier "-0.38 steady slope" was an artifact of having only the two endpoints
+(e9, e19) -- the line LOOKED linear because we lacked the midpoint. With e14
+filled, the curve flattens after the initial settle; e19 is NOT worse than e14.
+
+IMPLICATIONS (corrects the prior "mild ongoing decline persists" read):
+1. "More surgical data keeps eroding the advantage" is NOT supported. The model
+   settles into a slightly-lower-but-STABLE basin early (by ~e14), then holds.
+2. v3_e9 is still the peak (+1.33), but the e9->e19 drop is a single early step,
+   not a trend that would keep falling with more epochs. The advantage is DURABLE.
+3. Distillation-anchoring (frozen-Meta teacher) is still the lever to convert the
+   e9 peak into a sustained gain AND prevent the one-time settle -- but the
+   urgency is lower: there is no runaway erosion, just a small fixed cost.
