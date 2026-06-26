@@ -287,3 +287,21 @@ during CPT (distill-while-adapt) or regularize features/weights toward Meta;
 (2) accept ViT-L can't self-improve from a distilled init -> only very-short
 heavily-anchored adaptation (e9 peak is the ceiling); (3) anchored/frozen EMA
 (teacher~=Meta) as a cheap partial version of (1).
+
+## LEO'S PHASE1 LR SWEEP (found 2026-06-26) — LR is a bigger lever than thought
+Leo ran a phase1 (warmup-from-Meta, SAME init) LR grid, 4 epochs, inline probes
+at pretrain-e2/e4. Anchor: Meta-raw inline probe = 55.10. Best (pe4):
+| LR mult | abs LR  | pe4 F1 | vs Meta 55.10 |
+| 0.25 | 1.25e-5 | 53.11 | -2.0 |
+| 0.5  | 2.5e-5  | 53.94 | -1.2 |
+| 1.0  | 5e-5    | 54.30 | -0.8 |
+| 1.25 | 6.25e-5 | 54.41 | -0.7 |
+| 1.75 | 8.75e-5 | 55.52 | +0.4 |
+| 2.0  | 1e-4    | 59.99 | +4.9 |  <- only clear win, still climbing (ceiling not hit)
+KEY: only LR=1e-4 clearly beats Meta (+4.9); all lower LRs are BELOW Meta at e4.
+Our v3 used 7.5e-5 -> in the BELOW-Meta band. So our peak LR was likely TOO LOW.
+RECONCILES with un-distillation: LR sets how HIGH the early peak gets; un-distill
+drift sets the LATE decline (Leo's 4ep window too short to see it). Good recipe
+likely needs BOTH high LR (strong early peak) + distillation-anchor (stop late
+decline). CAVEATS: Leo confounded -- sampling_temperature:None (the old
+oversampling BUG), lambda=0.5 ON, only 4 epochs; unknown if 1e-4 HOLDS past e4.
