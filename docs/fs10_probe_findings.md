@@ -162,7 +162,7 @@ the fs10 ranking on full data and (b) do it fast.
 | v3_e9 | 73.89 | **+2.2** | (+1.2) -> REPRODUCES, stronger |
 | v1_e9 | 69.93 | **-1.8** | (+1.8) -> RANKING FLIPPED |
 | v1p1_e12 | 70.95 | -0.7 | (new: v1 true epoch/res match to v3) |
-| v2_e9 | pending | | (-1.3) |
+| v2_e9 | 72.93 | +1.2 | (-1.3) -> SIGN FLIPPED (fs10 said <Meta) |
 (Key question: does the full-data ranking REPRODUCE the fs10 ranking? If yes,
 the fast fs10 trend tool is validated. If not, fs10 distorts comparisons.)
 
@@ -181,3 +181,28 @@ IMPLICATION: fs10 is reliable for "does X beat its anchor by a clear margin" but
 NOT for fine cross-lineage ranking (it got v1-vs-v3 order + v1-vs-Meta sign
 wrong). Full data is the arbiter for close calls. The "surgical CPT beats Meta"
 claim now rests on v3 (clean data), NOT the confounded v1.
+
+## FULL-DATA CROSS-CHECK COMPLETE (2026-06-26) — engine fix > data fix
+Final full-data cached table (vs Meta 71.69):
+| ckpt | full dMeta | fs10 dMeta | engine | data |
+|---|---|---|---|---|
+| v3_e9 | +2.2 | +1.2 | fixed | CLEAN |
+| v2_e9 | +1.2 | -1.3 (FLIP) | fixed | dirty |
+| v1p1_e12 | -0.7 | — | broken | dirty |
+| v1_e9 | -1.8 | +1.8 (FLIP) | broken | dirty |
+
+REVISED CONCLUSION (full data corrects the fs10 story):
+1. ENGINE FIX is the dominant factor. Both FIXED-engine surgical runs (v2 dirty
+   +1.2, v3 clean +2.2) beat Meta; both BROKEN-engine v1 runs (-0.7, -1.8) do
+   not. The sdpa layout fix matters more than the data fix.
+2. DATA FIX is real but SMALLER than fs10 implied: v3_e9 (clean) vs v2_e9 (dirty),
+   matched epoch/recipe/engine = +0.96 on full data (was +2.5 on fs10).
+3. fs10 was SYSTEMATICALLY MISLEADING for cross-lineage sign/order: it flipped
+   BOTH v2 (said <Meta, really >Meta) and v1 (said >Meta, really <Meta). fs10 is
+   only safe as a coarse "clearly beats its own anchor" screen, NOT for ranking
+   or sign near the anchor. FULL-DATA is the arbiter. This retroactively softens
+   earlier fs10-based claims (e.g. "v2 dirty data hurts below Meta" was an fs10
+   artifact; v2 actually beats Meta once the engine is fixed).
+4. STILL OPEN: within-version TREND (does v3 decline with epochs like v1/v2's
+   fs10 trend suggested?) -- needs v3_e14/e19 full-data, running now. And whether
+   v2's fs10 "decline e9->e19" also reverses on full data (not yet retested).
