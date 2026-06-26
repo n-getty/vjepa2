@@ -206,3 +206,16 @@ REVISED CONCLUSION (full data corrects the fs10 story):
 4. STILL OPEN: within-version TREND (does v3 decline with epochs like v1/v2's
    fs10 trend suggested?) -- needs v3_e14/e19 full-data, running now. And whether
    v2's fs10 "decline e9->e19" also reverses on full data (not yet retested).
+
+## v3 WITHIN-VERSION TRAJECTORY (full-data cached, 2026-06-26)
+| v3 epoch | full F1 | vs Meta 71.69 |
+|---|---|---|
+| e9  | 73.89 | +2.2 |
+| e14 | 73.06 | +1.4 |
+| e19 | pending | (DECISIVE) |
+e9->e14 = -0.83: a MILD decline, but stays well ABOVE Meta (+1.4 at e14). This is
+NOT the v1/v2-style regression (those fell BELOW their anchor; fs10 slopes were
+-2.4/-2.6). v3 reads as PLATEAU-above-Meta with slight drift, not collapse.
+Decisive test remains v3_e19: hold >=Meta => fixes changed the trajectory; drop
+below => mild late decline persists even in the best recipe. (Caveat: e9 may be a
+local high; e14 within ~1 F1 could be seed/early-stop noise -- single seed.)
