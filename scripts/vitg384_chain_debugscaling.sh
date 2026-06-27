@@ -31,7 +31,12 @@ ROOT=/lus/flare/projects/ModCon/ngetty/vjepa2
 BASE_CFG=$ROOT/configs/vitg16_surg_vid_webdataset_single4/vitg384_cleandata.yaml
 RUNTIME_CFG=$ROOT/.runtime_configs/n16g12_weak/configs/vitg16_surg_vid_webdataset_single4/vitg384_cleandata.yaml
 PY=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python
-CKPT_DIR=/flare/ModCon/ngetty/checkpoints/surg_2_1_vitg384_cleandata/vitg384
+# prepare_runtime_config.py rewrites the YAML's folder: field by appending the
+# topology suffix (_n16g12_weak), and the trainer writes latest.pth.tar THERE.
+# CKPT_DIR must match that suffixed folder or the chain's progress/completion
+# check + lock + PARAMS look in the wrong place (latest.pth.tar never found ->
+# chain thinks epoch 0 forever). The base config's folder is .../vitg384.
+CKPT_DIR=/flare/ModCon/ngetty/checkpoints/surg_2_1_vitg384_cleandata/vitg384_n16g12_weak
 PARAMS=$CKPT_DIR/params-pretrain.yaml
 SELF=$ROOT/scripts/vitg384_chain_debugscaling.sh
 LOCK=$CKPT_DIR/.training.lock
