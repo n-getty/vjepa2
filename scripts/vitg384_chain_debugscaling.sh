@@ -69,8 +69,10 @@ fi
 # NOTE: do NOT use `-W depend=afterany:$PBS_JOBID` — on Aurora PBS a walltime
 # kill (-29) leaves the dependent stuck in unreleasable system-hold. The LOCK
 # guard already serializes, so submit dependency-free; the successor backfills.
-CAP_RUNNING=$(qstat -u $USER 2>/dev/null | awk '$3=="vitg_cap" && $10=="R"' | wc -l)
-DS_QUEUED=$(qstat -u $USER 2>/dev/null | awk '$3=="debug-sca" && $10=="Q"' | wc -l)
+# qstat -u columns: 3=queue, 4=jobname, 10=state. Match jobname (col 4) — the
+# queue col truncates to "debug-s*" so matching it is unreliable.
+CAP_RUNNING=$(qstat -u $USER 2>/dev/null | awk '$4=="vitg_cap" && $10=="R"' | wc -l)
+DS_QUEUED=$(qstat -u $USER 2>/dev/null | awk '$4=="vitg_chain" && $10=="Q"' | wc -l)
 if (( CAP_RUNNING >= 1 )); then
   echo "swap-over: capacity job running -> debug-scaling chain draining (no resubmit)"
 elif (( DS_QUEUED >= 1 )); then
