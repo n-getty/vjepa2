@@ -27,6 +27,7 @@ ts(){ date -u +%FT%TZ; }
 if [[ -f "$STATE" ]]; then
   DECISION=$(cat "$STATE")
   case "$DECISION" in
+    STOP)          echo "$(ts) orchestrator: STOP — no re-arm (stage complete, awaiting next decision)"; exit 0 ;;
     RESUME)        NAME=vitg_rs; CHAIN=$ROOT/scripts/vitg384_resume_16f_chain.sh ;;
     COOLDOWN_64F)  NAME=vitg_cd; CHAIN=$ROOT/scripts/vitg384_cooldown_64f_chain.sh ;;
     COOLDOWN_32F)  NAME=vitg_cd; CHAIN=$ROOT/scripts/vitg384_cooldown_32f_chain.sh ;;
