@@ -76,15 +76,20 @@ fi
 # guard already serializes, so submit dependency-free; the successor backfills.
 # qstat -u columns: 3=queue, 4=jobname, 10=state. Match jobname (col 4) — the
 # queue col truncates to "debug-s*" so matching it is unreliable.
-CAP_RUNNING=$(qstat -u $USER 2>/dev/null | awk '$4=="vitg_cap" && $10=="R"' | wc -l)
+CAP_RUNNING=$(qstat -u $USER 2>/dev/null | awk '$4=="vitg_crcap" && $10=="R"' | wc -l)
 DS_QUEUED=$(qstat -u $USER 2>/dev/null | awk '$4=="vitg_cr" && $10=="Q"' | wc -l)
 if (( CAP_RUNNING >= 1 )); then
   echo "swap-over: capacity job running -> debug-scaling chain draining (no resubmit)"
 elif (( DS_QUEUED >= 1 )); then
   echo "skip resubmit: $DS_QUEUED debug-scaling job already queued"
 else
-  NEXT_JOB=$(qsub $SELF)
-  echo "Chained next job (no dependency): $NEXT_JOB"
+  # NB: resubmit MUST be non-fatal. Under `set -e`, a failed qsub (e.g. shared-
+  # account "would exceed per-user Q limit") would otherwise abort THIS slice
+  # before training even starts (observed: job 8574149 Exit 38). The watchdog/
+  # orchestrator re-arms the chain if this resubmit is skipped, so failing soft
+  # here is safe.
+  NEXT_JOB=$(qsub $SELF 2>&1) || NEXT_JOB="(resubmit failed, watchdog will re-arm: $NEXT_JOB)"
+  echo "Chained next job: $NEXT_JOB"
 fi
 
 # Lock guard: never train two slices against the same latest.pth.tar. This also

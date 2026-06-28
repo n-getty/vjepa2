@@ -83,7 +83,7 @@ if (( CAP_RUNNING >= 1 )); then
 elif (( DS_QUEUED >= 1 )); then
   echo "skip resubmit: $DS_QUEUED debug-scaling job already queued"
 else
-  NEXT_JOB=$(qsub $SELF)
+  NEXT_JOB=$(qsub $SELF 2>&1) || NEXT_JOB="(resubmit failed, watchdog re-arms: $NEXT_JOB)"
   echo "Chained next job (no dependency): $NEXT_JOB"
 fi
 

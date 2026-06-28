@@ -4,7 +4,7 @@
 # Runs the OPTIMAL run: undistilled Meta ViT-g @ native 384, context loss on
 # (lambda 0.5, ramp rescaled to the run), predictor warm-started, with the
 # bf16 DDP comm hook + bucket50 (-32% iter-time, validated 2026-06-26). See
-# configs/vitg16_surg_vid_webdataset_single4/vitg384_cooldown_64f.yaml and memory
+# configs/vitg16_surg_vid_webdataset_single4/vitg384_cresume_const15.yaml and memory
 # optimal-cpt-vitg384 / vitg-optimization-plan for the full rationale.
 #
 # Strategy: debug-scaling backfills 1h jobs fast and is a SEPARATE per-user slot,
@@ -15,30 +15,30 @@
 # latest if present). The LOCK guard prevents two slices training the same ckpt.
 #
 # Submit first instance:
-#   qsub /lus/flare/projects/ModCon/ngetty/vjepa2/scripts/vitg384_cooldown_64f_chain.sh
+#   qsub /lus/flare/projects/ModCon/ngetty/vjepa2/scripts/vitg384_cresume_const15_chain.sh
 #
-#PBS -N vitg_cd
+#PBS -N vitg_crcap
 #PBS -A ModCon
-#PBS -q debug-scaling
+#PBS -q capacity
 #PBS -l select=16
-#PBS -l walltime=01:00:00
+#PBS -l walltime=12:00:00
 #PBS -l filesystems=home:flare
 #PBS -j oe
 #PBS -o /flare/ModCon/ngetty/logs/
 
 set -eo pipefail
 ROOT=/lus/flare/projects/ModCon/ngetty/vjepa2
-BASE_CFG=$ROOT/configs/vitg16_surg_vid_webdataset_single4/vitg384_cooldown_64f.yaml
-RUNTIME_CFG=$ROOT/.runtime_configs/n16g12_weak/configs/vitg16_surg_vid_webdataset_single4/vitg384_cooldown_64f.yaml
+BASE_CFG=$ROOT/configs/vitg16_surg_vid_webdataset_single4/vitg384_cresume_const15.yaml
+RUNTIME_CFG=$ROOT/.runtime_configs/n16g12_weak/configs/vitg16_surg_vid_webdataset_single4/vitg384_cresume_const15.yaml
 PY=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python
 # prepare_runtime_config.py rewrites the YAML's folder: field by appending the
 # topology suffix (_n16g12_weak), and the trainer writes latest.pth.tar THERE.
 # CKPT_DIR must match that suffixed folder or the chain's progress/completion
 # check + lock + PARAMS look in the wrong place (latest.pth.tar never found ->
 # chain thinks epoch 0 forever). The base config's folder is .../vitg384.
-CKPT_DIR=/flare/ModCon/ngetty/checkpoints/surg_2_1_vitg384_cooldown/vitg384_cd64f_n16g12_weak
+CKPT_DIR=/flare/ModCon/ngetty/checkpoints/surg_2_1_vitg384_cresume/vitg384_cr15_n16g12_weak
 PARAMS=$CKPT_DIR/params-pretrain.yaml
-SELF=$ROOT/scripts/vitg384_cooldown_64f_chain.sh
+SELF=$ROOT/scripts/vitg384_cresume_const15_chain.sh
 LOCK=$CKPT_DIR/.training.lock
 mkdir -p $CKPT_DIR /flare/ModCon/ngetty/logs
 
@@ -66,26 +66,8 @@ if (( CURRENT_EPOCH >= NUM_EPOCHS )); then
   exit 0
 fi
 
-# Keep the chain alive: resubmit a successor unless one is already queued, OR a
-# capacity job has STARTED running (the swap-over: once capacity is live it owns
-# the run via the shared LOCK, so the debug-scaling chain should drain itself
-# instead of churning no-op slices behind it). While a capacity job is only
-# queued (could wait hours), the chain keeps making progress.
-# NOTE: do NOT use `-W depend=afterany:$PBS_JOBID` — on Aurora PBS a walltime
-# kill (-29) leaves the dependent stuck in unreleasable system-hold. The LOCK
-# guard already serializes, so submit dependency-free; the successor backfills.
-# qstat -u columns: 3=queue, 4=jobname, 10=state. Match jobname (col 4) — the
-# queue col truncates to "debug-s*" so matching it is unreliable.
-CAP_RUNNING=$(qstat -u $USER 2>/dev/null | awk '$4=="vitg_cap" && $10=="R"' | wc -l)
-DS_QUEUED=$(qstat -u $USER 2>/dev/null | awk '$4=="vitg_cd" && $10=="Q"' | wc -l)
-if (( CAP_RUNNING >= 1 )); then
-  echo "swap-over: capacity job running -> debug-scaling chain draining (no resubmit)"
-elif (( DS_QUEUED >= 1 )); then
-  echo "skip resubmit: $DS_QUEUED debug-scaling job already queued"
-else
-  NEXT_JOB=$(qsub $SELF 2>&1) || NEXT_JOB="(resubmit failed, watchdog re-arms: $NEXT_JOB)"
-  echo "Chained next job (no dependency): $NEXT_JOB"
-fi
+# Single long capacity job (no self-resubmit). Shares CKPT_DIR + LOCK with the
+# debug-scaling cresume chain; whichever holds the lock trains, the other skips.
 
 # Lock guard: never train two slices against the same latest.pth.tar. This also
 # protects against a capacity job and a debug-scaling slice colliding (both honor
