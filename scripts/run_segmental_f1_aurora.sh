@@ -27,10 +27,12 @@ BEST=$FOLDER/video_classification_frozen/$PROBE_TAG/best.pt
 OUT=/flare/ModCon/ngetty/logs/segf1_${TAG}.json
 
 cd $ROOT && module load frameworks
+# FLAT exposes all 12 tiles; torch.device("xpu") uses tile 0. Do NOT set
+# ZE_AFFINITY_MASK=0.0 — that form makes Level-Zero report ZERO devices and the
+# script silently falls back to CPU (observed 2026-06-28). Single-process job, so
+# no per-rank pinning needed.
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 export TMPDIR=/tmp OMP_NUM_THREADS=16
-# single tile is enough (inference only); pin to tile 0
-export ZE_AFFINITY_MASK=0.0
 export http_proxy="http://proxy.alcf.anl.gov:3128" https_proxy="http://proxy.alcf.anl.gov:3128"
 
 PY=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python

@@ -345,6 +345,11 @@ def main():
 
     device = _pick_device()
     print(f"device: {device}", flush=True)
+    if device.type == "cpu" and os.environ.get("SEGF1_ALLOW_CPU") != "1":
+        print("FATAL: no XPU/CUDA device found — refusing to run full val inference "
+              "on CPU (set SEGF1_ALLOW_CPU=1 to override). Check ZE_FLAT_DEVICE_HIERARCHY "
+              "/ frameworks module / ZE_AFFINITY_MASK.", flush=True)
+        sys.exit(2)
     encoder, classifiers = build_encoder_and_heads(cfg, device)
     epoch = load_classifier_weights(classifiers, args.checkpoint, device)
     print(f"loaded classifiers from epoch {epoch}", flush=True)
