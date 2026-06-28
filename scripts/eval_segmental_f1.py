@@ -278,10 +278,21 @@ def run_inference(encoder, classifier, dataset, device, use_bfloat16):
             amp_ctx = torch.amp.autocast(dev_type, dtype=torch.bfloat16, enabled=use_bfloat16)
         else:
             amp_ctx = torch.amp.autocast("cpu", enabled=False)
+        # Optional test-time augmentation (SEGF1_TTA=1): average softmax over the
+        # original clip and its horizontal flip (label-preserving for action
+        # segmentation). Each clip view is [B,C,T,H,W]; flip the W (last) dim.
+        tta = os.environ.get("SEGF1_TTA", "0") == "1"
+        clip_variants = [clips]
+        if tta:
+            clips_flip = [[v.flip(-1) for v in views] for views in clips]
+            clip_variants.append(clips_flip)
         with amp_ctx:
-            outputs_per_view = encoder(clips, clip_idx_t)
-            head_outputs = [classifier(o) for o in outputs_per_view]
-            probs = sum(F.softmax(o.float(), dim=-1) for o in head_outputs)
+            probs = None
+            for cv in clip_variants:
+                outputs_per_view = encoder(cv, clip_idx_t)
+                head_outputs = [classifier(o) for o in outputs_per_view]
+                p = sum(F.softmax(o.float(), dim=-1) for o in head_outputs)
+                probs = p if probs is None else probs + p
             preds = probs.argmax(dim=-1).reshape(-1).cpu().numpy()
         labels_np = (label.reshape(-1).cpu().numpy()
                      if isinstance(label, torch.Tensor) else
