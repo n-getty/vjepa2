@@ -969,3 +969,16 @@ def main(args, resume_preempt=False):
                 save_every_file = f"e{epoch}.pth.tar"
                 save_every_path = os.path.join(folder, save_every_file)
                 save_checkpoint(epoch + 1, save_every_path)
+            # On a short-walltime chained slice (debug-scaling), we only ever get
+            # ~one epoch per slice. Exiting right after the checkpoint avoids
+            # burning the rest of the walltime on a partial next epoch that will
+            # be discarded (next slice resumes from this same checkpoint). The
+            # chain/watchdog relaunches; the successor resumes from latest.pth.tar.
+            # Opt-in via VJEPA_EXIT_AFTER_CKPT=1 so the capacity/long runs (which
+            # SHOULD keep going) are unaffected.
+            if os.environ.get("VJEPA_EXIT_AFTER_CKPT") == "1" and (epoch + 1) < num_epochs:
+                logger.info(
+                    f"VJEPA_EXIT_AFTER_CKPT: saved epoch {epoch + 1}, exiting "
+                    f"slice cleanly (chain will resume from latest.pth.tar)."
+                )
+                return

@@ -136,7 +136,7 @@ optimization:
   epochs: 60
   final_lr: 1.5e-05
   final_weight_decay: 0.04
-  ipe: 350
+  ipe: 450
   ipe_scale: 1.0
   lr: 1.5e-05
   start_lr: 1.5e-05

@@ -133,6 +133,7 @@ export WDS_LOCAL_SLICING=1
 # --- ViT-g optimizations (validated 2026-06-26: -32% iter-time, no loss cost) ---
 export VJEPA_BF16_COMM=1
 export VJEPA_DDP_BUCKET_MB=50
+export VJEPA_EXIT_AFTER_CKPT=1  # 1h slice: exit after the 1 epoch we get, dont waste partial next
 if [[ -f "${PBS_NODEFILE:-}" ]]; then
   MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
 else
