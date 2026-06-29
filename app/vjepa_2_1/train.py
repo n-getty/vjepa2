@@ -329,7 +329,15 @@ def main(args, resume_preempt=False):
                 load_path = anneal_ckpt
                 resume_anneal = False
         else:
-            load_path = r_file if r_file is not None else latest_path
+            # Resume precedence: a latest.pth.tar in the run folder is an
+            # in-progress resume and must WIN over read_checkpoint (r_file).
+            # r_file is only a BOOTSTRAP (e.g. resume-from-another-run's e19);
+            # if we keep preferring it, every chained slice reloads the bootstrap
+            # and re-does the same epoch forever (observed: cresume stuck at ep21).
+            if os.path.exists(latest_path):
+                load_path = latest_path
+            else:
+                load_path = r_file if r_file is not None else latest_path
         if not os.path.exists(load_path):
             load_path = None
             load_model = False
