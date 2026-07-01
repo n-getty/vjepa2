@@ -78,6 +78,22 @@ def init_module(
     return model
 
 
+# ----------------------------------------------------------------------------
+# `preserve_clip_dim` (added 2026-05-29 for SAR_RARP50 ASFormer head)
+# -----------------------------------------------------------------------------
+# Default behaviour (`preserve_clip_dim=False`): each spatial view of
+# `multiviews_postprocess` is `[B, num_clips*T_clip*S, D]` (clip + time
+# flattened together). That works for the AttentiveClassifier path because the
+# head pools the full token sequence with a learned query.
+#
+# The ASFormer head needs per-clip access: it pools spatial tokens
+# *per (clip, time) step*, then runs a temporal stack across
+# `num_clips * T_clip` steps. Setting `preserve_clip_dim=True` makes the
+# wrapper return `[B, num_clips, T_clip*S, D]` so the head can reshape and
+# pool unambiguously.
+# -----------------------------------------------------------------------------
+
+
 class ClipAggregation(nn.Module):
     """
     Process each clip independently and concatenate all tokens
@@ -89,12 +105,17 @@ class ClipAggregation(nn.Module):
         tubelet_size=2,
         max_frames=128,
         use_pos_embed=False,
+        preserve_clip_dim=False,
     ):
         super().__init__()
         self.model = model
         self.tubelet_size = tubelet_size
         self.embed_dim = embed_dim = model.embed_dim
         self.num_heads = model.num_heads
+        # When True, multiviews_postprocess returns per-clip token tensors
+        # of shape [B, num_clips, T_clip*S, D] instead of flattening clip+time.
+        # Used by the ASFormer head on SAR_RARP50.
+        self.preserve_clip_dim = preserve_clip_dim
 
         # 1D-temporal pos-embedding
         self.pos_embed = None
@@ -130,10 +151,28 @@ class ClipAggregation(nn.Module):
                     all_outputs[j].append(o[j * B : (j + 1) * B])
 
             for i, outputs in enumerate(all_outputs):
-                # Concatenate along temporal dimension
+                # `outputs` is a list of length num_clips, each [B, T*S, D] (post-reshape).
                 outputs = [o.reshape(B, T, S, D) for o in outputs]
+
+                if self.preserve_clip_dim:
+                    # ASFormer path: keep clip axis separate.
+                    # Result: [B, num_clips, T*S, D].
+                    per_clip = [o.reshape(B, T * S, D) for o in outputs]
+                    stacked = torch.stack(per_clip, dim=1)
+                    if (self.pos_embed is not None) and (clip_indices is not None):
+                        _indices = [c[:, :: self.tubelet_size] for c in clip_indices]
+                        pos_embed = self.pos_embed.repeat(B, 1, 1)  # [B, max_T, D]
+                        pos_embed = apply_masks(pos_embed, _indices, concat=False)  # list([B, T, D])
+                        pos_per_clip = [
+                            pe.unsqueeze(2).repeat(1, 1, S, 1).reshape(B, T * S, D)
+                            for pe in pos_embed
+                        ]
+                        stacked = stacked + torch.stack(pos_per_clip, dim=1)
+                    all_outputs[i] = stacked
+                    continue
+
+                # Default path: flatten clip + time -> [B, num_clips*T*S, D].
                 outputs = torch.cat(outputs, dim=1).flatten(1, 2)
-                # Compute positional embedding
                 if (self.pos_embed is not None) and (clip_indices is not None):
                     _indices = [c[:, :: self.tubelet_size] for c in clip_indices]
                     pos_embed = self.pos_embed.repeat(B, 1, 1)  # [B, max_T, D]

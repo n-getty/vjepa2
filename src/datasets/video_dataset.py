@@ -23,7 +23,21 @@ from src.datasets.utils.dataloader import (
 from src.datasets.utils.weighted_sampler import DistributedWeightedSampler
 
 _GLOBAL_SEED = 0
+MAX_FAILED_SAMPLE_RETRIES = max(1, int(os.environ.get("VJEPA2_MAX_FAILED_SAMPLE_RETRIES", "32")))
 logger = getLogger()
+
+
+def _stringify_label_token(value):
+    """Normalize CSV label fields into a compact space-delimited string."""
+    if pd.isna(value):
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)) and float(value).is_integer():
+        return str(int(value))
+    return str(value)
 
 
 def make_videodataset(
@@ -51,6 +65,8 @@ def make_videodataset(
     persistent_workers=True,
     deterministic=True,
     log_dir=None,
+    sequence_labels=False,
+    return_sample_path=False,
 ):
     dataset = VideoDataset(
         data_paths=data_paths,
@@ -67,6 +83,8 @@ def make_videodataset(
         filter_long_videos=filter_long_videos,
         shared_transform=shared_transform,
         transform=transform,
+        sequence_labels=sequence_labels,
+        return_sample_path=return_sample_path,
     )
 
     log_dir = pathlib.Path(log_dir) if log_dir else None
@@ -137,6 +155,8 @@ class VideoDataset(torch.utils.data.Dataset):
         filter_short_videos=False,
         filter_long_videos=int(10**9),
         duration=None,  # duration in seconds
+        sequence_labels=False,
+        return_sample_path=False,
     ):
         self.data_paths = data_paths
         self.datasets_weights = datasets_weights
@@ -150,6 +170,17 @@ class VideoDataset(torch.utils.data.Dataset):
         self.filter_long_videos = filter_long_videos
         self.duration = duration
         self.fps = fps
+        # When True, __getitem__ returns (buffer, label, clip_indices, sample_path)
+        # instead of the default (buffer, label, clip_indices). The sample_path is
+        # the absolute video path used by *MultiLabel* wrappers in
+        # evals/triplet_recog_frozen/dataset_wrapper.py to join multilabel
+        # annotations from a sidecar CSV.
+        self.return_sample_path = return_sample_path
+        # When True, multi-token labels (e.g. "3 3 5 5 7 7 7 7" for an
+        # 8-step frame-wise sequence) are decoded into LongTensor([T]) on
+        # __getitem__. Single-int labels are unaffected. Used by the
+        # SAR_RARP50 ASFormer head.
+        self.sequence_labels = sequence_labels
 
         if sum([v is not None for v in (fps, duration, frame_step)]) != 1:
             raise ValueError(
@@ -184,8 +215,37 @@ class VideoDataset(torch.utils.data.Dataset):
                 except pd.errors.ParserError:
                     # In image captioning datasets where we have space, we use :: as delimiter.
                     data = pd.read_csv(data_path, header=None, delimiter="::")
-                samples += list(data.values[:, 0])
-                labels += list(data.values[:, 1])
+
+                data = data.dropna(how="all")
+                if data.empty:
+                    logger.warning(f"No usable rows found in CSV dataset: {data_path}")
+                    self.num_samples_per_dataset.append(0)
+                    continue
+
+                if data.shape[1] < 2:
+                    raise ValueError(f"Expected at least 2 columns in dataset CSV, got {data.shape[1]}: {data_path}")
+
+                label_frame = data.iloc[:, 1:]
+                valid_mask = data.iloc[:, 0].notna()
+                if label_frame.shape[1] == 1:
+                    valid_mask &= label_frame.iloc[:, 0].notna()
+                else:
+                    # Multi-task rows must provide every task label; malformed rows are skipped.
+                    valid_mask &= label_frame.notna().all(axis=1)
+
+                dropped_rows = int((~valid_mask).sum())
+                if dropped_rows:
+                    logger.warning(f"Dropping {dropped_rows} malformed rows from dataset CSV: {data_path}")
+
+                data = data.loc[valid_mask].reset_index(drop=True)
+                samples += list(data.iloc[:, 0])
+                if label_frame.shape[1] == 1:
+                    labels += list(data.iloc[:, 1])
+                else:
+                    labels += [
+                        " ".join(_stringify_label_token(value) for value in row)
+                        for row in data.iloc[:, 1:].itertuples(index=False, name=None)
+                    ]
                 num_samples = len(data)
                 self.num_samples_per_dataset.append(num_samples)
 
@@ -209,25 +269,69 @@ class VideoDataset(torch.utils.data.Dataset):
 
         self.samples = samples
         self.labels = labels
+        self.max_failed_sample_retries = MAX_FAILED_SAMPLE_RETRIES
+
+    def _maybe_decode_sequence_label(self, label):
+        """Decode a space-delimited integer-list label into LongTensor([T]).
+
+        Multi-token labels are stored as strings like "3 3 5 5 7 7 7 7" by
+        `_stringify_label_token`. When `sequence_labels=True`, the trainer
+        (ASFormer path) expects a 1-D integer tensor per sample; the default
+        collate then stacks across the batch to [B, T].
+
+        Pass-through when:
+          - sequence_labels is False (default), or
+          - the label is already an integer (single-task pooled-clip CSVs).
+        """
+        if not self.sequence_labels:
+            return label
+        if isinstance(label, (int, np.integer)):
+            return torch.tensor([int(label)], dtype=torch.long)
+        if isinstance(label, str):
+            tokens = label.split()
+            if not tokens:
+                return torch.zeros(0, dtype=torch.long)
+            return torch.tensor([int(t) for t in tokens], dtype=torch.long)
+        return label
 
     def __getitem__(self, index):
-        sample = self.samples[index]
-        loaded_sample = False
-        # Keep trying to load videos until you find a valid sample
-        while not loaded_sample:
+        original_index = int(index)
+        attempted_samples = []
+        # Bound retries so a bad sample raises instead of silently stalling distributed work.
+        for attempt in range(self.max_failed_sample_retries):
+            sample = self.samples[index]
             if not isinstance(sample, str):
-                logger.warning("Invalid sample.")
+                logger.warning(f"Invalid sample at index {index}: {sample!r}")
+                loaded_sample = None
             else:
                 if sample.split(".")[-1].lower() in ("jpg", "png", "jpeg"):
                     loaded_sample = self.get_item_image(index)
                 else:
                     loaded_sample = self.get_item_video(index)
 
-            if not loaded_sample:
-                index = np.random.randint(self.__len__())
-                sample = self.samples[index]
+            if loaded_sample:
+                if attempt > 0:
+                    logger.warning(
+                        "Recovered dataset sample after %d retries "
+                        "(original_index=%d, final_index=%d, sample=%s)",
+                        attempt,
+                        original_index,
+                        index,
+                        sample,
+                    )
+                return loaded_sample
 
-        return loaded_sample
+            attempted_samples.append(sample if isinstance(sample, str) else repr(sample))
+            index = int(np.random.randint(self.__len__()))
+
+        attempted_preview = ", ".join(repr(path) for path in attempted_samples[:4])
+        if len(attempted_samples) > 4:
+            attempted_preview += ", ..."
+        raise RuntimeError(
+            "Failed to load dataset sample after "
+            f"{self.max_failed_sample_retries} attempts "
+            f"(original_index={original_index}, attempted_samples=[{attempted_preview}])"
+        )
 
     def get_item_video(self, index):
         sample = self.samples[index]
@@ -242,7 +346,7 @@ class VideoDataset(torch.utils.data.Dataset):
             return
 
         # Label/annotations for video
-        label = self.labels[index]
+        label = self._maybe_decode_sequence_label(self.labels[index])
 
         def split_into_clips(video):
             """Split video into a list of clips"""
@@ -257,6 +361,8 @@ class VideoDataset(torch.utils.data.Dataset):
         if self.transform is not None:
             buffer = [self.transform(clip) for clip in buffer]
 
+        if self.return_sample_path:
+            return buffer, label, clip_indices, sample
         return buffer, label, clip_indices
 
     def get_item_image(self, index):
@@ -268,9 +374,10 @@ class VideoDataset(torch.utils.data.Dataset):
             image_tensor = torchvision.io.read_image(
                 path=sample, mode=torchvision.io.ImageReadMode.RGB
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"failed to read image {sample}: {exc}")
             return
-        label = self.labels[index]
+        label = self._maybe_decode_sequence_label(self.labels[index])
         clip_indices = [np.arange(start=0, stop=fpc, dtype=np.int32)]
 
         # Expanding the input image [3, H, W] ==> [T, 3, H, W]
@@ -284,6 +391,8 @@ class VideoDataset(torch.utils.data.Dataset):
         if self.transform is not None:
             buffer = [self.transform(buffer)]
 
+        if self.return_sample_path:
+            return buffer, label, clip_indices, sample
         return buffer, label, clip_indices
 
     def loadvideo_decord(self, sample, fpc):
@@ -300,12 +409,16 @@ class VideoDataset(torch.utils.data.Dataset):
             return [], None
 
         try:
-            vr = VideoReader(fname, num_threads=-1, ctx=cpu(0))
-        except Exception:
+            # num_threads=1: under 4-rank DDP on Polaris, num_threads=-1 (all CPUs)
+            # blows past pthread limits and triggers `can't start new thread`.
+            vr = VideoReader(fname, num_threads=1, ctx=cpu(0))
+        except Exception as exc:
+            logger.warning(f"failed to open video {fname}: {exc}")
             return [], None
 
         fstp = self.frame_step
         if self.duration is not None or self.fps is not None:
+            video_fps = None
             try:
                 video_fps = math.ceil(vr.get_avg_fps())
             except Exception as e:
@@ -313,12 +426,33 @@ class VideoDataset(torch.utils.data.Dataset):
 
             if self.duration is not None:
                 assert self.fps is None
+                if video_fps is None:
+                    logger.warning(f"failed to infer video fps for {fname}; skipping sample")
+                    return [], None
                 fstp = int(self.duration * video_fps / fpc)
             else:
                 assert self.duration is None
-                fstp = video_fps // self.fps
+                if video_fps is None:
+                    logger.warning(f"failed to infer video fps for {fname}; skipping sample")
+                    return [], None
+                if self.fps <= 0:
+                    logger.warning(f"invalid target fps={self.fps} for {fname}; skipping sample")
+                    return [], None
+                if video_fps < self.fps:
+                    logger.warning(
+                        "video fps (%s) is lower than requested fps (%s) for %s; "
+                        "clamping frame step to 1",
+                        video_fps,
+                        self.fps,
+                        fname,
+                    )
+                    fstp = 1
+                else:
+                    fstp = video_fps // self.fps
 
-        assert fstp is not None and fstp > 0
+        if fstp is None or fstp <= 0:
+            logger.warning(f"computed invalid frame step {fstp} for {fname}; clamping to 1")
+            fstp = 1
         clip_len = int(fpc * fstp)
 
         if self.filter_short_videos and len(vr) < clip_len:
@@ -382,7 +516,11 @@ class VideoDataset(torch.utils.data.Dataset):
             clip_indices.append(indices)
             all_indices.extend(list(indices))
 
-        buffer = vr.get_batch(all_indices).asnumpy()
+        try:
+            buffer = vr.get_batch(all_indices).asnumpy()
+        except Exception as exc:
+            logger.warning(f"failed to decode video {fname}: {exc}")
+            return [], None
         return buffer, clip_indices
 
     def __len__(self):

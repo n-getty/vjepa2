@@ -56,6 +56,7 @@ SPECS = [
     ("v1_e39", f"{V1}/e39.pth.tar", "target_encoder"),      # phase2 decline curve
     ("v3_e4", f"{V3}/e4.pth.tar", "target_encoder"),
     ("v3_e9", f"{V3}/e9.pth.tar", "target_encoder"),
+    ("v3_e14", f"{V3}/e14.pth.tar", "target_encoder"),
     ("v3_e19", f"{V3}/e19.pth.tar", "target_encoder"),
 ]
 
