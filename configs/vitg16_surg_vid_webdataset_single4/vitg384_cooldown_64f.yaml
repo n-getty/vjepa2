@@ -8,23 +8,18 @@ data:
   num_clips: 10
   dataset_type: WebDataset
   datasets:
-  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/crcd
-  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/endovis15
-  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/jigsaw
+  # small_surg = symlink bundle of the tiny surgical sets (crcd, endovis15, jigsaw,
+  # miccai_2017, miccai_endoseg, surgvisdom = 926 clips total). Merged so per-source
+  # temperature sampling sizes them by combined count instead of giving each tiny
+  # set its own seat (which oversampled endovis15's 8 clips 82x/epoch -> memorization).
+  # Bundled: worst-case per-clip oversample drops 82x -> ~8x, no data dropped.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/small_surg
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/kinetics400
-  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/miccai_2017
-  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/miccai_endoseg
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/sitl
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_robotic
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgtoolloc2022
-  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvisdom
-  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvu24
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvu24_clean
   datasets_weights:
-  - 1
-  - 1
-  - 1
-  - 1
-  - 1
   - 1
   - 1
   - 1
@@ -37,11 +32,6 @@ data:
   crop_size: 384
   patch_size: 16
   dataset_fpcs:
-  - 64
-  - 64
-  - 64
-  - 64
-  - 64
   - 64
   - 64
   - 64
