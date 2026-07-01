@@ -42,3 +42,9 @@ experiments/
 
 # Project memory / development context (per-checkout, not part of the port)
 CLAUDE.md
+
+# Aurora port: crash dumps and scratch/staging (never commit)
+core.*
+.*_staging/
+*.stock_backup
+dataset_table_content.txt

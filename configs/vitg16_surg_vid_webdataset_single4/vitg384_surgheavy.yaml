@@ -1,0 +1,185 @@
+# ViT-g @ 384 surgical CPT — SURGERY-HEAVY data reweight variant.
+#
+# Sibling of vitg384_cleandata.yaml. IDENTICAL in every respect (model, init,
+# optimization, masks, resolution, topology) EXCEPT the WebDataset mixing
+# weights, so any probe delta is cleanly attributable to the data diet alone.
+#
+# WHY (the data-dilution lever, second experiment after cooldown_64f):
+#   The corpus is 231,321 SOURCE clips (~1-min each, the loader draws random 4s
+#   windows), of which kinetics400 = 136,246 (58.9% of the corpus) is general
+#   action video, not surgery. Under the existing sqrt-size sampling
+#   (sampling_temperature: 0.5) the REALIZED training mix is already 62.9%
+#   surgical (sqrt tames kinetics 58.9%->37.1% realized), but kinetics is still
+#   the single largest source. This variant deliberately pushes the surgical
+#   share to ~82% so the 1B-param ViT-g spends its capacity on the target domain.
+#
+# WEIGHTS (Option B, computed in src/datasets/webdataset.py:compute_mixing_probs
+#   semantics: prob_i ∝ datasets_weights_i * sample_count_i ** temperature):
+#     kinetics400 = 0.3   (down-weight the dominant non-surgical source)
+#     surgvu24    = 0.5   (down-weight to OFFSET its ~19% byte-identical black
+#                          clips — raising surgical share would otherwise make
+#                          surgvu24 the #1 source and push black clips from
+#                          ~4.4% to ~5.9% of every batch; 0.5 holds it at ~3.5%.
+#                          See memory surgvu24-black-clip-corruption. min_clip_std
+#                          rejects them at load, but the reject just redraws from
+#                          the same stream, so lowering its prob is the real fix.)
+#     all others  = 1.0
+#   Realized mix @ temp0.5: surgtoolloc 25.3 / sitl 19.0 / surgvu24 18.3 /
+#     kinetics 17.8 / surgenet 9.7 / surgvisdom 3.5 / crcd+jigsaw ~2 each / micro <1.
+#   => surgical share 82.2%, surgvu24 black ~3.5%/batch (DOWN from 4.4% baseline).
+#
+# PHASE: this is a FULL-LR PRETRAIN arc from the Meta init (warmup 2.0, lr 7.5e-5),
+#   NOT a resume or cooldown. A distribution shift must be introduced while the
+#   model is plastic; introducing it during cooldown's annealing LR is the worst
+#   time (the model freezes exactly as its diet changes). Run this fresh arc, then
+#   cooldown from ITS best epoch — mirroring the cleandata -> cooldown_64f arc.
+app: vjepa_2_1
+nodes: 16
+tasks_per_node: 12
+cpus_per_task: 16
+mem_per_gpu: 40G
+folder: /flare/ModCon/ngetty/checkpoints/surg_2_1_vitg384_surgheavy/vitg384_surgheavy
+data:
+  num_clips: 10
+  dataset_type: WebDataset
+  datasets:
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/crcd
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/endovis15
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/jigsaw
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/kinetics400
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/miccai_2017
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/miccai_endoseg
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/sitl
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_robotic
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgtoolloc2022
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvisdom
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvu24
+  # SURGERY-HEAVY reweight (Option B). Order matches `datasets:` above.
+  #  crcd endovis15 jigsaw [kinetics=0.3] miccai_2017 miccai_endoseg sitl
+  #  surgenet_robotic surgtoolloc2022 surgvisdom [surgvu24=0.5]
+  datasets_weights:
+  - 1
+  - 1
+  - 1
+  - 0.3
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 0.5
+  sampling_temperature: 0.5
+  # Degenerate (black/frozen) clip reject floor on the raw 0-255 per-pixel std.
+  # Drops surgvu24's ~19% byte-identical pure-black clips before they reach a
+  # batch (the v3 data fix; carried forward). Set 0 to disable.
+  min_clip_std: 1.0
+  batch_size: 2
+  crop_size: 384
+  patch_size: 16
+  dataset_fpcs:
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  tubelet_size: 2
+  fps: 4
+  num_workers: 2
+  persistent_workers: true
+  pin_mem: true
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+loss:
+  loss_exp: 1.0
+  predict_all: true
+  shift_by_n: 0
+  weight_distance_loss: true
+mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 8
+  spatial_scale:
+  - 0.15
+  - 0.15
+  temporal_scale:
+  - 1.0
+  - 1.0
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 2
+  spatial_scale:
+  - 0.7
+  - 0.7
+  temporal_scale:
+  - 1.0
+  - 1.0
+meta:
+  context_encoder_key: encoder
+  dtype: bfloat16
+  eval_freq: 1000000000
+  load_checkpoint: true
+  load_predictor: true
+  pretrain_checkpoint: /flare/ModCon/ngetty/checkpoints/vjepa2_1_vitg_384.pt
+  read_checkpoint: null
+  save_every_freq: 5
+  seed: 239
+  target_encoder_key: target_encoder
+  use_sdpa: true
+model:
+  has_cls_first: false
+  img_temporal_dim_size: 1
+  interpolate_rope: true
+  is_causal: false
+  lambda_value_vid: 0.5
+  lambda_start_iter: 500
+  lambda_end_iter: 1500
+  modality_embedding: true
+  model_name: vit_giant_xformers
+  n_registers: 0
+  n_registers_predictor: 0
+  normalize_predictor: false
+  pred_depth: 24
+  pred_embed_dim: 384
+  pred_is_causal: false
+  pred_num_heads: 12
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_mask_tokens: true
+  use_rope: true
+  zero_init_mask_tokens: true
+optimization:
+  ema:
+  - 0.99925
+  - 0.99925
+  epochs: 20
+  final_lr: 1.0e-06
+  final_weight_decay: 0.04
+  ipe: 500
+  ipe_scale: 1.0
+  lr: 7.5e-05
+  start_lr: 1.0e-06
+  warmup: 2.0
+  weight_decay: 0.04

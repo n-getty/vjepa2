@@ -133,10 +133,23 @@ optimization:
   ema:
   - 0.99925
   - 0.99925
-  epochs: 8
+  # WALLTIME FIT (revised 2026-06-30, 2nd pass): 64f is ~14.3s/iter MEDIAN (p90
+  # 16.9s), and staging costs ~5 min EVERY slice. The first fix (ipe=200) gave
+  # ~48 min compute + 5 staging + ckpt ≈ 58+ min — right at the 60-min cliff, so
+  # slices got walltime-KILLED before saving (8575990 died at iter ~mid-epoch-2,
+  # lost the epoch). Cut ipe 200->150: ~36 min compute + 5 staging + ckpt ≈ 42 min,
+  # REAL margin under 60 min on debug-scaling. epochs stays 20 (NOT raised): the
+  # cosine cooldown LR at an epoch boundary = cos(pi * start_epoch/num_epochs),
+  # which depends only on epochs, NOT ipe (verified train.py:566 replays
+  # start_epoch*ipe steps vs T_max=ipe*epochs). So the already-saved epoch-1 ckpt
+  # stays consistent AND the capacity job (vitg384_cooldown_64f_capacity.sh, 12h,
+  # shares CKPT_DIR+PARAMS+LOCK) reads the SAME params safely. Total anneal is now
+  # 150*20=3000 steps (vs 4000) — a slightly shorter cooldown, fine. Pairs with
+  # VJEPA_EXIT_AFTER_CKPT=1 in the debug-scaling chain.
+  epochs: 20
   final_lr: 1.0e-06
   final_weight_decay: 0.04
-  ipe: 500
+  ipe: 150
   ipe_scale: 1.0
   lr: 7.5e-05
   start_lr: 7.5e-05

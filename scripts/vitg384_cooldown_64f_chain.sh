@@ -76,7 +76,7 @@ fi
 # guard already serializes, so submit dependency-free; the successor backfills.
 # qstat -u columns: 3=queue, 4=jobname, 10=state. Match jobname (col 4) — the
 # queue col truncates to "debug-s*" so matching it is unreliable.
-CAP_RUNNING=$(qstat -u $USER 2>/dev/null | awk '$4=="vitg_cap" && $10=="R"' | wc -l)
+CAP_RUNNING=$(qstat -u $USER 2>/dev/null | awk '$4=="vitg_cdcap" && $10=="R"' | wc -l)
 DS_QUEUED=$(qstat -u $USER 2>/dev/null | awk '$4=="vitg_cd" && $10=="Q"' | wc -l)
 if (( CAP_RUNNING >= 1 )); then
   echo "swap-over: capacity job running -> debug-scaling chain draining (no resubmit)"
@@ -128,6 +128,7 @@ export WDS_LOCAL_SLICING=1
 # --- ViT-g optimizations (validated 2026-06-26: -32% iter-time, no loss cost) ---
 export VJEPA_BF16_COMM=1
 export VJEPA_DDP_BUCKET_MB=50
+export VJEPA_EXIT_AFTER_CKPT=1  # 1h slice: exit after the 1 epoch (ipe=200) we get; dont waste partial next epoch
 if [[ -f "${PBS_NODEFILE:-}" ]]; then
   MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
 else
