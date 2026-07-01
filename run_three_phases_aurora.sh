@@ -4,7 +4,11 @@
 # Env vars (same contract as run_three_phases_polaris.sh — see CLAUDE.md):
 #   VJEPA_NUM_NODES     (required, e.g. 1, 2, ...)
 #   VJEPA_NUM_GPUS      tiles per node (default 12 on Aurora with ZE_FLAT_DEVICE_HIERARCHY=FLAT)
-#   VJEPA_STRONG_SCALE  if "1", per-rank batch stays fixed; else global batch preserved
+#   VJEPA_WEAK_SCALE    if "1", per-rank batch stays fixed and global batch grows
+#                       with GPU count (weak scaling). Default 0 = strong scaling
+#                       (global batch preserved by shrinking per-rank batch).
+#                       Legacy alias VJEPA_STRONG_SCALE=1 also accepted (it was
+#                       a misnomer for the same weak-scaling behavior).
 #   VJEPA_PYTHON        (required) path to python; on Aurora typically the system
 #                       python from `module load frameworks`, e.g.
 #                         /opt/aurora/.../frameworks_2025.2.0/bin/python3
@@ -27,7 +31,7 @@ RUNTIME_CFG_TOOL="$ROOT/scripts/prepare_runtime_config.py"
 
 NUM_NODES="${VJEPA_NUM_NODES:?must set VJEPA_NUM_NODES}"
 NUM_GPUS="${VJEPA_NUM_GPUS:-12}"
-STRONG_SCALE="${VJEPA_STRONG_SCALE:-0}"
+WEAK_SCALE="${VJEPA_WEAK_SCALE:-${VJEPA_STRONG_SCALE:-0}}"
 ACCOUNT="${VJEPA_ACCOUNT:-AuroraGPT}"
 PARTITION="${VJEPA_PARTITION:-debug}"
 TIME_MIN="${VJEPA_TIME_MIN:-60}"
@@ -48,8 +52,8 @@ if [[ "$#" -eq 0 ]]; then
 fi
 
 PREP_ARGS=(--root "$ROOT" --num-gpus "$NUM_GPUS" --num-nodes "$NUM_NODES")
-if [[ "$STRONG_SCALE" == "1" ]]; then
-  PREP_ARGS+=(--strong-scale)
+if [[ "$WEAK_SCALE" == "1" ]]; then
+  PREP_ARGS+=(--weak-scale)
 fi
 if [[ -n "$FOLDER_BASE" ]]; then
   PREP_ARGS+=(--folder-base "$FOLDER_BASE")
@@ -99,7 +103,7 @@ cd "$ROOT"
 PREV_JOB=""
 for cfg in "$@"; do
   echo
-  echo "== Preparing $cfg [nodes=$NUM_NODES tiles/node=$NUM_GPUS strong=$STRONG_SCALE] =="
+  echo "== Preparing $cfg [nodes=$NUM_NODES tiles/node=$NUM_GPUS weak_scale=$WEAK_SCALE] =="
   runtime_cfg="$("$PYTHON_BIN" "$RUNTIME_CFG_TOOL" "${PREP_ARGS[@]}" "$cfg")"
   echo "  runtime cfg: $runtime_cfg"
 

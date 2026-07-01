@@ -48,6 +48,7 @@ from pathlib import Path
 import yaml
 
 from app.scaffold import main as app_main
+from evals.scaffold import main as eval_main
 from src.utils.logging import get_logger, git_information
 
 logger = get_logger(force=True)
@@ -140,12 +141,20 @@ def build_pbs_script(folder, job_name, account, partition, walltime_minutes,
 
     aurora_env = [
         "ulimit -c unlimited",
+        # Default frameworks (2025.3.1) is the only env where mpi4py + mpich
+        # libs are co-loaded — required for the pre-`init_process_group` MPI
+        # barrier (torchtune CLAUDE.md production multi-node row).
+        # webdataset+decord+braceexpand are user-installed for python3.12.
         "module load frameworks",
         f"source {venv}/bin/activate" if venv else "",
         # Tile addressing: split each GPU into 2 tiles → 12 tiles/node.
         "export ZE_FLAT_DEVICE_HIERARCHY=FLAT",
         "export MPICH_GPU_SUPPORT_ENABLED=1",
         # oneCCL multi-node block (torchtune CLAUDE.md "Production multi-node" row).
+        # Tested 2026-06-05: CCL_ALLREDUCE=topo + rabenseifner from ALCF
+        # docs was ~4% SLOWER than ring at 16n / 192 ranks for our DDP workload
+        # (rabenseifner's intra-node fanout overhead exceeds inter-node savings
+        # at only 16 nodes — ALCF's "large scale" recs target 64+ nodes).
         "export CCL_PROCESS_LAUNCHER=pmix",
         "export CCL_ATL_TRANSPORT=mpi",
         "export CCL_KVS_MODE=mpi",
@@ -375,21 +384,34 @@ def run_training(args):
     # Ensure the run folder exists before app_main opens log_r{rank}.csv.
     # Normally submit() pre-creates it on the login node, but when --train_mode
     # is launched directly (e.g. via run_train.sh on a held node) nothing has.
-    # Rank 0 creates it, then a barrier so other ranks see it.
+    # Rank 0 creates it; other ranks poll the filesystem instead of using
+    # dist.barrier() — barrier on XPU here segfaults because init_process_group
+    # was called without device_id (deliberately, per torchtune table; passing
+    # device_id hangs DataLoader workers on multi-node XPU).
     folder = params.get("folder")
     if folder:
         if rank == 0:
             Path(folder).mkdir(parents=True, exist_ok=True)
-        import torch.distributed as dist
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
+        else:
+            import time
+            for _ in range(600):
+                if Path(folder).exists():
+                    break
+                time.sleep(0.1)
 
     if rank == 0:
         logger.info(f"World size: {world_size}; loaded params:")
         pprint.PrettyPrinter(indent=2).pprint(params)
 
     try:
-        app_main(params["app"], args=params, resume_preempt=False)
+        # Eval YAMLs (e.g. configs/heads/sarrarp50/*) carry `eval_name` and route
+        # through `evals.scaffold.main`. Pretraining YAMLs carry `app` and route
+        # through `app.scaffold.main`. Backward compatible: only the presence of
+        # the `eval_name` key changes routing.
+        if "eval_name" in params:
+            eval_main(params["eval_name"], args_eval=params, resume_preempt=False)
+        else:
+            app_main(params["app"], args=params, resume_preempt=False)
     finally:
         import torch.distributed as dist
         if dist.is_available() and dist.is_initialized():
