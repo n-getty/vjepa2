@@ -1,0 +1,141 @@
+app: vjepa_2_1
+nodes: 16
+tasks_per_node: 12
+cpus_per_task: 16
+mem_per_gpu: 40G
+folder: /flare/ModCon/ngetty/checkpoints/surg_2_1_v2_cleanbug/from_meta_regrecipe
+data:
+  num_clips: 10
+  dataset_type: WebDataset
+  datasets:
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/crcd
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/endovis15
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/jigsaw
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/kinetics400
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/miccai_2017
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/miccai_endoseg
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/sitl
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_robotic
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgtoolloc2022
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvisdom
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvu24
+  datasets_weights:
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  sampling_temperature: 0.5
+  batch_size: 2
+  crop_size: 256
+  patch_size: 16
+  dataset_fpcs:
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  tubelet_size: 2
+  fps: 4
+  num_workers: 2
+  persistent_workers: true
+  pin_mem: true
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+loss:
+  loss_exp: 1.0
+  predict_all: true
+  shift_by_n: 0
+  weight_distance_loss: true
+mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 8
+  spatial_scale:
+  - 0.15
+  - 0.15
+  temporal_scale:
+  - 1.0
+  - 1.0
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 2
+  spatial_scale:
+  - 0.7
+  - 0.7
+  temporal_scale:
+  - 1.0
+  - 1.0
+meta:
+  context_encoder_key: ema_encoder
+  dtype: bfloat16
+  eval_freq: 1000000000
+  load_checkpoint: true
+  load_predictor: false
+  pretrain_checkpoint: /flare/ModCon/ngetty/checkpoints/vjepa2_1_vitl_dist_vitG_384.pt
+  read_checkpoint: null
+  save_every_freq: 1000
+  seed: 239
+  target_encoder_key: ema_encoder
+  use_sdpa: true
+model:
+  has_cls_first: false
+  img_temporal_dim_size: 1
+  interpolate_rope: true
+  is_causal: false
+  lambda_value_vid: 0.5
+  modality_embedding: true
+  model_name: vit_large
+  n_registers: 0
+  n_registers_predictor: 0
+  normalize_predictor: false
+  pred_depth: 24
+  pred_embed_dim: 384
+  pred_is_causal: false
+  pred_num_heads: 12
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_mask_tokens: true
+  use_rope: true
+  zero_init_mask_tokens: true
+optimization:
+  ema:
+  - 0.99925
+  - 0.99925
+  epochs: 40
+  final_lr: 0.000525
+  final_weight_decay: 0.04
+  ipe: 500
+  ipe_scale: 1.0
+  lr: 0.000525
+  start_lr: 0.000525
+  warmup: 0.0
+  weight_decay: 0.04

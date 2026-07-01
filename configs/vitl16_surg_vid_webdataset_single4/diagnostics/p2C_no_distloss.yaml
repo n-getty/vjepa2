@@ -1,0 +1,113 @@
+# Phase 2 (main) — V-JEPA 2.1 on the full surg_vid_webdataset corpus.
+# Aurora ALCF: 16 nodes x 12 ranks/node = 192 ranks.
+# Resumes from phase-1 warmup; runs at 384 px / 16 f for ~60k optimizer steps.
+app: vjepa_2_1
+nodes: 16
+tasks_per_node: 12
+cpus_per_task: 16
+mem_per_gpu: 40G
+folder: /flare/ModCon/ngetty/checkpoints/surg_2_1_v1/diag_p2C_no_distloss
+
+data:
+  num_clips: 10
+  dataset_type: WebDataset
+  datasets:
+    - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/crcd
+    - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/endovis15
+    - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/jigsaw
+    - /flare/ModCon/ngetty/data/surg_vid_webdataset/kinetics400
+    - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/miccai_2017
+    - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/miccai_endoseg
+    - /flare/ModCon/ngetty/data/surg_vid_webdataset/sitl
+    - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_robotic
+    - /flare/ModCon/ngetty/data/surg_vid_webdataset/surgtoolloc2022
+    - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvisdom
+    - /flare/ModCon/ngetty/data/surg_vid_webdataset/surgvu24
+  datasets_weights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+  batch_size: 2
+  crop_size: 384
+  patch_size: 16
+  dataset_fpcs: [16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
+  tubelet_size: 2
+  fps: 4
+  num_workers: 2
+  persistent_workers: true
+  pin_mem: true
+
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio: [0.75, 1.35]
+  random_resize_scale: [0.3, 1.0]
+  reprob: 0.0
+
+loss:
+  loss_exp: 1.0
+  predict_all: true
+  shift_by_n: 0
+  weight_distance_loss: false
+
+mask:
+  - aspect_ratio: [0.75, 1.5]
+    full_complement: false
+    max_keep: null
+    max_temporal_keep: 1.0
+    num_blocks: 8
+    spatial_scale: [0.15, 0.15]
+    temporal_scale: [1.0, 1.0]
+  - aspect_ratio: [0.75, 1.5]
+    full_complement: false
+    max_keep: null
+    max_temporal_keep: 1.0
+    num_blocks: 2
+    spatial_scale: [0.7, 0.7]
+    temporal_scale: [1.0, 1.0]
+
+meta:
+  dtype: bfloat16
+  eval_freq: 60000
+  load_checkpoint: true
+  load_predictor: true
+  pretrain_checkpoint: /flare/ModCon/ngetty/checkpoints/surg_2_1_v1/phase2_main_n16g12_weak/e59.pth.tar
+  read_checkpoint: null
+  # snapshot every 60 mini-epochs ≈ 10 named checkpoints across phase 2
+  save_every_freq: 60
+  seed: 239
+  use_sdpa: true
+
+model:
+  has_cls_first: false
+  img_temporal_dim_size: 1
+  interpolate_rope: true
+  is_causal: false
+  lambda_progressive: false
+  lambda_value_vid: 0.5
+  modality_embedding: true
+  model_name: vit_large
+  n_registers: 0
+  n_registers_predictor: 0
+  normalize_predictor: false
+  pred_depth: 24
+  pred_embed_dim: 384
+  pred_is_causal: false
+  pred_num_heads: 12
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_mask_tokens: true
+  use_rope: true
+  zero_init_mask_tokens: true
+
+optimization:
+  ema: [0.99925, 0.99925]
+  # ipe lowered 600 -> 100 and epochs raised 100 -> 600 to bound wasted work
+  # at debug-scaling 1h walltime boundaries. Total iters unchanged (60k).
+  # Checkpoint cadence becomes every ~10 min instead of every ~60 min.
+  epochs: 600
+  final_lr: 0.000525
+  final_weight_decay: 0.04
+  ipe: 100
+  ipe_scale: 1.0
+  lr: 0.000525
+  start_lr: 0.000525
+  warmup: 0.0
+  weight_decay: 0.04
