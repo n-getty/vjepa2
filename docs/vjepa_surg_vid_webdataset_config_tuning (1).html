@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Tuning the V-JEPA 2.1 surg_vid_webdataset 3-phase config</title>
+<style>
+  :root {
+    --fg: #1d1d1f;
+    --muted: #6b6b70;
+    --accent: #0a4d8c;
+    --bg: #fbfbfb;
+    --user-bg: #eef3f9;
+    --user-border: #0a4d8c;
+    --asst-bg: #ffffff;
+    --asst-border: #d4d4d8;
+    --code-bg: #f5f5f7;
+    --table-border: #d4d4d8;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    max-width: 960px;
+    margin: 2rem auto;
+    padding: 0 1.5rem;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.55;
+  }
+  h1 {
+    border-bottom: 2px solid var(--accent);
+    padding-bottom: 0.5rem;
+  }
+  h1 .sub {
+    display: block;
+    font-size: 0.95rem;
+    font-weight: normal;
+    color: var(--muted);
+    margin-top: 0.3rem;
+  }
+  h2 {
+    color: var(--accent);
+    margin-top: 2.8rem;
+    border-bottom: 1px solid #e0e0e0;
+    padding-bottom: 0.3rem;
+  }
+  h3 { margin-top: 1.6rem; color: #333; }
+  h4 { margin-top: 1.2rem; color: #444; }
+  .turn {
+    margin: 1.5rem 0;
+    padding: 1rem 1.2rem;
+    border-radius: 8px;
+    border-left: 4px solid;
+  }
+  .turn.user {
+    background: var(--user-bg);
+    border-left-color: var(--user-border);
+  }
+  .turn.asst {
+    background: var(--asst-bg);
+    border: 1px solid var(--asst-border);
+    border-left: 4px solid var(--asst-border);
+  }
+  .role {
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin-bottom: 0.5rem;
+  }
+  .turn.user .role { color: var(--user-border); }
+  code {
+    background: var(--code-bg);
+    padding: 0.1rem 0.35rem;
+    border-radius: 3px;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.88em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 0.9rem 1.1rem;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-size: 0.85em;
+    line-height: 1.45;
+  }
+  pre code { background: none; padding: 0; }
+  table {
+    border-collapse: collapse;
+    margin: 1rem 0;
+    width: 100%;
+    font-size: 0.92em;
+  }
+  th, td {
+    border: 1px solid var(--table-border);
+    padding: 0.45rem 0.7rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: #efefef; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  blockquote {
+    border-left: 3px solid #ccc;
+    margin: 0.8rem 0;
+    padding-left: 1rem;
+    color: var(--muted);
+  }
+  .meta {
+    color: var(--muted);
+    font-style: italic;
+    font-size: 0.92em;
+  }
+  hr { border: none; border-top: 1px solid #e0e0e0; margin: 2.5rem 0; }
+  ul, ol { padding-left: 1.4rem; }
+  li { margin: 0.2rem 0; }
+  .caveat {
+    background: #fff8e1;
+    border-left: 4px solid #f0b400;
+    padding: 0.8rem 1rem;
+    margin: 1rem 0;
+    border-radius: 4px;
+  }
+</style>
+</head>
+<body>
+
+<h1>
+  Tuning the V-JEPA 2.1 surg_vid_webdataset 3-phase config
+  <span class="sub">Literature pass, hyperparameter edits, and Aurora node-scaling decisions</span>
+</h1>
+
+<p class="meta">
+  Workspace: <code>/eagle/tpc/leonardo_borgioli/</code><br>
+  Configs landed in:
+  <code>vjepa2_polaris/configs/train_2_1/vitl_Neil/vitl16_surg_vid_webdataset_single4/</code>
+  and the mirrored <code>vjepa2_1/</code> tree.
+</p>
+
+<hr>
+
+<h2>1. Literature pass — JEPA &amp; surgical SSL</h2>
+
+<div class="turn user">
+  <div class="role">User</div>
+  <p>
+    Now, knowing that the data is ~1,300 hours of training material, check the current literature on
+    JEPA-style models, and also the self-supervised learning literature in the robotic-assisted surgery
+    domain. What would you modify or adjust?
+  </p>
+</div>
+
+<div class="turn asst">
+  <div class="role">Assistant</div>
+
+  <h3>Literature-grounded recommendations for the 1.3 k h surgical V-JEPA 2.1 run</h3>
+
+  <h4>TL;DR — what I'd change in the three configs</h4>
+  <p>Five concrete edits, ordered by impact:</p>
+  <ol>
+    <li><strong>Cut phase 2 from 250 → ~100 epochs</strong>, and <strong>drop phase 3 to 256 px / 64 frames</strong> (a <em>temporal</em> cooldown, not a spatial one). The official V-JEPA 2.1 ViT-L recipe is "256 / 16f pretrain → <strong>256 / 64f cooldown</strong>" — there is no 384 or 512 px config for ViT-L 2.1 anywhere in Meta's repo. Adding frames buys phase-recognition accuracy more cheaply than adding pixels.</li>
+    <li><strong>Lower <code>start_lr</code> in phase 1 to ~3e-5</strong> (you're warming up from a pretrained checkpoint, not from scratch — the official's <code>1e-4</code> start_lr is for full from-scratch training). Keep peak <code>lr=5.25e-4</code>.</li>
+    <li><strong>Flip <code>weight_distance_loss: false</code> in the cooldown.</strong> The official 2.1 cooldown YAML does this; you currently have it <code>true</code> in cooldown too. Free win.</li>
+    <li><strong>Raise effective global batch to ≥64</strong> (currently 16 = 4 GPUs × bs 4). Below ~32 global, JEPA's EMA teacher destabilises. Add gradient accumulation if memory won't fit <code>batch_size: 8</code> directly.</li>
+    <li><strong>Reconsider the equal weighting.</strong> You picked uniform, which is defensible — but it gives a 5 h corpus (EndoVis15) the same gradient share as surgvu24 / surgtoolloc2022 (the two corpora closest to most downstream test sets). V-JEPA 2 itself uses non-uniform weights (HowTo100M at 0.565) for this exact reason. Worth A/B-ing.</li>
+  </ol>
+
+  <h4>Things to watch out for</h4>
+  <ul>
+    <li><strong>EMA collapse risk:</strong> <code>ema=[0.99925, 0.99925]</code> constant + batch 16 global + warming straight to 5.25e-4 from a pretrained checkpoint is fragile. Mitigation: lower <code>start_lr</code>, monitor student-feature variance.</li>
+    <li><strong>512 px + RoPE interpolation past 384</strong> is untested in the official codebase. If you keep the 512 px phase, expect to debug.</li>
+    <li><strong>Your starting checkpoint is <em>distilled</em> from ViT-G.</strong> Continued pretraining without an anchor loss will gradually wash out the distillation signal. Consider an alignment loss to the frozen original.</li>
+  </ul>
+
+  <h4>Things to keep exactly as you have them</h4>
+  <ul>
+    <li>Peak <code>lr = 5.25e-4</code> (matches the ViT-G recipe that produced your checkpoint)</li>
+    <li><code>weight_decay = 0.04</code> (universal across JEPA configs)</li>
+    <li>Mask schedule <code>8 × 0.15² + 2 × 0.7²</code> (untouched across every JEPA scale; well-ablated)</li>
+    <li><code>predict_all: true</code>, <code>shift_by_n: 0</code> (definitional to V-JEPA 2.1)</li>
+    <li><code>n_registers: 0</code> — <em>because</em> you're continuing from a checkpoint. Adding registers fresh into a pretrained model is harmful. For a from-scratch run you'd want 4–8.</li>
+    <li>Continuing from <code>vjepa2_1_vitl_dist_vitG_384.pt</code> is correct — Surgical-DINO shows natural-image features need in-domain adaptation, and starting from a pretrained model strictly beats from-scratch at 1.3 k h.</li>
+  </ul>
+
+  <h3>Full report</h3>
+
+  <h4>Literature summary — JEPA family (state of the field, 2023–2026)</h4>
+  <ul>
+    <li><strong>I-JEPA (Assran et al., 2023)</strong> establishes the two-principle masking rule that still governs all JEPA recipes: (a) target blocks must be <strong>semantically large</strong> (~0.15–0.2 of the image area), and (b) the context must be <strong>sufficiently informative / spatially distributed</strong>. Mask design is the single most ablated knob in the I-JEPA paper. (<a href="https://arxiv.org/abs/2301.08243">arxiv 2301.08243</a>)</li>
+    <li><strong>V-JEPA / VideoMix2M (Bardes et al., 2024)</strong> scales feature prediction to ~2M videos, ViT-H/16, tubelet 2×16×16, 90K iters, batch 3072, 224². It introduces the "multiblock" mask the user is using (8 small + 2 large spatial blocks, full-temporal). (<a href="https://arxiv.org/abs/2404.08471">arxiv 2404.08471</a>)</li>
+    <li><strong>V-JEPA 2 (Assran et al., 2025)</strong> scales to ≥1M hours of internet video (VideoMix22M) and introduces the <strong>warmup → constant → cooldown</strong> schedule. Reference run: 12K warmup + 228K constant + 12K cooldown iters at 256². Cooldown raises <em>resolution and frame count</em> and provides "8.4× GPU-time reduction" vs. training entirely at high-res, plus +0.7 pp from longer cooldown clips. Uses <strong>fixed (not ramp-up) EMA and weight decay</strong>. Tubelet 2×16×16, 3D-RoPE in predictor. (<a href="https://arxiv.org/abs/2506.09985">arxiv 2506.09985</a>)</li>
+    <li><strong>V-JEPA 2.1 (Meta, 2026)</strong> — repo-only, paper TODO. Refinements: (i) <strong>dense predictive loss</strong> — <em>all</em> tokens (visible + masked) contribute (<code>predict_all: true</code>); (ii) <strong>deep self-supervision</strong> at intermediate layers; (iii) image+video multimodal tokenizers; (iv) scale. Official ViT-L recipe (<code>configs/train_2_1/vitl16</code>): <strong>pretrain 256px/16f → cooldown 256px/64f</strong> (extends <em>time</em>, keeps spatial fixed). No 384px or 512px config exists for ViT-L 2.1. (<a href="https://github.com/facebookresearch/vjepa2">github.com/facebookresearch/vjepa2</a>)</li>
+    <li><strong>Official ViT-L 2.1 hyperparameters</strong> (<code>pretrain-256px-16f.yaml</code>): <code>lr=6e-4</code>, <code>start_lr=1e-4</code>, <code>final_lr=6e-4</code> (no decay in pretrain), <code>warmup=40</code>, <code>epochs=1000</code>, <code>ipe=300</code>, <code>ipe_scale=1.25</code>, <code>ema=[0.99925, 0.99925]</code> constant, <code>weight_decay=0.04</code> constant, <code>batch=24×128=3072</code> global, mask <code>[8×0.15², 2×0.7²]</code> full-temporal, <code>predict_all=true</code>, <code>weight_distance_loss=true</code>, <code>shift_by_n=0</code>, <code>n_registers=0</code>, <code>modality_embedding=true</code>, <code>use_rope=true</code>.</li>
+    <li><strong>Official ViT-L 2.1 cooldown</strong> (<code>cooldown-256px-64f.yaml</code>): <code>lr=6e-4</code>, <code>start_lr=1e-4</code>, <code>final_lr=1e-6</code>, <code>warmup=0</code>, <code>epochs=40</code>, <code>ema=[0.99925, 0.99925]</code>, <code>dataset_fpcs=[64,64,64]</code> (4× more frames), <code>batch_size=12</code> (halved due to memory), <code>weight_distance_loss=false</code>, <code>is_anneal=true</code>, <code>resume_anneal=true</code>. So cooldown ≈ 4–5 % of pretrain epoch count, <strong>no warmup</strong>, peak LR same, decays to 1e-6.</li>
+    <li><strong>Official ViT-G recipe</strong> that produced the <em>teacher</em> of the user's checkpoint: <code>pretrain-256px-16f</code> (<code>lr=5.25e-4</code>, <code>epochs=800</code>, warmup=40) → <code>cooldown-256px-64f</code> (<code>epochs=40</code>) → optional <code>cooldown-384px-64f</code> (<code>epochs=40</code>, <code>lr=5.25e-4 → 1e-6</code>, no warmup). The user's "5.25e-4 LR" target is exactly the ViT-G peak LR.</li>
+    <li><strong>"Vision Transformers Need Registers" (Darcet et al., 2023)</strong> shows 4–16 register tokens remove high-norm artefact tokens that ViTs otherwise place in low-information patches; gives SOTA on <strong>dense prediction</strong> tasks and smoother attention. (<a href="https://arxiv.org/abs/2309.16588">arxiv 2309.16588</a>) The V-JEPA 2.1 official configs ship with <code>n_registers=0</code>, but its dense-feature objective is exactly the regime registers help most.</li>
+  </ul>
+
+  <h4>Literature summary — Surgical / endoscopic SSL</h4>
+  <ul>
+    <li><strong>Endo-FM (Wang et al., MICCAI 2023)</strong> — DINO-style teacher–student on ~45.7 h video (32,896 clips × 5 s avg), ViT-B/16 video transformer, 224² global / 96² local, 8–16 frames, EMA 0.996, LR 2e-5, 30 epochs. Augmentations <em>kept</em>: random flips, color jitter, Gaussian blur, solarization (all temporally consistent). Beats SAM on CVC-12k polyp seg with ~10× less data. (<a href="https://arxiv.org/abs/2306.16741">arxiv 2306.16741</a>)</li>
+    <li><strong>SurgeNet / SurgeNetXL (Jaspers et al., MICCAI-DEMI 2024 &amp; 2025)</strong> — DINO-based, ~4.7 M surgical frames (image model, not video), CaFormer-S18 backbone, also ViT-S/B/L releases via DINOv1/v2/v3 at 224 or 336. Demonstrates that <strong>adding heterogeneous surgical data on top of procedure-specific data gives a further +2.5–5.2 % gain</strong> on segmentation / phase / CVS tasks. (<a href="https://arxiv.org/abs/2407.17904">arxiv 2407.17904</a>)</li>
+    <li><strong>SurgFM / Surg-3M (Che et al., 2025/26)</strong> — 938 h (4 K videos, 85 M frames), ConvNeXt + DINO + augmented distillation. Reports <strong>+8.4–9.5 pp Jaccard on phase recognition (AutoLaparo, M2CAI16, Cholec80)</strong>, +10.3 pp mDice on CholecSeg8k vs second-best. This is the closest analog in scale to the user's 1,300 h corpus. (<a href="https://arxiv.org/abs/2503.19740">arxiv 2503.19740</a>)</li>
+    <li><strong>SurgVLP / HecVL / PeskaVLP (Yuan et al., MedIA 2025; MICCAI 2024; NeurIPS 2024)</strong> — contrastive vision–language on hundreds of YouTube surgical lectures + ASR; demonstrates <strong>the data-distribution lever</strong>: just paying attention to phase/text alignment yields zero-shot phase recognition. (<a href="https://arxiv.org/abs/2307.15220">SurgVLP arxiv</a>)</li>
+    <li><strong>Surgical-DINO (Cui et al., IPCAI 2024)</strong> — confirms that "zero-shot DINOv2 / naive fine-tune is <em>not</em> enough" for surgical depth — even strong natural-image features need surgical adaptation. Empirical evidence that the domain shift from natural video → surgery warrants in-domain SSL. (<a href="https://arxiv.org/abs/2401.06013">arxiv 2401.06013</a>)</li>
+  </ul>
+
+  <h4>Scale comparison (corpus hours)</h4>
+  <table>
+    <tr><th>Model</th><th>Hours</th><th>Modality</th><th>Method</th></tr>
+    <tr><td>Endo-FM</td><td class="num">~46</td><td>endoscopy video</td><td>DINO</td></tr>
+    <tr><td>SurgVLP (SVL)</td><td>"hundreds"</td><td>surgical lectures + text</td><td>contrastive VLP</td></tr>
+    <tr><td>SurgFM / Surg-3M</td><td class="num"><strong>938</strong></td><td>mixed surgical video</td><td>DINO + ConvNeXt + distillation</td></tr>
+    <tr><td><strong>User corpus</strong></td><td class="num"><strong>~1,300</strong></td><td><strong>robotic-assisted surgery</strong></td><td><strong>V-JEPA 2.1 (planned)</strong></td></tr>
+    <tr><td>V-JEPA 2</td><td class="num">~1.8 M</td><td>internet video</td><td>JEPA</td></tr>
+  </table>
+  <p>
+    The user's 1.3 k h is the <strong>largest robotic-surgery SSL corpus in the published comparable set</strong> and ~1.4× SurgFM, but is still ~1,000× smaller than V-JEPA 2's pretraining set. This dictates a different recipe shape.
+  </p>
+
+  <h4>Concrete recommendation table</h4>
+  <table>
+    <tr><th>Hyperparameter</th><th>Current</th><th>Recommended</th><th>Rationale</th></tr>
+    <tr><td><strong>Phase shape</strong></td><td>warmup 12 ep / main 250 ep / cooldown 12 ep</td><td>warmup 5 ep / main 80–120 ep / cooldown 8–12 ep</td><td>Official V-JEPA 2.1 cooldown is 4–5 % of pretrain. 250 ep at 1.3 k h is over-budgeted vs scale; risks collapse once EMA target stops moving.</td></tr>
+    <tr><td><strong>Resolution schedule</strong></td><td>256 → 384 → 512</td><td><strong>256 → 384 (skip 512)</strong> OR pure-temporal cooldown 256/16f → 256/64f</td><td>No ViT-L 2.1 config trains at 512; the only 384 cooldown that exists (ViT-G) keeps 384, never 512. 512 adds ~4× memory for ≤0.3 pp downstream gain. Temporal context (64f) helps phase/triplet more than pixels at this scale.</td></tr>
+    <tr><td><strong>Continue from checkpoint?</strong></td><td>yes</td><td><strong>YES, but use shorter warmup (3–5 ep) and lower start_lr (~3e-5)</strong></td><td>Surgical-DINO shows naive natural-image features fail but in-domain fine-tune fixes it. With small corpus + pretrained init, large warmup wastes data and large start_lr trashes the prior.</td></tr>
+    <tr><td><strong>lr (peak)</strong></td><td>5.25e-4</td><td><strong>5.25e-4</strong></td><td>Exactly matches official ViT-G peak. Keep.</td></tr>
+    <tr><td><strong>start_lr</strong></td><td>1e-4 → 5.25e-4</td><td><strong>3e-5 → 5.25e-4 over 5 ep</strong></td><td>Official is 1e-4 with full data; you have a pretrained model — be gentler.</td></tr>
+    <tr><td><strong>final_lr (cooldown)</strong></td><td>1e-6</td><td><strong>1e-6</strong></td><td>Matches official ViT-L/G cooldown exactly.</td></tr>
+    <tr><td><strong>EMA</strong></td><td><code>[0.99925, 0.99925]</code></td><td><strong><code>[0.999, 0.9999]</code> ramp</strong>, OR keep constant</td><td>Original V-JEPA + I-JEPA used a ramp; more forgiving at small data because teacher moves faster early.</td></tr>
+    <tr><td><strong>weight_decay</strong></td><td>0.04</td><td><strong>0.04</strong></td><td>Universal across JEPA configs.</td></tr>
+    <tr><td><strong>mask</strong></td><td>8 × 0.15² + 2 × 0.7², full-temporal</td><td><strong>Keep</strong></td><td>Identical to every official V-JEPA 2 / 2.1 config; well-ablated.</td></tr>
+    <tr><td><strong>dataset_fpcs</strong></td><td>16</td><td><strong>16 in pretrain, 32–64 in cooldown</strong></td><td>Official V-JEPA 2.1 cooldown quadruples to 64. Surgical motion is slow → longer temporal context resolves tool-tissue phases better than higher spatial res.</td></tr>
+    <tr><td><strong>fps</strong></td><td>4</td><td><strong>4</strong> (or randomise ∈ {2, 4, 8})</td><td>Cholec80 / SurgVU phase labels are at 1 fps; 4 fps is already 4× the native label rate.</td></tr>
+    <tr><td><strong>data_aug</strong></td><td>minimal</td><td><strong>Keep minimal. Add horizontal flip; consider mild Gaussian blur. Do NOT add color jitter or auto_augment.</strong></td><td>Color jitter on surgical video confounds cautery/hemoglobin colour cues (tool vs tissue). JEPA is designed to use weak augmentation.</td></tr>
+    <tr><td><strong>predict_all</strong></td><td>true</td><td><strong>true</strong></td><td>Definitional to V-JEPA 2.1.</td></tr>
+    <tr><td><strong>weight_distance_loss</strong></td><td>true everywhere</td><td><strong>true in pretrain, false in cooldown</strong></td><td>Mirror the official 2.1 cooldown YAML. Free win.</td></tr>
+    <tr><td><strong>shift_by_n</strong></td><td>0</td><td><strong>0</strong></td><td>Official.</td></tr>
+    <tr><td><strong>per-GPU batch</strong></td><td>4 / 4 / 2 on 4 GPUs (global 16/16/8)</td><td><strong>8 / 8 / 4 if memory allows, else grad-accum to global 64</strong></td><td>Official 2.1 uses global 3072. 16 is ~190× smaller. Below batch 32 global, EMA target collapses faster.</td></tr>
+    <tr><td><strong>n_registers</strong></td><td>0</td><td><strong>0 (keep)</strong> if continuing from checkpoint; <strong>4–8</strong> if from scratch</td><td>Pretrained checkpoint has no register tokens — adding them now means fresh embeddings that interact badly with trained pos-emb / RoPE.</td></tr>
+    <tr><td><strong>img_dataset interleaving</strong></td><td>not used</td><td><strong>add a small surgical-image stream at <code>rank_ratio: 0.3–0.5</code></strong></td><td>All official V-JEPA 2.1 configs interleave image data; prevents encoder over-specialising to short temporal motifs.</td></tr>
+    <tr><td><strong>deep self-supervision</strong></td><td>not exposed</td><td>enable if available in <code>app/vjepa_2_1</code></td><td>Headline V-JEPA 2.1 ingredient. If your training code is V-JEPA 2 not 2.1, you're leaving the main benefit on the table.</td></tr>
+    <tr><td><strong>dataset weighting</strong></td><td>uniform across 10 datasets</td><td><strong>upweight surgvu24 + surgtoolloc2022 by 2–3×</strong></td><td>SurgFM and SurgeNet both find downstream gains follow the test distribution. Uniform gives a 5 h corpus the same gradient share as 500 h corpora — over-regularising. V-JEPA 2 weights HowTo100M at 0.565.</td></tr>
+  </table>
+
+  <h4>Top 5 biggest levers</h4>
+  <ol>
+    <li>Cut main phase 250 → 80–120 ep, add temporal extension (32–64 f) to cooldown. Aligns with published V-JEPA 2.1 recipe; frees compute for the higher-leverage temporal axis.</li>
+    <li>Skip 512 px; spend the saved compute on frames or batch size.</li>
+    <li>Upweight surgvu24 + surgtoolloc2022. Uniform weighting gives 10 % weight to ~5 h corpora — they dominate noise floor, not test distribution.</li>
+    <li>Raise effective global batch via grad-accum to ≥64. Below ~32 global, JEPA's EMA target destabilises.</li>
+    <li>Mirror the official <code>weight_distance_loss=true → false</code> flip in cooldown. One-line change.</li>
+  </ol>
+
+  <h4>Top 3 watch-outs (subtle failure modes)</h4>
+  <ol>
+    <li><strong>EMA collapse from a too-stable teacher on too-small data.</strong> Effective half-life ~900 steps at batch 16 global × 1.3 k h means the teacher barely moves during warmup. With <code>start_lr</code> warming straight to 5.25e-4, the student can blow past the teacher in the first 2 epochs and the loss plateaus while features degrade.</li>
+    <li><strong>512 px on a 384-pretrained checkpoint with <code>use_rope=true</code> and <code>interpolate_rope=true</code> is poorly tested.</strong> Rope interpolation past training resolution introduces frequency-domain artefacts.</li>
+    <li><strong>Your checkpoint is <em>distilled</em> from ViT-G.</strong> Continued pretraining without an anchor loss will gradually wash out the distillation signal. Either freeze the original ViT-G as an anchor (alignment loss term), or accept this is in-domain <em>continued pretraining</em> (not finetuning) and use small LR + short warmup.</li>
+  </ol>
+
+  <h4>Sources</h4>
+  <ul>
+    <li>I-JEPA — <a href="https://arxiv.org/abs/2301.08243">https://arxiv.org/abs/2301.08243</a></li>
+    <li>V-JEPA (Bardes et al.) — <a href="https://arxiv.org/abs/2404.08471">https://arxiv.org/abs/2404.08471</a></li>
+    <li>V-JEPA 2 — <a href="https://arxiv.org/abs/2506.09985">https://arxiv.org/abs/2506.09985</a></li>
+    <li>vjepa2 repo — <a href="https://github.com/facebookresearch/vjepa2">https://github.com/facebookresearch/vjepa2</a></li>
+    <li>V-JEPA 2.1 ViT-L pretrain — <a href="https://github.com/facebookresearch/vjepa2/blob/main/configs/train_2_1/vitl16/pretrain-256px-16f.yaml">pretrain-256px-16f.yaml</a></li>
+    <li>V-JEPA 2.1 ViT-L cooldown — <a href="https://github.com/facebookresearch/vjepa2/blob/main/configs/train_2_1/vitl16/cooldown-256px-64f.yaml">cooldown-256px-64f.yaml</a></li>
+    <li>V-JEPA 2 ViT-G 384 cooldown — <a href="https://github.com/facebookresearch/vjepa2/blob/main/configs/train/vitg16/cooldown-384px-64f.yaml">cooldown-384px-64f.yaml</a></li>
+    <li>Vision Transformers Need Registers — <a href="https://arxiv.org/abs/2309.16588">https://arxiv.org/abs/2309.16588</a></li>
+    <li>Endo-FM — <a href="https://arxiv.org/abs/2306.16741">https://arxiv.org/abs/2306.16741</a></li>
+    <li>SurgeNet — <a href="https://arxiv.org/abs/2407.17904">https://arxiv.org/abs/2407.17904</a></li>
+    <li>SurgFM / Surg-3M — <a href="https://arxiv.org/abs/2503.19740">https://arxiv.org/abs/2503.19740</a></li>
+    <li>SurgVLP — <a href="https://arxiv.org/abs/2307.15220">https://arxiv.org/abs/2307.15220</a></li>
+    <li>Surgical-DINO — <a href="https://arxiv.org/abs/2401.06013">https://arxiv.org/abs/2401.06013</a></li>
+  </ul>
+
+  <div class="caveat">
+    <strong>Caveats from the agent:</strong>
+    <ul>
+      <li>V-JEPA 2.1 has no published paper yet (TODO in repo); all 2.1-specific claims are from the repo README + YAMLs, not a refereed source.</li>
+      <li>No public V-JEPA 2.1 config trains at 512 px; the "skip 512" recommendation is extrapolation, not citation. A/B at 384 vs 512 on held-out phase recognition before committing.</li>
+      <li>Surgical resolution-sensitivity studies are scarce; SurgeNet's DINOv2/v3 releases use 336 px, which weakly supports "384 is enough."</li>
+    </ul>
+  </div>
+</div>
+
+<hr>
+
+<h2>2. Apply a chosen subset of the recommendations</h2>
+
+<div class="turn user">
+  <div class="role">User</div>
+  <p>
+    OK, first do this: cut the main phase from 250 → 80–120 epochs, and add the temporal
+    extension (32–64 frames) to the cooldown. I'd still like to keep the resolution bump in
+    the cooldown phase, though. Lower the <code>start_lr</code> as you suggested. Also flip
+    <code>weight_distance_loss: false</code> in the cooldown.
+  </p>
+</div>
+
+<div class="turn asst">
+  <div class="role">Assistant</div>
+  <p>All four edits applied (in both <code>vjepa2_polaris/</code> and the mirrored <code>vjepa2_1/</code> tree):</p>
+
+  <table>
+    <tr><th>Phase</th><th>Change</th></tr>
+    <tr>
+      <td><strong>Phase 1</strong> (pretrain 256/16f)</td>
+      <td><code>start_lr: 0.0001 → 0.00003</code> — gentler warmup since you're continuing from a pretrained checkpoint, not from scratch.</td>
+    </tr>
+    <tr>
+      <td><strong>Phase 2</strong> (main 384/16f)</td>
+      <td><code>epochs: 250 → 100</code> — main phase cut by ~60 %.</td>
+    </tr>
+    <tr>
+      <td><strong>Phase 3</strong> (cooldown)</td>
+      <td>
+        <code>dataset_fpcs: 16 → 64</code> (4× temporal context).
+        <code>crop_size: 512</code> kept per your request.
+        <code>batch_size: 2 → 1</code> (forced by the 4×-frames + 512² memory budget).
+        <code>weight_distance_loss: false</code> already in place.
+        Renamed <code>cooldown-512px-16f.yaml → cooldown-512px-64f.yaml</code> and updated both launcher scripts.
+      </td>
+    </tr>
+  </table>
+
+  <h4>Things to flag before launch</h4>
+  <ol>
+    <li>
+      <strong>Phase 3 will be memory-heavy.</strong> <code>bs=1 × 64 f × 512² × ViT-L</code> with
+      activation ckpt on should fit on 80 GB Polaris A100s, but <code>bs=1</code> means very noisy
+      gradients. If you see VRAM headroom, push bs back to 2; if you OOM, the comment I left in the
+      YAML tells future-you to drop <code>crop_size: 512 → 384</code> <em>before</em> cutting frames
+      (temporal context is the higher-leverage axis).
+    </li>
+    <li>
+      <strong>Global batch is tiny.</strong> Phase 2 is now 4 GPUs × bs 4 = global 16, phase 3 is
+      global 4. Both are well below the ~32–64 floor recommended for stable EMA targets. If you have
+      any way to grad-accumulate (or run on more nodes), that's the single biggest remaining lever.
+      I didn't add a grad-accum knob because I haven't traced whether the trainer exposes one — say
+      the word and I'll check.
+    </li>
+    <li>
+      <strong>Phase 2 LR is constant at 5.25e-4.</strong> Standard for the official 2.1 recipe, so
+      I left it — but if you see the loss plateau early (which can happen with continued
+      pretraining), consider adding a mild cosine decay across the 100 epochs
+      (<code>final_lr: 0.0002</code> or so) so phase 3 has a smoother handoff.
+    </li>
+  </ol>
+</div>
+
+<hr>
+
+<h2>3. Aurora ALCF — choosing node count and batch sizes</h2>
+
+<div class="turn user">
+  <div class="role">User</div>
+  <p>
+    Now the thing we need to handle: we'll run this on the Aurora ALCF system (don't worry
+    about library dependencies). We can scale the number of nodes as we wish, but we have a
+    relatively small dataset. What's the best setup in terms of node count vs. batch size
+    vs. the amount of data presented to each node?
+  </p>
+</div>
+
+<div class="turn asst">
+  <div class="role">Assistant</div>
+
+  <h3>Aurora scaling plan for the surg_vid 3-phase run</h3>
+
+  <h4>The relevant constraints</h4>
+  <p>
+    <strong>Aurora node:</strong> 6 Intel PVC GPUs × 2 tiles = <strong>12 ranks/node</strong>,
+    64 GB HBM per tile. (Same per-tile memory as a V100, half an A100. The original configs were
+    tuned on 80 GB A100, so per-rank batch should be <em>smaller</em> on Aurora, not larger.)
+  </p>
+  <p>
+    <strong>Dataset scale:</strong> 1.3 k h. At your 16-frame / 4-fps clips (4 s/clip), that's
+    roughly <strong>1.0–1.2 M unique clips</strong>. With 10 datasets the WebDataset shard counts
+    you have are:
+  </p>
+  <table>
+    <tr><th>dataset</th><th>shards</th></tr>
+    <tr><td>crcd, endovis15, jigsaw, miccai_2017, miccai_endoseg, surgvisdom</td><td class="num">1 each</td></tr>
+    <tr><td>surgenet_robotic</td><td class="num">5</td></tr>
+    <tr><td>sitl</td><td class="num">18</td></tr>
+    <tr><td>surgtoolloc2022</td><td class="num">41</td></tr>
+    <tr><td>surgvu24</td><td class="num">65</td></tr>
+    <tr><td><strong>total</strong></td><td class="num"><strong>~135 shards</strong></td></tr>
+  </table>
+  <p>This shard distribution is the <strong>binding constraint on node count</strong> (more on this below).</p>
+  <p>
+    <strong>EMA stability floor:</strong> ≥32 global batch, ≥64 preferred — below this V-JEPA's
+    teacher destabilises. (V-JEPA 2 paper appendix; I-JEPA also reports collapse at small batch +
+    high EMA momentum.)
+  </p>
+  <p>
+    <strong>SSL "data pass" sweet spot:</strong> every clip seen 5–30 times across full training.
+    Below 3× = underfit; above 50× = memorize. Total samples processed across all three phases is
+    <code>Σ(epochs × ipe × bs_global)</code>.
+  </p>
+
+  <h4>The trade-off</h4>
+  <p>For a fixed corpus:</p>
+  <ul>
+    <li><strong>More nodes</strong> → larger global batch → more stable EMA, faster wall clock — <strong>but</strong> fewer shards/node (data diversity collapses) and fewer optimization steps for the same number of "passes" over data (which can hurt SSL where step count matters more than sample count).</li>
+    <li><strong>Fewer nodes</strong> → smaller global batch (closer to the 32–64 floor) → noisier gradients, slower wall clock — <strong>but</strong> every node sees more shard diversity and you get more total optimizer steps.</li>
+  </ul>
+  <p>
+    For 1.3 k h, you're in the regime where <strong>gradient-step count is the more valuable axis</strong>
+    (Endo-FM, SurgFM both report saturation curves bending around ~50k steps).
+  </p>
+
+  <h4>Concrete recommendation</h4>
+  <table>
+    <tr><th></th><th>Phase 1 (256/16f)</th><th>Phase 2 (384/16f)</th><th>Phase 3 (512/64f)</th></tr>
+    <tr><td><strong>Nodes</strong></td><td class="num"><strong>4</strong></td><td class="num"><strong>8</strong></td><td class="num"><strong>4</strong></td></tr>
+    <tr><td>Ranks (×12/node)</td><td class="num">48</td><td class="num">96</td><td class="num">48</td></tr>
+    <tr><td><strong>bs_per_rank</strong></td><td class="num"><strong>4</strong></td><td class="num"><strong>2</strong></td><td class="num"><strong>1</strong></td></tr>
+    <tr><td><strong>global batch</strong></td><td class="num"><strong>192</strong></td><td class="num"><strong>192</strong></td><td class="num"><strong>48</strong></td></tr>
+    <tr><td>ipe (current)</td><td class="num">208</td><td class="num">500</td><td class="num">500</td></tr>
+    <tr><td><strong>ipe (recommended)</strong></td><td class="num"><strong>500</strong></td><td class="num"><strong>1000</strong></td><td class="num"><strong>400</strong></td></tr>
+    <tr><td>epochs</td><td class="num">12</td><td class="num">100</td><td class="num">12</td></tr>
+    <tr><td>total iters</td><td class="num">6,000</td><td class="num">100,000</td><td class="num">4,800</td></tr>
+    <tr><td>samples seen</td><td class="num">1.15 M</td><td class="num">19.2 M</td><td class="num">230 k</td></tr>
+    <tr><td><strong>data passes</strong></td><td class="num"><strong>~1×</strong></td><td class="num"><strong>~17×</strong></td><td class="num"><strong>~0.2×</strong></td></tr>
+  </table>
+
+  <p>Rationale per phase:</p>
+  <p>
+    <strong>Phase 1 (warmup, 4 nodes):</strong> Conservative node count protects the
+    pretrained-checkpoint init — fewer ranks means a closer-to-32 effective gradient batch (after
+    accounting for SSL's noisy targets) which lets the warmup actually warm up. Bumping <code>ipe</code>
+    from 208 → 500 gives the LR scheduler more steps to ramp across, matching the official 2.1
+    recipe's longer warmup-iteration count. ~1 full pass through the corpus in 12 epochs is correct
+    for a warmup.
+  </p>
+  <p>
+    <strong>Phase 2 (main, 8 nodes):</strong> This is where you spend wall clock. 8 nodes gives
+    global batch 192, ipe 1000 across 100 epochs = 100k optimizer steps and ~17 data passes —
+    squarely in the SSL sweet spot. The published V-JEPA 2.1 ViT-L recipe is ~300k steps but on 1000×
+    more data; at our scale 100k steps is closer to "enough but not memorizing." <code>bs_per_rank=2</code>
+    because 384²/16f on 64 GB PVC tiles is tighter than on A100.
+  </p>
+  <p>
+    <strong>Phase 3 (cooldown, 4 nodes):</strong> 64 frames × 512² explodes the token count to 32k per
+    clip — by far the heaviest per-sample workload. Drop back to 4 nodes / bs=1 / global 48. 12
+    epochs × ipe 400 = 4,800 cooldown steps, ~5% of phase-2 step count — exactly the official 2.1
+    cooldown ratio.
+  </p>
+
+  <h4>The shard-distribution catch</h4>
+  <p>
+    WebDataset's <code>split_by_node</code> assigns whole shards to nodes. <strong>You only have 1 shard for 6 of 10 datasets.</strong>
+    At 8 nodes, those 6 datasets each visit only one node per epoch — gradient signal from CRCD,
+    EndoVis15, JIGSAW, etc., is concentrated on a single rank instead of averaged across the fleet.
+  </p>
+  <p>Two ways to handle this, in increasing order of effort:</p>
+  <ol>
+    <li><strong>Cap phase 2 at the node count where most datasets still have ≥1 shard/node.</strong> With 5 shards in the smallest non-singleton (<code>surgenet_robotic</code>), that's ~5 nodes. I'd recommend <strong>6 nodes for phase 2</strong> (still global batch 144, ipe 1300) if you can't reshard.</li>
+    <li><strong>Reshard the singletons</strong> when you wire up the loader: split each 1-shard dataset into 8 shards by <code>wds.ShardWriter(maxcount=…)</code> with a smaller cap. ~30 min of work, lets you scale freely up to 8+ nodes without losing per-node diversity.</li>
+  </ol>
+  <p>
+    If your loader uses <code>split_by_worker</code> over a global URL list (instead of
+    <code>split_by_node</code>), the shard-count constraint vanishes — every rank sees every shard
+    probabilistically. Worth checking which mode you wire up.
+  </p>
+
+  <h4>Why not push to 16+ nodes?</h4>
+  <p>
+    You <em>could</em> — global batch 768 on phase 2 is fine for EMA. But:
+  </p>
+  <ul>
+    <li>ipe would need to drop to ~250 to keep data passes sane, leaving only 25k optimizer steps for the main phase (too few for SSL convergence at this corpus size — SurgFM saturates around 40k).</li>
+    <li>Shard distribution gets actively pathological (most datasets seen by ≤1 in 8 nodes per epoch).</li>
+    <li>Aurora wall-clock per phase is already short at 8 nodes — you're not compute-bound on cooldown.</li>
+  </ul>
+  <p>
+    The exception: if you reshard everything to ≥16 shards per dataset AND you're optimizing for
+    wall-clock not for max representation quality, 16 nodes for phase 2 with ipe=500 and
+    bs_per_rank=2 (global 384) is defensible.
+  </p>
+</div>
+
+<hr>
+
+<h2>4. Consolidate to a constant node count</h2>
+
+<div class="turn user">
+  <div class="role">User</div>
+  <p>I'd prefer to use the same number of nodes for every phase, if that's not too much of an issue.</p>
+</div>
+
+<div class="turn asst">
+  <div class="role">Assistant</div>
+  <p>
+    Not an issue at all — a single node count is actually cleaner operationally (no requeueing for
+    different allocations between phases). Here's the plan:
+  </p>
+
+  <h3>Recommendation: <strong>N = 4 nodes everywhere</strong></h3>
+  <table>
+    <tr><th></th><th>Phase 1</th><th>Phase 2</th><th>Phase 3</th></tr>
+    <tr><td><strong>Nodes</strong></td><td class="num">4</td><td class="num">4</td><td class="num">4</td></tr>
+    <tr><td><strong>Ranks (12/node)</strong></td><td class="num">48</td><td class="num">48</td><td class="num">48</td></tr>
+    <tr><td><strong>bs_per_rank</strong></td><td class="num">4</td><td class="num">2</td><td class="num">1</td></tr>
+    <tr><td><strong>global batch</strong></td><td class="num">192</td><td class="num"><strong>96</strong></td><td class="num">48</td></tr>
+    <tr><td><strong>ipe</strong> (new)</td><td class="num">500</td><td class="num"><strong>1000</strong></td><td class="num">400</td></tr>
+    <tr><td><strong>epochs</strong></td><td class="num">12</td><td class="num">100</td><td class="num">12</td></tr>
+    <tr><td><strong>total opt steps</strong></td><td class="num">6,000</td><td class="num"><strong>100,000</strong></td><td class="num">4,800</td></tr>
+    <tr><td><strong>samples seen</strong></td><td class="num">1.15 M</td><td class="num"><strong>9.6 M</strong></td><td class="num">230 k</td></tr>
+    <tr><td><strong>data passes</strong></td><td class="num">~1×</td><td class="num"><strong>~9×</strong></td><td class="num">~0.2×</td></tr>
+  </table>
+
+  <h4>Why 4 (not 6 or 8) when we lock it constant</h4>
+  <p>
+    The binding constraint is <strong>phase 2</strong> — the workhorse — because it sets where you
+    spend most compute.
+  </p>
+  <ul>
+    <li>Global batch 96 is comfortably above the EMA-stability floor (~32–64) so the teacher won't destabilise.</li>
+    <li>100k optimizer steps lands squarely in the SurgFM / Endo-FM saturation window (40k–150k); going to 8 nodes would halve this to 50k for the same epoch budget, which is borderline-too-few for SSL.</li>
+    <li>Shard diversity per epoch is best at low N: 6 of your 10 datasets have just 1 shard. At 4 nodes each of those datasets reaches ¼ of the fleet per epoch (over the 100-epoch run, random shard shuffling means every rank sees every dataset). At 8 nodes it drops to ⅛.</li>
+    <li>Per-rank batch must shrink anyway on Aurora (64 GB PVC tile vs 80 GB A100 the original configs were tuned for), so the gain from extra nodes is smaller than you'd expect.</li>
+  </ul>
+  <p>
+    The cost: phase-2 wall clock roughly 2× longer than at 8 nodes. For SSL on 1.3 k h, that's the
+    right trade — you have more time than data.
+  </p>
+
+  <h4>Per-phase notes</h4>
+  <ul>
+    <li><strong>Phase 1</strong> (light memory): keeps bs=4. Global 192 is the largest of the three phases, which is fine — warmup wants smoother gradients to protect the pretrained init.</li>
+    <li><strong>Phase 2</strong>: drops to bs=2 because 384²/16f at bs=4 won't fit a PVC tile comfortably. <code>ipe</code> doubles from 500→1000 to keep 100k total steps despite the smaller global batch.</li>
+    <li><strong>Phase 3</strong>: bs=1 unchanged (already memory-bound at 512²/64f). <code>ipe</code> 500→400 to bring the cooldown step count to ~5 % of phase 2, matching the official 2.1 ratio.</li>
+  </ul>
+
+  <h4>Final configuration: 4 nodes everywhere (applied)</h4>
+  <table>
+    <tr><th>Phase</th><th>Resolution × Frames</th><th>bs/rank</th><th>Global batch</th><th>ipe</th><th>Epochs</th><th>Opt steps</th><th>Wall-clock est.*</th></tr>
+    <tr><td>1 — warmup</td><td>256 × 16</td><td class="num">4</td><td class="num"><strong>192</strong></td><td class="num">500</td><td class="num">12</td><td class="num">6,000</td><td class="num">~6 h</td></tr>
+    <tr><td>2 — main</td><td>384 × 16</td><td class="num">2</td><td class="num"><strong>96</strong></td><td class="num">1000</td><td class="num">100</td><td class="num"><strong>100,000</strong></td><td class="num">~80 h (~3.3 d)</td></tr>
+    <tr><td>3 — cooldown</td><td>512 × 64</td><td class="num">1</td><td class="num"><strong>48</strong></td><td class="num">400</td><td class="num">12</td><td class="num">4,800</td><td class="num">~12 h</td></tr>
+  </table>
+  <p class="meta">
+    *Rough Aurora estimates assuming ~1.5 s/step at 256/16f, ~3 s at 384/16f, ~9 s at 512/64f —
+    calibrate from the first 100 steps and adjust the PBS walltime accordingly.
+  </p>
+
+  <h4>Things worth flagging before submission</h4>
+  <ol>
+    <li><strong>Shard-distribution caveat persists.</strong> 6 of your 10 datasets are 1-shard. At 4 nodes with <code>split_by_node</code>, each of those datasets reaches only ¼ of the fleet per epoch. Over 100 epochs of shuffling this evens out, but if you see one dataset's contribution to the loss bouncing wildly between epochs, that's why — resharding the singletons to ≥4 shards each is a 30-min fix when you wire up the WDS loader.</li>
+    <li><strong>Total fleet-hours ≈ 4 nodes × ~100 h ≈ 400 node-hours</strong>, dominated by phase 2. Worth queueing phase 2 as several shorter jobs with the existing <code>latest.pth.tar</code> resume logic rather than one monolithic walltime.</li>
+    <li><strong>Aurora's WebDataset I/O on Lustre.</strong> If you don't stage to <code>/local/scratch</code> (your <code>VJEPA_STAGE_DATA=1</code> default), 4 nodes hammering ~135 shards on shared Lustre may be the actual bottleneck rather than compute. Stage early — the configs already point at directory roots so the existing stage script handles them.</li>
+  </ol>
+</div>
+
+<hr>
+
+<h2>5. "What if I use way more nodes and just the biggest dataset?"</h2>
+
+<div class="turn user">
+  <div class="role">User</div>
+  <p>
+    Quick question — wouldn't it be much faster to bump phase 2 up to, say, 16 nodes, use only
+    the biggest dataset for that phase, and decrease <code>ipe</code> proportionally?
+  </p>
+</div>
+
+<div class="turn asst">
+  <div class="role">Assistant</div>
+  <p>
+    Yes — and this is a genuinely good intuition. Let me work the numbers because there's one
+    subtlety that matters.
+  </p>
+
+  <h4>The wall-clock math</h4>
+  <table>
+    <tr><th></th><th>Current (4 nodes, all 10)</th><th>Your proposal (16 nodes, biggest only)</th></tr>
+    <tr><td>Global batch</td><td class="num">96</td><td class="num">384</td></tr>
+    <tr><td>ipe (÷4 to keep samples)</td><td class="num">1000 → 250</td><td class="num">250</td></tr>
+    <tr><td>Opt steps (100 ep)</td><td class="num">100,000</td><td class="num"><strong>25,000</strong></td></tr>
+    <tr><td>Wall clock (rough)</td><td class="num">~80 h</td><td class="num"><strong>~20 h</strong></td></tr>
+  </table>
+  <p>4× speedup. Real.</p>
+
+  <h4>The catch: 25k steps is below the SSL saturation floor</h4>
+  <p>
+    This is the one thing I'd push back on. SurgFM (~938 h, comparable scale) reports its quality
+    curve saturating around <strong>40–50k steps</strong>, not 25k. V-JEPA 2's published recipe used
+    252k iters. Below ~40k, you leave performance on the table — the EMA target needs time to drift
+    into the data manifold, and below the floor the run finishes before that converges.
+  </p>
+
+  <div class="caveat">
+    <strong>Why "more samples seen" isn't the same as "more optimizer steps" in JEPA</strong>
+    <p>
+      It's tempting to think: "if I double the global batch and halve <code>ipe</code>, I see the
+      same samples — should be equivalent." For supervised learning that's roughly true. For
+      JEPA-style SSL it is <em>not</em>, because the loss is computed against a target encoder
+      that's an EMA of the student. That target only updates <strong>once per optimizer step</strong>,
+      regardless of batch size.
+    </p>
+    <p>
+      With <code>ema=[0.99925, 0.99925]</code>, the teacher's effective half-life is
+      <code>ln(2)/(1-0.99925) ≈ 924 steps</code>. The teacher needs roughly 3–5 half-lives
+      (~3,000–5,000 steps) to "forget" its initialization and start tracking the data, and another
+      ~30,000–50,000 steps after that to actually drift into the surgical-data manifold and become a
+      useful prediction target. Total floor ≈ <strong>35–55k optimizer steps</strong>.
+    </p>
+    <p>The two failure modes when you go below the floor:</p>
+    <ul>
+      <li>
+        <strong>Teacher never converges:</strong> the student is predicting against a target that's
+        still partly the natural-video pretrained checkpoint, not surgical-domain features. Loss
+        looks "fine" (it goes down) but downstream probes show the model hasn't actually learned
+        surgical-specific representations — you basically did expensive feature extraction.
+      </li>
+      <li>
+        <strong>Student-teacher coupling never tightens:</strong> JEPA's whole game is the student
+        learning to predict targets the teacher will <em>later</em> produce. With too few steps,
+        you stop while that loop is still loose, leaving the predictor undertrained even if the
+        encoder is fine.
+      </li>
+    </ul>
+    <p>
+      <strong>Practical rule:</strong> at this scale (1.3 k h), aim for
+      <strong>≥40k optimizer steps in phase 2</strong>. The relationship is:
+    </p>
+    <pre><code>opt_steps = epochs × ipe          # global batch is irrelevant to this count
+samples_seen = opt_steps × global_batch    # batch only affects gradient noise</code></pre>
+    <p>
+      So when you scale to more nodes (larger global batch), don't divide <code>ipe</code>
+      proportionally — keep <code>ipe</code> high enough that <code>epochs × ipe ≥ 40,000</code>.
+      Extra samples-per-step is a free bonus (better gradient SNR); fewer optimizer steps is a
+      penalty (worse EMA convergence). They are not interchangeable.
+    </p>
+  </div>
+  <p>
+    So the better dial is to keep step count above the floor, not divide ipe proportionally:
+  </p>
+  <table>
+    <tr><th>Variant</th><th>Global batch</th><th>ipe</th><th>Epochs</th><th>Steps</th><th>Wall clock</th><th>Verdict</th></tr>
+    <tr><td>A (your suggestion as stated)</td><td class="num">384</td><td class="num">250</td><td class="num">100</td><td class="num">25k</td><td class="num">~20 h</td><td>⚠️ likely under-trained</td></tr>
+    <tr><td><strong>B (recommended)</strong></td><td class="num"><strong>384</strong></td><td class="num"><strong>500</strong></td><td class="num"><strong>100</strong></td><td class="num"><strong>50k</strong></td><td class="num"><strong>~40 h</strong></td><td>✅ above floor, ~2× speedup</td></tr>
+    <tr><td>C (aggressive)</td><td class="num">384</td><td class="num">400</td><td class="num">100</td><td class="num">40k</td><td class="num">~32 h</td><td>borderline — exactly at floor</td></tr>
+  </table>
+  <p>
+    Variant B still doubles your speed AND gives you a much larger global batch (better EMA stability,
+    the original concern at global 96). Strictly Pareto-better than the current 4-node plan.
+  </p>
+
+  <h4>The "biggest dataset" question</h4>
+  <p>
+    I'd nudge this to <strong>the two biggest</strong> (<code>surgvu24</code> + <code>surgtoolloc2022</code>),
+    not one. Reasons:
+  </p>
+  <ol>
+    <li><strong>Shard count works out cleanly:</strong> 65 + 41 = 106 shards over 16 nodes = ~6.6 shards/node. No shard-distribution starvation.</li>
+    <li><strong>Coverage:</strong> surgvu24 alone is ~49 % of corpus bytes; adding surgtoolloc2022 brings it to ~81 %. So you'd be giving up only ~19 % of the data, but getting much more representational breadth across procedure types (surgvu24 is mostly nephrectomies/prostatectomies, surgtoolloc2022 is da Vinci tool-use clips — complementary).</li>
+    <li><strong>Overfit insurance:</strong> 100 epochs on one dataset risks the model learning that dataset's specific camera optics, lighting, post-processing pipeline as features rather than as nuisance. Two datasets with different acquisition setups makes the model marginalise those out.</li>
+    <li><strong>Both are exactly the corpora closest to most downstream test distributions</strong> — phase recognition benchmarks (Cholec80, AutoLaparo, M2CAI16) are all general laparoscopic surgery, much more similar to surgvu24/surgtoolloc2022 than to JIGSAW (training-task suturing) or SurgVisDom (virtual reality).</li>
+  </ol>
+  <p>
+    You'd lose: JIGSAW, EndoVis15, SITL, CRCD, miccai_2017, miccai_endoseg, surgenet_robotic, surgvisdom
+    (combined ~19 % by bytes, mostly the niche/synthetic/training-data corpora).
+  </p>
+  <p>
+    You still see everything in <strong>phase 1 (12 ep warmup, all 10)</strong> and
+    <strong>phase 3 (12 ep cooldown, all 10)</strong> — so the smaller datasets aren't forgotten,
+    they just don't get the main-phase compute.
+  </p>
+
+  <h4>My recommended phase-2 config (variant B)</h4>
+  <table>
+    <tr><th>Setting</th><th>Value</th></tr>
+    <tr><td>nodes</td><td class="num">16</td></tr>
+    <tr><td>tasks_per_node</td><td class="num">12</td></tr>
+    <tr><td>bs_per_rank</td><td class="num">2</td></tr>
+    <tr><td><strong>global batch</strong></td><td class="num"><strong>384</strong></td></tr>
+    <tr><td>ipe</td><td class="num">500</td></tr>
+    <tr><td>epochs</td><td class="num">100</td></tr>
+    <tr><td><strong>opt steps</strong></td><td class="num"><strong>50,000</strong></td></tr>
+    <tr><td>datasets</td><td><strong><code>surgvu24</code>, <code>surgtoolloc2022</code> only</strong></td></tr>
+    <tr><td>datasets_weights</td><td><code>[1, 1]</code> (or <code>[1, 0.6]</code> to bias toward the larger one)</td></tr>
+  </table>
+  <p>
+    Wall-clock savings: ~80 h → ~40 h (estimated). EMA stability much improved
+    (384 ≫ the 32–64 floor).
+  </p>
+
+  <h4>What I'd watch out for</h4>
+  <ol>
+    <li><strong>Phase 3 still uses all 10 datasets</strong> — the model has to "remember" the smaller ones in a 12-epoch cooldown. If you see the loss spike on the cooldown transition, the cause is likely under-exposure to small datasets in phase 2; mitigate by upweighting them in phase 3's <code>datasets_weights</code>.</li>
+    <li><strong>16 nodes on Aurora ≈ 192 PVC tiles</strong> — confirm your allocation can sustain that for ~40 h. If queueing is the bottleneck rather than compute, smaller node counts might actually deliver faster end-to-end.</li>
+    <li><strong>Per-dataset weighting in phase 2:</strong> I'd actually lean <code>[1, 1]</code> (equal between the two) rather than proportional-to-size, since surgtoolloc2022 has more tool-action diversity per hour.</li>
+  </ol>
+
+  <h4>Concrete phase-2 YAML changes (pending confirmation)</h4>
+  <ul>
+    <li><code>nodes: 4 → 16</code></li>
+    <li><code>batch_size: 2</code> (unchanged)</li>
+    <li><code>ipe: 1000 → 500</code></li>
+    <li><code>datasets:</code> reduced from 10 entries to 2 (<code>surgvu24</code>, <code>surgtoolloc2022</code>)</li>
+    <li><code>datasets_weights: [1, 1]</code></li>
+    <li><code>dataset_fpcs: [16, 16]</code></li>
+  </ul>
+</div>
+
+</body>
+</html>

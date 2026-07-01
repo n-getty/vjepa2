@@ -1,0 +1,764 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ASFormer on SAR-RARP50 — Long Schedule + Soft Class Weights</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #fbfaf6;
+    --fg: #1f2933;
+    --muted: #5a6473;
+    --accent: #6b4ba0;
+    --accent-soft: #e2d8ef;
+    --rule: #d8d3c8;
+    --card: #ffffff;
+    --code-bg: #f1ede2;
+    --green: #5e8c4a;
+    --green-soft: #dde9d6;
+    --red: #b94a3d;
+    --red-soft: #f1d4d0;
+    --amber: #c08a2a;
+    --amber-soft: #f3e2c4;
+    --blue: #2c5f8f;
+    --blue-soft: #d6e2ed;
+  }
+  * { box-sizing: border-box; }
+  html { font-size: 16px; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "Charter", "Georgia", "Times New Roman", serif;
+    line-height: 1.55;
+    margin: 0; padding: 0;
+  }
+  main {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+  }
+  @media (max-width: 760px) {
+    main { padding: 24px 14px 60px; }
+  }
+  h1 {
+    font-size: 2.2em;
+    margin: 4px 0 8px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  h2 {
+    font-size: 1.5em;
+    margin-top: 2em;
+    margin-bottom: 0.5em;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--rule);
+    font-weight: 600;
+  }
+  h3 {
+    font-size: 1.15em;
+    margin-top: 1.5em;
+    margin-bottom: 0.3em;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  h4 { margin: 0 0 6px; font-weight: 600; }
+  p { margin: 0.7em 0; }
+  code {
+    font-family: "JetBrains Mono", "Menlo", "Consolas", monospace;
+    font-size: 0.88em;
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 18px;
+    border-radius: 4px;
+    overflow-x: auto;
+    font-size: 0.85em;
+    font-family: "JetBrains Mono", "Menlo", "Consolas", monospace;
+    line-height: 1.45;
+    border-left: 3px solid var(--accent);
+  }
+
+  /* ---- hero / header (reuse existing .hero class) ---- */
+  .hero {
+    border-bottom: 2px solid var(--accent);
+    padding-bottom: 16px;
+    margin-bottom: 36px;
+  }
+  .kicker {
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-size: 0.78em;
+    color: var(--muted);
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-weight: 600;
+  }
+  .lede {
+    color: var(--muted);
+    font-size: 1.05em;
+    font-style: italic;
+    margin: 6px 0 14px;
+    max-width: 880px;
+  }
+
+  /* ---- tags / pills ---- */
+  .tag {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 3px;
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.78em;
+    margin-right: 6px;
+    margin-bottom: 4px;
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+  .tag.good { background: var(--green-soft); color: var(--green); }
+  .tag.acc  { background: var(--blue-soft);  color: var(--blue); }
+  .tag.warn { background: var(--amber-soft); color: var(--amber); }
+
+  /* ---- grid / stat cards ---- */
+  .grid { display: grid; gap: 18px; }
+  .cols-2 { grid-template-columns: 1fr 1fr; }
+  .cols-3 { grid-template-columns: 1fr 1fr 1fr; }
+  .cols-4 { grid-template-columns: repeat(4, 1fr); }
+  @media (max-width: 760px) { .cols-2, .cols-3, .cols-4 { grid-template-columns: 1fr; } }
+  .card {
+    padding: 14px 18px;
+    background: var(--card);
+    border-radius: 4px;
+    border: 1px solid var(--rule);
+  }
+  .stat {
+    padding: 14px 18px;
+    background: var(--card);
+    border-radius: 4px;
+    border: 1px solid var(--rule);
+    border-top: 3px solid var(--accent);
+  }
+  .stat .v {
+    font-size: 1.6em;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--accent);
+    font-family: "Helvetica Neue", Arial, sans-serif;
+  }
+  .stat .v.good { color: var(--green); }
+  .stat .v.acc  { color: var(--blue);  }
+  .stat .v.warn { color: var(--amber); }
+  .stat .l {
+    font-size: 0.78em;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-top: 2px;
+    font-family: "Helvetica Neue", Arial, sans-serif;
+  }
+
+  /* ---- tables ---- */
+  table.data {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 0.92em;
+    background: transparent;
+  }
+  table.data th {
+    text-align: left;
+    border-bottom: 2px solid var(--fg);
+    padding: 8px 10px;
+    font-weight: 600;
+    background: transparent;
+    color: var(--fg);
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 1em;
+  }
+  table.data td {
+    border-bottom: 1px solid var(--rule);
+    padding: 7px 10px;
+    vertical-align: top;
+  }
+  table.data tr:last-child td { border-bottom: none; }
+  table.data td.num, table.data th.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  table.data tr.highlight { background: var(--accent-soft); }
+  .tbl-caption {
+    font-size: 0.85em;
+    color: var(--muted);
+    margin: 0 0 14px;
+    font-style: italic;
+  }
+
+  /* ---- figures (canvases + SVG diagram) ---- */
+  figure {
+    background: var(--card);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 16px;
+    margin: 20px 0;
+  }
+  figcaption {
+    font-size: 0.85em;
+    color: var(--muted);
+    margin-top: 8px;
+    font-style: italic;
+  }
+  .fig-title {
+    margin: 0 0 8px;
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 0.95em;
+    color: var(--fg);
+    font-weight: 600;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+
+  /* ---- callouts ---- */
+  .callout {
+    border-left: 4px solid var(--accent);
+    background: var(--accent-soft);
+    padding: 12px 18px;
+    margin: 16px 0;
+    border-radius: 0 4px 4px 0;
+    font-size: 0.97em;
+    border-top: none; border-right: none; border-bottom: none;
+  }
+  .callout.warn { border-left-color: var(--amber); background: var(--amber-soft); }
+  .callout.good { border-left-color: var(--green); background: var(--green-soft); }
+  .callout.bad  { border-left-color: var(--red);   background: var(--red-soft); }
+  .callout h4 { margin: 0 0 4px; color: inherit; }
+
+  /* ---- legend ---- */
+  .legend {
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+    font-size: 0.85em;
+    color: var(--muted);
+    font-family: "Helvetica Neue", Arial, sans-serif;
+  }
+  .legend .sw {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+
+  /* ---- canvas ---- */
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: var(--card);
+    border-radius: 3px;
+  }
+
+  /* ---- footer note ---- */
+  .note {
+    margin-top: 50px;
+    padding-top: 18px;
+    border-top: 1px solid var(--rule);
+    font-size: 0.85em;
+    color: var(--muted);
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-style: normal;
+  }
+
+  ul { padding-left: 22px; }
+  li { margin: 0.3em 0; }
+</style>
+</head>
+<body>
+<main>
+<header class="hero">
+  <div class="kicker">Technical report &middot; SAR-RARP50 surgical gesture recognition</div>
+  <h1>ASFormer head + V-JEPA backbone — long schedule, soft class weights</h1>
+  <div class="lede">
+    Frozen V-JEPA backbone paired with an <strong>ASFormer</strong> action-segmentation head on the
+    SAR-RARP50 challenge split. Schedule extended from 30 to 130 epochs, class weights softened
+    (cap at 8&times; median, mean-normalised) per the LemonFM report recipe.
+  </div>
+  <div>
+    <span class="tag good">Best val_acc: 78.68% @ ep 66</span>
+    <span class="tag good">Best val_macro_f1: 71.78% @ ep 83</span>
+    <span class="tag good">Test acc: 77.38% / macro F1: 62.92% (head_0)</span>
+    <span class="tag acc">Reference (30-ep): 63.85% test acc / score_AR 0.7032</span>
+  </div>
+</header>
+
+<section>
+<h2>1 &middot; What was trained</h2>
+
+<h3>1.1 &nbsp; Two-stage pipeline</h3>
+<p>
+The pipeline follows the standard frozen-backbone + lightweight temporal head pattern used by
+SAR-RARP50 challenge winners. The backbone is frozen throughout training; only the
+~1M-parameter ASFormer head is updated.
+</p>
+<figure>
+  <div class="fig-title">Fig. 1 &mdash; Two-stage pipeline</div>
+  <svg viewBox="0 0 900 200" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica Neue, Arial, sans-serif" font-size="13">
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a6473"/>
+      </marker>
+    </defs>
+
+    <rect x="10" y="60" width="160" height="80" rx="4" fill="#e2d8ef" stroke="#6b4ba0" stroke-width="1.5"/>
+    <text x="90" y="92" text-anchor="middle" font-weight="600" fill="#1f2933">SAR-RARP50 clip</text>
+    <text x="90" y="110" text-anchor="middle" font-size="11" fill="#5a6473">3 &times; 16f @ 4 fps</text>
+    <text x="90" y="126" text-anchor="middle" font-size="11" fill="#5a6473">384&times;384 RGB</text>
+
+    <line x1="175" y1="100" x2="225" y2="100" stroke="#5a6473" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <rect x="235" y="40" width="220" height="120" rx="4" fill="#fbfaf6" stroke="#1f2933" stroke-width="2" stroke-dasharray="4,3"/>
+    <text x="345" y="64" text-anchor="middle" font-weight="700" fill="#1f2933">Stage 1: Frozen V-JEPA backbone</text>
+    <text x="345" y="84" text-anchor="middle" font-size="11" fill="#5a6473">ViT-L, patch 16, tubelet 2, RoPE</text>
+    <text x="345" y="100" text-anchor="middle" font-size="11" fill="#5a6473">384px input</text>
+    <text x="345" y="116" text-anchor="middle" font-weight="600" font-size="11" fill="#b94a3d">FROZEN — EMA target encoder, no grads</text>
+    <text x="345" y="138" text-anchor="middle" font-style="italic" font-size="11" fill="#5a6473">(checkpoint loaded with strict=False)</text>
+
+    <line x1="460" y1="100" x2="510" y2="100" stroke="#5a6473" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <rect x="520" y="50" width="170" height="100" rx="4" fill="#f1ede2" stroke="#5a6473" stroke-width="1.5"/>
+    <text x="605" y="76" text-anchor="middle" font-weight="600" fill="#1f2933">per-clip tokens</text>
+    <text x="605" y="96" text-anchor="middle" font-size="11" fill="#5a6473">[B, 3 clips, T&middot;S, D]</text>
+    <text x="605" y="114" text-anchor="middle" font-size="11" fill="#5a6473">preserve_clip_dim=true</text>
+
+    <line x1="695" y1="100" x2="745" y2="100" stroke="#5a6473" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <rect x="755" y="40" width="135" height="120" rx="4" fill="#e2d8ef" stroke="#6b4ba0" stroke-width="2"/>
+    <text x="822" y="64" text-anchor="middle" font-weight="700" fill="#1f2933">Stage 2: ASFormer</text>
+    <text x="822" y="84" text-anchor="middle" font-size="11" fill="#5a6473">~1.05M params</text>
+    <text x="822" y="100" text-anchor="middle" font-size="11" fill="#5a6473">10 dilated-attn enc</text>
+    <text x="822" y="116" text-anchor="middle" font-size="11" fill="#5a6473">+ 3 refinement dec</text>
+    <text x="822" y="138" text-anchor="middle" font-weight="600" font-size="11" fill="#6b4ba0">24 per-frame labels</text>
+  </svg>
+  <figcaption>
+    Per clip the V-JEPA backbone produces token sequences for 3 chunks of 16 frames each
+    (ctx3 input format). ASFormer pools spatial tokens per timestep and predicts a label
+    for each of the 24 temporal positions. Loss = class-weighted CE + 0.15 &times; truncated-MSE
+    smoothness on adjacent log-probs.
+  </figcaption>
+</figure>
+
+<h3>1.2 &nbsp; Dataset and split (full SAR-RARP50 challenge split)</h3>
+<table class="data">
+<thead><tr><th>Split</th><th class="num">Videos</th><th class="num">Clips (ctx3)</th><th class="num">Per-frame labels</th></tr></thead>
+<tbody>
+  <tr><td>Train (<code>clips/train1/</code>)</td><td class="num">38</td><td class="num">11,353</td><td class="num">272,472</td></tr>
+  <tr><td>Val (held-out from train1)</td><td class="num">6</td><td class="num">1,690</td><td class="num">40,560</td></tr>
+  <tr><td>Test (<code>clips/test/</code>, videos 41&ndash;50)</td><td class="num">10</td><td class="num">3,252</td><td class="num">78,048</td></tr>
+</tbody>
+</table>
+<p>
+Val videos: <code>video_04, 10, 11_1, 17_1, 30, 36</code>. They are pulled from <code>clips/train1/</code>
+so they share the train-time distribution while being held out from optimisation. Test videos are the
+challenge's official held-out 10-video set, never seen during training or model selection.
+</p>
+
+<h3>1.3 &nbsp; What changed vs the original 30-epoch run</h3>
+<table class="data">
+<thead><tr><th>Knob</th><th>Original (30-ep)</th><th>This run (130-ep)</th><th>Rationale</th></tr></thead>
+<tbody>
+  <tr><td>num_epochs</td><td class="num">30</td><td class="num">130</td><td>LemonFM report uses 120&ndash;130 for ASFormer</td></tr>
+  <tr><td>Class weights mean</td><td class="num">~2.20</td><td class="num">1.00</td><td>Cap at 8&times; median, mean-normalise</td></tr>
+  <tr><td>Class weight max</td><td class="num">11.88</td><td class="num">3.65</td><td>Class 5 (tying_knot) actively capped</td></tr>
+  <tr><td>Backbone</td><td>frozen V-JEPA</td><td>same</td><td>head-controlled comparison</td></tr>
+  <tr><td>Resolution</td><td class="num">384</td><td class="num">384</td><td>same</td></tr>
+  <tr><td>batch_size (per-rank)</td><td class="num">4</td><td class="num">4</td><td>4 nodes &times; 4 GPUs, global 64</td></tr>
+  <tr><td>Selection metric</td><td>last epoch</td><td>best val_acc + best val_macro_f1</td><td>upgraded eval saves both</td></tr>
+</tbody>
+</table>
+
+<h3>1.4 &nbsp; Training recipe (verbatim)</h3>
+<table class="data">
+<thead><tr><th>Setting</th><th>Value</th></tr></thead>
+<tbody>
+  <tr><td>Optimiser</td><td>AdamW (per-head: lr 1e-3 / 3e-4 / 1e-4, wd 0.05/0.05/0.10)</td></tr>
+  <tr><td>Schedule</td><td>5% warmup, cosine to 1e-5 final lr; final wd 0.4</td></tr>
+  <tr><td>Smoothness loss</td><td>0.15 &times; truncated-MSE on adjacent log-probs (threshold 4.0)</td></tr>
+  <tr><td>Class weights</td><td>inverse-frequency &rarr; cap @ 8&times; median &rarr; mean-normalise; values =<br><code>[0.251, 0.663, 0.169, 0.172, 0.187, 3.654, 1.720, 1.185]</code></td></tr>
+  <tr><td>AMP</td><td>bfloat16</td></tr>
+  <tr><td>Topology</td><td>Polaris 4 nodes &times; 4 GPUs, strong-scaling (global batch 64 seqs)</td></tr>
+  <tr><td>Total wall</td><td>~7.5 h across multiple debug-scaling 1h chunks (auto-resubmit watchdog)</td></tr>
+</tbody>
+</table>
+</section>
+
+<section>
+<h2>2 &middot; Training curves</h2>
+
+<div class="grid cols-4" style="margin:18px 0 10px">
+  <div class="stat"><div class="v acc">129</div><div class="l">epochs trained</div></div>
+  <div class="stat"><div class="v good">78.68%</div><div class="l">best val_acc @ep 66</div></div>
+  <div class="stat"><div class="v good">71.78%</div><div class="l">best val_macro_f1 @ep 83</div></div>
+  <div class="stat"><div class="v warn">98.89% / 76.59%</div><div class="l">final train vs val acc (overfit)</div></div>
+</div>
+
+<figure>
+  <div class="fig-title">Fig. 2 &mdash; Accuracy (train vs val)</div>
+  <canvas id="cv_acc" width="900" height="320"></canvas>
+  <div class="legend">
+    <span><span class="sw" style="background:#6b4ba0"></span>train acc</span>
+    <span><span class="sw" style="background:#5e8c4a"></span>val acc</span>
+    <span><span class="sw" style="background:#b94a3d"></span>best val acc</span>
+  </div>
+</figure>
+
+<figure>
+  <div class="fig-title">Fig. 3 &mdash; Macro F1 (train vs val)</div>
+  <canvas id="cv_f1" width="900" height="320"></canvas>
+  <div class="legend">
+    <span><span class="sw" style="background:#6b4ba0"></span>train macro F1</span>
+    <span><span class="sw" style="background:#5e8c4a"></span>val macro F1</span>
+    <span><span class="sw" style="background:#b94a3d"></span>best val macro F1</span>
+  </div>
+</figure>
+
+<figure>
+  <div class="fig-title">Fig. 4 &mdash; Loss (train vs val)</div>
+  <canvas id="cv_loss" width="900" height="280"></canvas>
+  <div class="legend">
+    <span><span class="sw" style="background:#6b4ba0"></span>train loss</span>
+    <span><span class="sw" style="background:#5e8c4a"></span>val loss</span>
+  </div>
+</figure>
+
+<div class="callout warn">
+  <h4>What the curves show</h4>
+  <p>
+    Train acc climbs steadily from 30% (ep 1) to ~99% (ep 129) &mdash; the head fits the train
+    set near-perfectly. Val acc rises sharply for the first 30 epochs (45% &rarr; 76%),
+    then plateaus around 76&ndash;79% with no monotonic gain after epoch 66. Val loss
+    starts <em>rising</em> after epoch ~30 even as val acc holds; this is the classic
+    overfitting signature for a tiny head trained on a frozen feature cache. Best
+    val_acc and best val_f1 land at different epochs (66 vs 83), which is why both
+    checkpoints are tracked separately.
+  </p>
+</div>
+</section>
+
+<section id="test-eval">
+<h2>3 &middot; Test results</h2>
+<div class="grid cols-4" style="margin:18px 0 10px">
+  <div class="stat"><div class="v good">77.38%</div><div class="l">test accuracy (best ckpt)</div></div>
+  <div class="stat"><div class="v good">62.92%</div><div class="l">test macro F1</div></div>
+  <div class="stat"><div class="v acc">76.81%</div><div class="l">test weighted F1</div></div>
+  <div class="stat"><div class="v acc">0.6977</div><div class="l">&radic;(acc&middot;macroF1)</div></div>
+</div>
+<h3>3.1 &nbsp; Headline: best_val_acc.pt (epoch 66) on test (10 videos, 78,048 labels)</h3>
+<table class="data"><thead><tr><th>Head</th><th class="num">Test acc</th><th class="num">Macro F1</th><th class="num">Weighted F1</th></tr></thead><tbody>
+<tr class="highlight"><td>head_0</td><td class="num">77.38%</td><td class="num">62.92%</td><td class="num">76.81%</td></tr>
+<tr><td>head_1</td><td class="num">76.71%</td><td class="num">60.47%</td><td class="num">76.25%</td></tr>
+<tr><td>head_2</td><td class="num">77.11%</td><td class="num">60.91%</td><td class="num">76.31%</td></tr>
+</tbody></table>
+<div class="tbl-caption">Per-head test metrics for the val_acc-selected checkpoint. Highlighted: best head.</div>
+<h3>3.2 &nbsp; Per-class breakdown (head_0)</h3>
+<table class="data"><thead><tr><th>Class</th><th class="num">Support</th><th class="num">%</th><th class="num">Precision</th><th class="num">Recall</th><th class="num">F1</th></tr></thead><tbody>
+<tr><td>G0_other</td><td class="num">9,107</td><td class="num">11.7%</td><td class="num">66.5%</td><td class="num">74.8%</td><td class="num">70.4%</td></tr>
+<tr><td>G1_picking_up</td><td class="num">4,608</td><td class="num">5.9%</td><td class="num">58.5%</td><td class="num">43.8%</td><td class="num">50.1%</td></tr>
+<tr><td>G2_positioning</td><td class="num">20,484</td><td class="num">26.2%</td><td class="num">77.2%</td><td class="num">75.3%</td><td class="num">76.2%</td></tr>
+<tr><td>G3_pushing</td><td class="num">22,584</td><td class="num">28.9%</td><td class="num">87.5%</td><td class="num">89.9%</td><td class="num">88.7%</td></tr>
+<tr><td>G4_pulling</td><td class="num">17,616</td><td class="num">22.6%</td><td class="num">75.0%</td><td class="num">81.7%</td><td class="num">78.2%</td></tr>
+<tr><td>G5_tying</td><td class="num">444</td><td class="num">0.6%</td><td class="num">43.2%</td><td class="num">29.5%</td><td class="num">35.1%</td></tr>
+<tr><td>G6_cutting</td><td class="num">1,632</td><td class="num">2.1%</td><td class="num">77.7%</td><td class="num">23.5%</td><td class="num">36.1%</td></tr>
+<tr><td>G7_dropping</td><td class="num">1,573</td><td class="num">2.0%</td><td class="num">79.7%</td><td class="num">60.2%</td><td class="num">68.6%</td></tr>
+</tbody></table>
+<h3>3.3 &nbsp; Confusion matrix (head_0)</h3>
+<figure><table class="data" style="font-variant-numeric:tabular-nums">
+<thead><tr><th>true \ pred</th>
+<th class="num">G0</th>
+<th class="num">G1</th>
+<th class="num">G2</th>
+<th class="num">G3</th>
+<th class="num">G4</th>
+<th class="num">G5</th>
+<th class="num">G6</th>
+<th class="num">G7</th>
+</tr></thead><tbody>
+<tr><th>G0 (9,107)</th>
+<td class="num" style="background:rgba(94,140,74,0.673);font-weight:700">6,809</td>
+<td class="num" style="background:rgba(185,74,61,0.017);">308</td>
+<td class="num" style="background:rgba(185,74,61,0.036);">649</td>
+<td class="num" style="background:rgba(185,74,61,0.001);">27</td>
+<td class="num" style="background:rgba(185,74,61,0.067);">1,222</td>
+<td class="num" style="background:rgba(185,74,61,0.001);">23</td>
+<td class="num" style="background:rgba(185,74,61,0.000);">1</td>
+<td class="num" style="background:rgba(185,74,61,0.004);">68</td>
+</tr>
+<tr><th>G1 (4,608)</th>
+<td class="num" style="background:rgba(185,74,61,0.036);">329</td>
+<td class="num" style="background:rgba(94,140,74,0.457);font-weight:700">2,018</td>
+<td class="num" style="background:rgba(185,74,61,0.134);">1,234</td>
+<td class="num" style="background:rgba(185,74,61,0.011);">104</td>
+<td class="num" style="background:rgba(185,74,61,0.091);">842</td>
+<td class="num" style="background:rgba(185,74,61,0.002);">14</td>
+<td class="num" style="background:rgba(185,74,61,0.001);">7</td>
+<td class="num" style="background:rgba(185,74,61,0.007);">60</td>
+</tr>
+<tr><th>G2 (20,484)</th>
+<td class="num" style="background:rgba(185,74,61,0.030);">1,211</td>
+<td class="num" style="background:rgba(185,74,61,0.016);">664</td>
+<td class="num" style="background:rgba(94,140,74,0.677);font-weight:700">15,416</td>
+<td class="num" style="background:rgba(185,74,61,0.043);">1,780</td>
+<td class="num" style="background:rgba(185,74,61,0.033);">1,361</td>
+<td class="num" style="background:rgba(185,74,61,0.001);">38</td>
+<td class="num" style="background:rgba(185,74,61,0.000);">1</td>
+<td class="num" style="background:rgba(185,74,61,0.000);">13</td>
+</tr>
+<tr><th>G3 (22,584)</th>
+<td class="num" style="background:rgba(185,74,61,0.011);">513</td>
+<td class="num" style="background:rgba(185,74,61,0.000);">17</td>
+<td class="num" style="background:rgba(185,74,61,0.022);">1,012</td>
+<td class="num" style="background:rgba(94,140,74,0.779);font-weight:700">20,301</td>
+<td class="num" style="background:rgba(185,74,61,0.016);">725</td>
+<td class="num" style="background:rgba(185,74,61,0.000);">15</td>
+<td class="num" style="background:rgba(185,74,61,0.000);">1</td>
+<td class="num" style="background:transparent;">0</td>
+</tr>
+<tr><th>G4 (17,616)</th>
+<td class="num" style="background:rgba(185,74,61,0.021);">745</td>
+<td class="num" style="background:rgba(185,74,61,0.007);">255</td>
+<td class="num" style="background:rgba(185,74,61,0.032);">1,130</td>
+<td class="num" style="background:rgba(185,74,61,0.027);">949</td>
+<td class="num" style="background:rgba(94,140,74,0.722);font-weight:700">14,387</td>
+<td class="num" style="background:rgba(185,74,61,0.002);">56</td>
+<td class="num" style="background:rgba(185,74,61,0.002);">79</td>
+<td class="num" style="background:rgba(185,74,61,0.000);">15</td>
+</tr>
+<tr><th>G5 (444)</th>
+<td class="num" style="background:transparent;">0</td>
+<td class="num" style="background:rgba(185,74,61,0.042);">37</td>
+<td class="num" style="background:transparent;">0</td>
+<td class="num" style="background:transparent;">0</td>
+<td class="num" style="background:rgba(185,74,61,0.311);">276</td>
+<td class="num" style="background:rgba(94,140,74,0.357);font-weight:700">131</td>
+<td class="num" style="background:transparent;">0</td>
+<td class="num" style="background:transparent;">0</td>
+</tr>
+<tr><th>G6 (1,632)</th>
+<td class="num" style="background:rgba(185,74,61,0.139);">454</td>
+<td class="num" style="background:rgba(185,74,61,0.018);">59</td>
+<td class="num" style="background:rgba(185,74,61,0.083);">272</td>
+<td class="num" style="background:rgba(185,74,61,0.012);">39</td>
+<td class="num" style="background:rgba(185,74,61,0.101);">330</td>
+<td class="num" style="background:rgba(185,74,61,0.003);">9</td>
+<td class="num" style="background:rgba(94,140,74,0.315);font-weight:700">384</td>
+<td class="num" style="background:rgba(185,74,61,0.026);">85</td>
+</tr>
+<tr><th>G7 (1,573)</th>
+<td class="num" style="background:rgba(185,74,61,0.057);">179</td>
+<td class="num" style="background:rgba(185,74,61,0.029);">92</td>
+<td class="num" style="background:rgba(185,74,61,0.085);">268</td>
+<td class="num" style="background:transparent;">0</td>
+<td class="num" style="background:rgba(185,74,61,0.016);">49</td>
+<td class="num" style="background:rgba(185,74,61,0.005);">17</td>
+<td class="num" style="background:rgba(185,74,61,0.007);">21</td>
+<td class="num" style="background:rgba(94,140,74,0.571);font-weight:700">947</td>
+</tr>
+</tbody></table>
+<figcaption>Diagonal cells (green) are correct predictions; off-diagonal red shading is confusion. Row labels = ground truth; column labels = predicted.</figcaption>
+</figure>
+<h3>3.4 &nbsp; Comparison to baseline + reference</h3>
+<table class="data"><thead><tr><th>Run</th><th class="num">Test acc</th><th class="num">Macro F1</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Original 30-ep ASFormer (same split)</td><td class="num">63.85%</td><td class="num">~0.37</td><td>Bundle reference checkpoint, score_AR 0.7032</td></tr>
+<tr class="highlight"><td><strong>This run, 130-ep + soft weights (best_val_acc, head_0)</strong></td><td class="num"><strong>77.38%</strong></td><td class="num"><strong>62.92%</strong></td><td>+13.5pp acc, +25pp macro F1</td></tr>
+<tr><td>This run, best_val_f1 (head_1)</td><td class="num">75.89%</td><td class="num">61.10%</td><td>Selected by val F1 instead of val acc</td></tr>
+</tbody></table>
+<h3>3.5 &nbsp; best_val_f1.pt (epoch 83) on test — full head table</h3>
+<table class="data"><thead><tr><th>Head</th><th class="num">Test acc</th><th class="num">Macro F1</th><th class="num">Weighted F1</th></tr></thead><tbody>
+<tr><td>head_0</td><td class="num">75.83%</td><td class="num">58.77%</td><td class="num">75.32%</td></tr>
+<tr class="highlight"><td>head_1</td><td class="num">75.89%</td><td class="num">61.10%</td><td class="num">75.53%</td></tr>
+<tr><td>head_2</td><td class="num">76.38%</td><td class="num">60.26%</td><td class="num">75.50%</td></tr>
+</tbody></table>
+</section>
+
+<section>
+<h2>4 &middot; Reproducibility</h2>
+<table class="data">
+<thead><tr><th>Artifact</th><th>Path</th></tr></thead>
+<tbody>
+  <tr><td>Training YAML</td><td><code>vjepa2_polaris/configs/heads/sarrarp50/sarrarp50_actions_4fps_asformer_vitl_dist_vitg_ema_384_frozen_origsplit_long.yaml</code></td></tr>
+  <tr><td>Run directory</td><td><code>vjepa2_experiments/asformer_sarrarp50_distilled_long_origsplit/asformer_vitl_dist_vitg_ema_384_frozen_origsplit_long_n4g4_strong/</code></td></tr>
+  <tr><td>Best ckpt (val_acc)</td><td><code>&hellip;/video_classification_frozen/&lt;tag&gt;/best_val_acc.pt</code></td></tr>
+  <tr><td>Best ckpt (val_f1)</td><td><code>&hellip;/video_classification_frozen/&lt;tag&gt;/best_val_f1.pt</code></td></tr>
+  <tr><td>Training log CSV</td><td><code>&hellip;/video_classification_frozen/&lt;tag&gt;/log_r0.csv</code></td></tr>
+  <tr><td>Launcher wrapper</td><td><code>vjepa2_experiments/asformer_sarrarp50_distilled_long_origsplit/submit_train_n4g4_strong.sh</code></td></tr>
+  <tr><td>Class-weights tool</td><td><code>vjepa2_polaris/scripts/compute_soft_weights_origsplit_384.py</code></td></tr>
+  <tr><td>Test-eval submit</td><td><code>vjepa2_experiments/asformer_sarrarp50_distilled_long_origsplit/submit_test_eval.pbs</code></td></tr>
+</tbody>
+</table>
+</section>
+
+<section>
+<h2>5 &middot; Note on split coverage (vs the LemonFM report's split)</h2>
+<p>
+A second SAR-RARP50 split is widely cited &mdash; the &ldquo;6+1+3&rdquo; split used in the LemonFM
+report: train on videos <code>04, 07, 08, 09, 10, 36, 44</code>; val on
+<code>45</code>; test on <code>41, 42, 43</code>. While running the experiments above, we
+also counted per-class label frequencies in that split to compare it to the
+challenge split this run used. The result is non-trivial enough to be worth flagging.
+</p>
+
+<table class="data">
+<thead><tr>
+  <th>Class</th>
+  <th class="num">newsplit train</th>
+  <th class="num">newsplit val</th>
+  <th class="num">newsplit test</th>
+  <th class="num">origsplit train</th>
+  <th class="num">origsplit val</th>
+  <th class="num">origsplit test</th>
+</tr></thead>
+<tbody>
+  <tr><td>G0_other</td><td class="num">6,696</td><td class="num">241</td><td class="num">2,202</td><td class="num">44,813</td><td class="num">5,094</td><td class="num">9,107</td></tr>
+  <tr><td>G1_picking_up_needle</td><td class="num">1,663</td><td class="num">132</td><td class="num">996</td><td class="num">16,940</td><td class="num">1,271</td><td class="num">4,608</td></tr>
+  <tr><td>G2_positioning_needle</td><td class="num">7,643</td><td class="num">804</td><td class="num">4,428</td><td class="num">66,414</td><td class="num">10,210</td><td class="num">20,484</td></tr>
+  <tr><td>G3_pushing_needle</td><td class="num">7,860</td><td class="num">840</td><td class="num">5,604</td><td class="num">65,400</td><td class="num">12,336</td><td class="num">22,584</td></tr>
+  <tr><td>G4_pulling_needle</td><td class="num">7,092</td><td class="num">684</td><td class="num">4,740</td><td class="num">60,035</td><td class="num">8,015</td><td class="num">17,616</td></tr>
+  <tr style="background:#f1d4d0"><td>G5_tying_knot</td><td class="num">1,380</td><td class="num"><strong>0</strong></td><td class="num"><strong>0</strong></td><td class="num">2,868</td><td class="num">2,112</td><td class="num">444</td></tr>
+  <tr style="background:#f1d4d0"><td>G6_cutting_suture</td><td class="num">672</td><td class="num"><strong>0</strong></td><td class="num">684</td><td class="num">6,528</td><td class="num">660</td><td class="num">1,632</td></tr>
+  <tr><td>G7_dropping_needle</td><td class="num">1,194</td><td class="num">107</td><td class="num">402</td><td class="num">9,474</td><td class="num">862</td><td class="num">1,573</td></tr>
+  <tr style="background:#f1ede2"><td><strong>total</strong></td><td class="num"><strong>34,200</strong></td><td class="num"><strong>2,808</strong></td><td class="num"><strong>19,056</strong></td><td class="num"><strong>272,472</strong></td><td class="num"><strong>40,560</strong></td><td class="num"><strong>78,048</strong></td></tr>
+</tbody>
+</table>
+<div class="tbl-caption">Per-frame label counts in each split. Highlighted rows: classes missing from at least one split partition of the newsplit. Counts taken directly from the ctx3 4-fps CSVs.</div>
+
+<div class="callout warn">
+<h4>Coverage problems in the 6+1+3 newsplit</h4>
+<ul>
+  <li><strong>val (video_45) is missing 2 of the 8 classes:</strong> zero frames of <code>G5_tying_knot</code> AND <code>G6_cutting_suture</code> exist in the val partition. Any model-selection metric computed on this val set is structurally blind to whether the head can predict either gesture &mdash; those classes contribute 0/0 to recall and 0/x to precision (= 0 F1, ignored by macro-F1 averaging on this set).</li>
+  <li><strong>test (videos 41+42+43) is missing G5_tying_knot entirely:</strong> the model can never be wrong about tying_knot on this test set because the class literally never occurs. Macro-F1 reported on this test set is an average over 7 classes, not 8.</li>
+  <li><strong>train has only 7 videos:</strong> 34k per-frame labels vs the challenge split's 272k &mdash; ~8&times; smaller. Surgeon-style and instrument-pose variance is correspondingly narrower; G5 and G6 each have under 1,500 training frames.</li>
+</ul>
+</div>
+
+<p>
+The challenge split (used by this report's training run) avoids all three problems:
+all 8 classes appear in every partition, the training set is 8&times; larger, and val/test
+cover 16 different operations between them rather than 4. The trade-off is that
+its train and test distributions are correspondingly wider &mdash; harder to fit
+but more honest about generalisation across surgeons and devices.
+</p>
+
+<p>
+Practical implication for cross-paper comparisons: numbers reported on the 6+1+3
+newsplit and on the challenge split are not directly comparable. A run that scores
+high on newsplit test may be overconfident about G3/G4 because half of the
+challenge's rare-class burden is absent from the eval. When we evaluated this
+run's checkpoint on the newsplit-style 1Hz cadence in a separate experiment
+(<code>asformer_sarrarp50_distilled_long/</code>), it landed around 63&ndash;66% test
+acc &mdash; comparable to the LemonFM report's own numbers on the same restricted
+split, but ~14pp lower than the 77.4% reported here, which uses 10 test videos
+and all 8 classes.
+</p>
+</section>
+
+
+<script>
+// Per-epoch metrics from log_r0.csv (deduped across watchdog resumes).
+const CURVES = [{"e": 1, "ta": 29.595, "tf": 19.39, "tl": 2.1733, "va": 45.768, "vf": 28.871, "vl": 2.2369, "bva": 45.768, "bvf": 28.871, "bvae": 1, "bvfe": 1}, {"e": 2, "ta": 48.726, "tf": 35.444, "tl": 1.8694, "va": 50.205, "vf": 36.176, "vl": 1.7811, "bva": 50.205, "bvf": 36.176, "bvae": 2, "bvfe": 2}, {"e": 3, "ta": 54.54, "tf": 41.253, "tl": 1.6574, "va": 53.052, "vf": 40.346, "vl": 1.6187, "bva": 53.052, "bvf": 40.346, "bvae": 3, "bvfe": 3}, {"e": 4, "ta": 57.705, "tf": 47.842, "tl": 1.4694, "va": 62.603, "vf": 48.814, "vl": 1.782, "bva": 62.603, "bvf": 48.814, "bvae": 4, "bvfe": 4}, {"e": 5, "ta": 62.662, "tf": 54.483, "tl": 1.3656, "va": 65.294, "vf": 49.261, "vl": 1.5047, "bva": 65.294, "bvf": 49.261, "bvae": 5, "bvfe": 5}, {"e": 6, "ta": 64.63, "tf": 56.219, "tl": 1.3097, "va": 65.668, "vf": 52.692, "vl": 1.6816, "bva": 65.668, "bvf": 52.692, "bvae": 6, "bvfe": 6}, {"e": 7, "ta": 67.982, "tf": 60.872, "tl": 1.2518, "va": 67.39, "vf": 54.767, "vl": 1.4836, "bva": 67.39, "bvf": 54.767, "bvae": 7, "bvfe": 7}, {"e": 8, "ta": 69.037, "tf": 61.856, "tl": 1.1471, "va": 66.271, "vf": 51.947, "vl": 1.9001, "bva": 67.39, "bvf": 54.767, "bvae": 7, "bvfe": 7}, {"e": 9, "ta": 70.497, "tf": 63.99, "tl": 1.0845, "va": 65.34, "vf": 57.221, "vl": 1.5222, "bva": 67.39, "bvf": 57.221, "bvae": 7, "bvfe": 9}, {"e": 10, "ta": 71.082, "tf": 64.166, "tl": 1.072, "va": 67.623, "vf": 56.498, "vl": 1.1915, "bva": 67.623, "bvf": 57.221, "bvae": 10, "bvfe": 9}, {"e": 11, "ta": 69.868, "tf": 63.403, "tl": 0.9997, "va": 71.251, "vf": 59.167, "vl": 1.442, "bva": 71.251, "bvf": 59.167, "bvae": 11, "bvfe": 11}, {"e": 12, "ta": 69.767, "tf": 63.336, "tl": 0.9811, "va": 66.932, "vf": 55.631, "vl": 1.471, "bva": 71.251, "bvf": 59.167, "bvae": 11, "bvfe": 11}, {"e": 13, "ta": 71.758, "tf": 65.645, "tl": 0.9432, "va": 70.237, "vf": 60.113, "vl": 1.6046, "bva": 71.251, "bvf": 60.113, "bvae": 11, "bvfe": 13}, {"e": 14, "ta": 75.623, "tf": 70.107, "tl": 0.8995, "va": 69.917, "vf": 60.387, "vl": 1.3828, "bva": 71.251, "bvf": 60.387, "bvae": 11, "bvfe": 14}, {"e": 15, "ta": 73.597, "tf": 68.252, "tl": 0.8758, "va": 66.712, "vf": 55.288, "vl": 1.3781, "bva": 71.251, "bvf": 60.387, "bvae": 11, "bvfe": 14}, {"e": 16, "ta": 76.724, "tf": 72.012, "tl": 0.8555, "va": 71.862, "vf": 64.061, "vl": 1.4337, "bva": 71.862, "bvf": 64.061, "bvae": 16, "bvfe": 16}, {"e": 17, "ta": 71.502, "tf": 65.18, "tl": 0.812, "va": 69.969, "vf": 58.093, "vl": 1.6355, "bva": 71.862, "bvf": 64.061, "bvae": 16, "bvfe": 16}, {"e": 18, "ta": 77.956, "tf": 73.966, "tl": 0.8108, "va": 69.629, "vf": 58.99, "vl": 1.4881, "bva": 71.862, "bvf": 64.061, "bvae": 16, "bvfe": 16}, {"e": 19, "ta": 79.452, "tf": 75.467, "tl": 0.7805, "va": 71.514, "vf": 59.538, "vl": 1.3741, "bva": 71.862, "bvf": 64.061, "bvae": 16, "bvfe": 16}, {"e": 20, "ta": 73.827, "tf": 67.92, "tl": 0.7399, "va": 74.219, "vf": 64.63, "vl": 1.3383, "bva": 74.219, "bvf": 64.63, "bvae": 20, "bvfe": 20}, {"e": 21, "ta": 76.761, "tf": 71.383, "tl": 0.75, "va": 68.094, "vf": 56.977, "vl": 1.5866, "bva": 74.219, "bvf": 64.63, "bvae": 20, "bvfe": 20}, {"e": 22, "ta": 74.69, "tf": 69.553, "tl": 0.7087, "va": 72.964, "vf": 60.504, "vl": 1.9597, "bva": 74.219, "bvf": 64.63, "bvae": 20, "bvfe": 20}, {"e": 23, "ta": 78.485, "tf": 74.432, "tl": 0.7074, "va": 72.206, "vf": 60.819, "vl": 1.3498, "bva": 74.219, "bvf": 64.63, "bvae": 20, "bvfe": 20}, {"e": 24, "ta": 79.836, "tf": 75.56, "tl": 0.678, "va": 75.238, "vf": 63.76, "vl": 1.4114, "bva": 75.238, "bvf": 64.63, "bvae": 24, "bvfe": 20}, {"e": 25, "ta": 80.87, "tf": 77.038, "tl": 0.655, "va": 74.619, "vf": 60.678, "vl": 1.3204, "bva": 75.238, "bvf": 64.63, "bvae": 24, "bvfe": 20}, {"e": 26, "ta": 84.916, "tf": 82.724, "tl": 0.6447, "va": 73.195, "vf": 59.676, "vl": 1.4405, "bva": 75.238, "bvf": 64.63, "bvae": 24, "bvfe": 20}, {"e": 27, "ta": 81.644, "tf": 78.178, "tl": 0.6089, "va": 76.009, "vf": 65.524, "vl": 1.2369, "bva": 76.009, "bvf": 65.524, "bvae": 27, "bvfe": 27}, {"e": 28, "ta": 81.37, "tf": 77.79, "tl": 0.6076, "va": 76.152, "vf": 63.563, "vl": 1.4241, "bva": 76.152, "bvf": 65.524, "bvae": 28, "bvfe": 27}, {"e": 29, "ta": 82.916, "tf": 79.584, "tl": 0.596, "va": 74.194, "vf": 65.045, "vl": 1.1245, "bva": 76.152, "bvf": 65.524, "bvae": 28, "bvfe": 27}, {"e": 30, "ta": 82.872, "tf": 79.366, "tl": 0.5676, "va": 72.589, "vf": 59.562, "vl": 1.4397, "bva": 76.152, "bvf": 65.524, "bvae": 28, "bvfe": 27}, {"e": 31, "ta": 84.113, "tf": 81.673, "tl": 0.544, "va": 73.112, "vf": 59.769, "vl": 1.7198, "bva": 76.152, "bvf": 65.524, "bvae": 28, "bvfe": 27}, {"e": 32, "ta": 88.114, "tf": 86.691, "tl": 0.5114, "va": 74.867, "vf": 62.733, "vl": 1.499, "bva": 76.152, "bvf": 65.524, "bvae": 28, "bvfe": 27}, {"e": 33, "ta": 85.413, "tf": 82.976, "tl": 0.5198, "va": 76.532, "vf": 63.889, "vl": 1.4418, "bva": 76.532, "bvf": 65.524, "bvae": 33, "bvfe": 27}, {"e": 34, "ta": 86.643, "tf": 85.033, "tl": 0.4838, "va": 71.074, "vf": 59.99, "vl": 1.8658, "bva": 76.532, "bvf": 65.524, "bvae": 33, "bvfe": 27}, {"e": 35, "ta": 88.205, "tf": 86.572, "tl": 0.5071, "va": 74.326, "vf": 65.733, "vl": 1.5195, "bva": 76.532, "bvf": 65.733, "bvae": 33, "bvfe": 35}, {"e": 36, "ta": 82.797, "tf": 79.537, "tl": 0.4732, "va": 74.397, "vf": 64.759, "vl": 1.5296, "bva": 76.532, "bvf": 65.733, "bvae": 33, "bvfe": 35}, {"e": 37, "ta": 83.549, "tf": 80.837, "tl": 0.45, "va": 74.634, "vf": 61.446, "vl": 1.6501, "bva": 76.532, "bvf": 65.733, "bvae": 33, "bvfe": 35}, {"e": 38, "ta": 89.497, "tf": 88.441, "tl": 0.4529, "va": 74.429, "vf": 62.984, "vl": 1.3252, "bva": 76.532, "bvf": 65.733, "bvae": 33, "bvfe": 35}, {"e": 39, "ta": 90.345, "tf": 89.177, "tl": 0.4267, "va": 74.532, "vf": 64.229, "vl": 1.5166, "bva": 76.532, "bvf": 65.733, "bvae": 33, "bvfe": 35}, {"e": 40, "ta": 88.585, "tf": 87.297, "tl": 0.3996, "va": 76.788, "vf": 66.663, "vl": 1.3393, "bva": 76.788, "bvf": 66.663, "bvae": 40, "bvfe": 40}, {"e": 41, "ta": 91.101, "tf": 90.197, "tl": 0.4031, "va": 73.961, "vf": 63.776, "vl": 1.6252, "bva": 76.788, "bvf": 66.663, "bvae": 40, "bvfe": 40}, {"e": 42, "ta": 89.395, "tf": 88.135, "tl": 0.3874, "va": 75.486, "vf": 64.944, "vl": 1.3914, "bva": 76.788, "bvf": 66.663, "bvae": 40, "bvfe": 40}, {"e": 43, "ta": 89.466, "tf": 88.559, "tl": 0.372, "va": 76.064, "vf": 66.724, "vl": 1.6938, "bva": 76.788, "bvf": 66.724, "bvae": 40, "bvfe": 43}, {"e": 44, "ta": 90.13, "tf": 89.494, "tl": 0.3646, "va": 76.748, "vf": 66.913, "vl": 1.5054, "bva": 76.788, "bvf": 66.913, "bvae": 40, "bvfe": 44}, {"e": 45, "ta": 86.384, "tf": 84.501, "tl": 0.3664, "va": 77.985, "vf": 70.359, "vl": 1.3799, "bva": 77.985, "bvf": 70.359, "bvae": 45, "bvfe": 45}, {"e": 46, "ta": 86.41, "tf": 85.084, "tl": 0.3643, "va": 76.748, "vf": 68.22, "vl": 1.5076, "bva": 77.985, "bvf": 70.359, "bvae": 45, "bvfe": 45}, {"e": 47, "ta": 87.589, "tf": 85.756, "tl": 0.338, "va": 77.734, "vf": 67.076, "vl": 1.5352, "bva": 77.985, "bvf": 70.359, "bvae": 45, "bvfe": 45}, {"e": 48, "ta": 90.924, "tf": 90.106, "tl": 0.326, "va": 74.181, "vf": 67.878, "vl": 1.4651, "bva": 77.985, "bvf": 70.359, "bvae": 45, "bvfe": 45}, {"e": 49, "ta": 88.138, "tf": 86.682, "tl": 0.3215, "va": 77.842, "vf": 68.948, "vl": 1.5407, "bva": 77.985, "bvf": 70.359, "bvae": 45, "bvfe": 45}, {"e": 50, "ta": 88.296, "tf": 86.93, "tl": 0.3251, "va": 77.083, "vf": 64.788, "vl": 1.6127, "bva": 77.985, "bvf": 70.359, "bvae": 45, "bvfe": 45}, {"e": 51, "ta": 92.837, "tf": 92.367, "tl": 0.287, "va": 75.053, "vf": 67.476, "vl": 1.3621, "bva": 77.985, "bvf": 70.359, "bvae": 45, "bvfe": 45}, {"e": 52, "ta": 92.169, "tf": 91.694, "tl": 0.2981, "va": 76.465, "vf": 67.07, "vl": 1.3116, "bva": 77.985, "bvf": 70.359, "bvae": 45, "bvfe": 45}, {"e": 53, "ta": 92.645, "tf": 92.113, "tl": 0.2848, "va": 77.361, "vf": 67.989, "vl": 1.7946, "bva": 77.985, "bvf": 70.359, "bvae": 45, "bvfe": 45}, {"e": 54, "ta": 93.184, "tf": 92.926, "tl": 0.2774, "va": 76.7, "vf": 67.868, "vl": 1.8041, "bva": 77.985, "bvf": 70.359, "bvae": 45, "bvfe": 45}, {"e": 55, "ta": 89.822, "tf": 89.007, "tl": 0.275, "va": 77.088, "vf": 66.122, "vl": 1.7838, "bva": 77.985, "bvf": 70.359, "bvae": 45, "bvfe": 45}, {"e": 56, "ta": 93.258, "tf": 92.932, "tl": 0.2655, "va": 77.331, "vf": 69.086, "vl": 1.6076, "bva": 77.985, "bvf": 70.359, "bvae": 45, "bvfe": 45}, {"e": 57, "ta": 93.846, "tf": 93.127, "tl": 0.2656, "va": 76.252, "vf": 67.976, "vl": 1.3863, "bva": 77.985, "bvf": 70.359, "bvae": 45, "bvfe": 45}, {"e": 58, "ta": 90.952, "tf": 90.315, "tl": 0.2556, "va": 75.578, "vf": 66.289, "vl": 1.4361, "bva": 77.985, "bvf": 70.359, "bvae": 45, "bvfe": 45}, {"e": 59, "ta": 94.159, "tf": 94.477, "tl": 0.2504, "va": 78.671, "vf": 71.296, "vl": 1.38, "bva": 78.671, "bvf": 71.296, "bvae": 59, "bvfe": 59}, {"e": 60, "ta": 94.87, "tf": 94.922, "tl": 0.244, "va": 72.862, "vf": 60.869, "vl": 1.8132, "bva": 78.671, "bvf": 71.296, "bvae": 59, "bvfe": 59}, {"e": 61, "ta": 95.298, "tf": 95.285, "tl": 0.2395, "va": 73.896, "vf": 68.072, "vl": 1.6227, "bva": 78.671, "bvf": 71.296, "bvae": 59, "bvfe": 59}, {"e": 62, "ta": 94.879, "tf": 94.612, "tl": 0.2424, "va": 76.805, "vf": 71.502, "vl": 1.2543, "bva": 78.671, "bvf": 71.502, "bvae": 59, "bvfe": 62}, {"e": 63, "ta": 94.657, "tf": 94.742, "tl": 0.2499, "va": 77.539, "vf": 68.294, "vl": 1.7601, "bva": 78.671, "bvf": 71.502, "bvae": 59, "bvfe": 62}, {"e": 64, "ta": 94.41, "tf": 94.483, "tl": 0.2412, "va": 78.328, "vf": 70.511, "vl": 1.4738, "bva": 78.671, "bvf": 71.502, "bvae": 59, "bvfe": 62}, {"e": 65, "ta": 92.464, "tf": 92.305, "tl": 0.2095, "va": 77.206, "vf": 68.992, "vl": 1.4975, "bva": 78.671, "bvf": 71.502, "bvae": 59, "bvfe": 62}, {"e": 66, "ta": 93.029, "tf": 93.226, "tl": 0.1928, "va": 78.681, "vf": 71.262, "vl": 1.4966, "bva": 78.681, "bvf": 71.502, "bvae": 66, "bvfe": 62}, {"e": 67, "ta": 92.468, "tf": 92.016, "tl": 0.2151, "va": 76.33, "vf": 65.645, "vl": 1.6307, "bva": 78.681, "bvf": 71.502, "bvae": 66, "bvfe": 62}, {"e": 68, "ta": 96.295, "tf": 96.586, "tl": 0.1898, "va": 76.971, "vf": 68.215, "vl": 1.521, "bva": 78.681, "bvf": 71.502, "bvae": 66, "bvfe": 62}, {"e": 69, "ta": 94.852, "tf": 94.861, "tl": 0.2067, "va": 75.2, "vf": 65.538, "vl": 1.7409, "bva": 78.681, "bvf": 71.502, "bvae": 66, "bvfe": 62}, {"e": 70, "ta": 96.463, "tf": 96.544, "tl": 0.1875, "va": 74.026, "vf": 61.688, "vl": 1.7573, "bva": 78.681, "bvf": 71.502, "bvae": 66, "bvfe": 62}, {"e": 71, "ta": 93.352, "tf": 93.102, "tl": 0.1934, "va": 77.221, "vf": 67.271, "vl": 1.6629, "bva": 78.681, "bvf": 71.502, "bvae": 66, "bvfe": 62}, {"e": 72, "ta": 95.119, "tf": 94.759, "tl": 0.1956, "va": 74.021, "vf": 60.472, "vl": 2.0004, "bva": 78.681, "bvf": 71.502, "bvae": 66, "bvfe": 62}, {"e": 73, "ta": 95.442, "tf": 95.216, "tl": 0.1935, "va": 76.936, "vf": 68.129, "vl": 1.5853, "bva": 78.681, "bvf": 71.502, "bvae": 66, "bvfe": 62}, {"e": 74, "ta": 95.891, "tf": 96.096, "tl": 0.1816, "va": 76.743, "vf": 68.359, "vl": 1.8489, "bva": 78.681, "bvf": 71.502, "bvae": 66, "bvfe": 62}, {"e": 75, "ta": 96.222, "tf": 96.539, "tl": 0.1679, "va": 77.602, "vf": 70.034, "vl": 1.4563, "bva": 78.681, "bvf": 71.502, "bvae": 66, "bvfe": 62}, {"e": 76, "ta": 96.549, "tf": 96.933, "tl": 0.1743, "va": 75.799, "vf": 67.695, "vl": 1.8277, "bva": 78.681, "bvf": 71.502, "bvae": 66, "bvfe": 62}, {"e": 77, "ta": 96.622, "tf": 96.975, "tl": 0.1857, "va": 76.552, "vf": 69.225, "vl": 1.8732, "bva": 78.681, "bvf": 71.502, "bvae": 66, "bvfe": 62}, {"e": 78, "ta": 96.31, "tf": 96.389, "tl": 0.1686, "va": 77.594, "vf": 71.55, "vl": 1.75, "bva": 78.681, "bvf": 71.55, "bvae": 66, "bvfe": 78}, {"e": 79, "ta": 95.008, "tf": 95.149, "tl": 0.1528, "va": 73.943, "vf": 63.888, "vl": 1.8388, "bva": 78.681, "bvf": 71.55, "bvae": 66, "bvfe": 78}, {"e": 80, "ta": 94.888, "tf": 95.17, "tl": 0.1541, "va": 75.508, "vf": 66.775, "vl": 1.6201, "bva": 78.681, "bvf": 71.55, "bvae": 66, "bvfe": 78}, {"e": 81, "ta": 96.229, "tf": 96.074, "tl": 0.1725, "va": 74.692, "vf": 63.183, "vl": 1.9034, "bva": 78.681, "bvf": 71.55, "bvae": 66, "bvfe": 78}, {"e": 82, "ta": 96.678, "tf": 96.649, "tl": 0.1548, "va": 76.465, "vf": 68.547, "vl": 1.6426, "bva": 78.681, "bvf": 71.55, "bvae": 66, "bvfe": 78}, {"e": 83, "ta": 95.614, "tf": 95.712, "tl": 0.1403, "va": 78.037, "vf": 71.781, "vl": 1.6192, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 84, "ta": 97.201, "tf": 97.219, "tl": 0.1491, "va": 76.855, "vf": 67.949, "vl": 1.6674, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 85, "ta": 97.299, "tf": 97.613, "tl": 0.1433, "va": 74.609, "vf": 66.001, "vl": 1.7302, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 86, "ta": 96.993, "tf": 97.251, "tl": 0.1405, "va": 76.783, "vf": 67.688, "vl": 1.6561, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 87, "ta": 97.394, "tf": 97.688, "tl": 0.1314, "va": 77.031, "vf": 68.769, "vl": 1.6126, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 88, "ta": 96.204, "tf": 96.44, "tl": 0.1257, "va": 77.547, "vf": 69.153, "vl": 1.6276, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 89, "ta": 96.068, "tf": 96.174, "tl": 0.126, "va": 74.189, "vf": 67.38, "vl": 1.8151, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 90, "ta": 95.629, "tf": 95.566, "tl": 0.1443, "va": 74.702, "vf": 62.268, "vl": 1.8644, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 91, "ta": 96.518, "tf": 96.679, "tl": 0.1172, "va": 77.544, "vf": 70.072, "vl": 1.8021, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 92, "ta": 97.799, "tf": 98.089, "tl": 0.12, "va": 76.635, "vf": 66.081, "vl": 1.7284, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 93, "ta": 97.962, "tf": 98.124, "tl": 0.1115, "va": 76.097, "vf": 65.685, "vl": 1.8813, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 94, "ta": 97.64, "tf": 98.049, "tl": 0.1251, "va": 75.729, "vf": 65.543, "vl": 1.7299, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 95, "ta": 97.989, "tf": 98.12, "tl": 0.1104, "va": 76.562, "vf": 67.851, "vl": 1.6984, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 96, "ta": 97.92, "tf": 98.241, "tl": 0.1072, "va": 77.687, "vf": 70.863, "vl": 1.707, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 97, "ta": 97.512, "tf": 97.189, "tl": 0.1125, "va": 76.312, "vf": 67.255, "vl": 1.9348, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 98, "ta": 97.913, "tf": 98.048, "tl": 0.1169, "va": 75.931, "vf": 66.805, "vl": 1.7603, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 99, "ta": 97.096, "tf": 97.349, "tl": 0.1046, "va": 76.437, "vf": 67.751, "vl": 1.8592, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 100, "ta": 98.119, "tf": 98.343, "tl": 0.0973, "va": 77.479, "vf": 68.975, "vl": 1.5577, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 101, "ta": 97.127, "tf": 97.313, "tl": 0.1032, "va": 75.869, "vf": 67.608, "vl": 1.6039, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 102, "ta": 98.1, "tf": 98.134, "tl": 0.0951, "va": 76.913, "vf": 68.938, "vl": 1.5039, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 103, "ta": 98.03, "tf": 98.223, "tl": 0.1044, "va": 76.029, "vf": 66.815, "vl": 1.6399, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 104, "ta": 97.904, "tf": 98.238, "tl": 0.0852, "va": 76.154, "vf": 65.968, "vl": 1.7659, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 105, "ta": 98.344, "tf": 98.379, "tl": 0.0915, "va": 76.79, "vf": 67.246, "vl": 1.7411, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 106, "ta": 98.321, "tf": 98.521, "tl": 0.0929, "va": 76.209, "vf": 67.753, "vl": 1.8805, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 107, "ta": 98.3, "tf": 98.251, "tl": 0.09, "va": 76.167, "vf": 66.927, "vl": 1.7402, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 108, "ta": 98.467, "tf": 98.458, "tl": 0.085, "va": 76.417, "vf": 66.859, "vl": 1.9952, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 109, "ta": 98.418, "tf": 98.632, "tl": 0.0899, "va": 75.949, "vf": 66.558, "vl": 1.9003, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 110, "ta": 98.364, "tf": 98.389, "tl": 0.0884, "va": 75.656, "vf": 68.047, "vl": 1.7075, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 111, "ta": 97.912, "tf": 98.045, "tl": 0.083, "va": 75.198, "vf": 66.708, "vl": 1.8577, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 112, "ta": 98.688, "tf": 98.823, "tl": 0.081, "va": 76.114, "vf": 66.478, "vl": 1.8359, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 113, "ta": 97.861, "tf": 97.911, "tl": 0.0866, "va": 77.394, "vf": 69.303, "vl": 1.8128, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 114, "ta": 98.493, "tf": 98.528, "tl": 0.0845, "va": 76.114, "vf": 66.462, "vl": 1.8592, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 115, "ta": 98.507, "tf": 98.696, "tl": 0.0839, "va": 76.094, "vf": 66.084, "vl": 1.92, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 116, "ta": 98.624, "tf": 98.711, "tl": 0.0798, "va": 75.446, "vf": 64.789, "vl": 1.9076, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 117, "ta": 98.733, "tf": 98.979, "tl": 0.0755, "va": 76.224, "vf": 65.959, "vl": 1.8815, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 118, "ta": 98.575, "tf": 98.713, "tl": 0.078, "va": 75.27, "vf": 66.104, "vl": 1.9977, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 119, "ta": 98.525, "tf": 98.785, "tl": 0.0707, "va": 76.189, "vf": 66.578, "vl": 1.8892, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 120, "ta": 98.651, "tf": 98.82, "tl": 0.0783, "va": 75.947, "vf": 66.4, "vl": 1.9263, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 121, "ta": 98.814, "tf": 99.003, "tl": 0.0718, "va": 76.26, "vf": 67.188, "vl": 1.8604, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 122, "ta": 98.464, "tf": 98.648, "tl": 0.0752, "va": 76.768, "vf": 68.136, "vl": 1.8228, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 123, "ta": 98.611, "tf": 98.804, "tl": 0.0757, "va": 75.944, "vf": 66.793, "vl": 1.8676, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 124, "ta": 98.814, "tf": 98.927, "tl": 0.0724, "va": 76.059, "vf": 67.145, "vl": 1.7737, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 125, "ta": 98.82, "tf": 98.982, "tl": 0.073, "va": 76.73, "vf": 69.095, "vl": 1.8779, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 126, "ta": 98.741, "tf": 98.705, "tl": 0.0698, "va": 76.152, "vf": 67.721, "vl": 1.7582, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 127, "ta": 98.774, "tf": 98.747, "tl": 0.0701, "va": 75.911, "vf": 67.046, "vl": 1.9324, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 128, "ta": 98.882, "tf": 99.12, "tl": 0.0701, "va": 76.154, "vf": 66.625, "vl": 1.8374, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}, {"e": 129, "ta": 98.895, "tf": 99.143, "tl": 0.0711, "va": 76.585, "vf": 68.298, "vl": 1.7955, "bva": 78.681, "bvf": 71.781, "bvae": 66, "bvfe": 83}];
+
+function drawCurve(canvasId, series, opts) {
+  const c = document.getElementById(canvasId);
+  if (!c) return;
+  const ctx = c.getContext("2d");
+  const W = c.width, H = c.height;
+  const padL = 50, padR = 16, padT = 14, padB = 30;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+
+  // axis ranges
+  const xs = CURVES.map(r => r.e);
+  const xmin = Math.min(...xs), xmax = Math.max(...xs);
+  let ymin = opts.ymin, ymax = opts.ymax;
+  if (ymin == null || ymax == null) {
+    const all = series.flatMap(s => CURVES.map(r => r[s.key]));
+    ymin = Math.min(...all); ymax = Math.max(...all);
+    const pad = (ymax - ymin) * 0.06;
+    ymin -= pad; ymax += pad;
+  }
+  const sx = e => padL + (e - xmin) / (xmax - xmin) * plotW;
+  const sy = v => padT + (1 - (v - ymin) / (ymax - ymin)) * plotH;
+
+  ctx.clearRect(0, 0, W, H);
+  // gridlines + y ticks
+  ctx.strokeStyle = "#e7e2d4"; ctx.fillStyle = "#5a6473";
+  ctx.font = "11px 'Helvetica Neue',Arial,sans-serif"; ctx.textAlign = "right";
+  const nticks = 5;
+  for (let i = 0; i <= nticks; i++) {
+    const v = ymin + (ymax - ymin) * i / nticks;
+    const y = sy(v);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    ctx.fillText(opts.yfmt ? opts.yfmt(v) : v.toFixed(1), padL - 4, y + 4);
+  }
+  // x ticks
+  ctx.textAlign = "center";
+  const xticks = [1, 25, 50, 75, 100, 125, 130];
+  xticks.forEach(t => {
+    if (t < xmin || t > xmax) return;
+    const x = sx(t);
+    ctx.beginPath(); ctx.moveTo(x, H - padB); ctx.lineTo(x, H - padB + 4); ctx.strokeStyle = "#d8d3c8"; ctx.stroke();
+    ctx.fillText(t, x, H - padB + 16);
+  });
+  // axis labels
+  ctx.fillStyle = "#5a6473"; ctx.textAlign = "center";
+  ctx.fillText("epoch", padL + plotW / 2, H - 4);
+
+  // plot lines
+  series.forEach(s => {
+    ctx.strokeStyle = s.color; ctx.lineWidth = s.dashed ? 1.5 : 2;
+    ctx.setLineDash(s.dashed ? [4, 3] : []);
+    ctx.beginPath();
+    CURVES.forEach((r, i) => {
+      const x = sx(r.e), y = sy(r[s.key]);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+  });
+
+  // best markers
+  if (opts.markBest) {
+    const m = opts.markBest;
+    const best = CURVES.reduce((a, b) => b[m.key] > a[m.key] ? b : a);
+    const x = sx(best.e), y = sy(best[m.key]);
+    ctx.fillStyle = m.color; ctx.beginPath();
+    ctx.arc(x, y, 4.5, 0, Math.PI * 2); ctx.fill();
+    ctx.font = "11px 'Helvetica Neue',Arial,sans-serif";
+    ctx.textAlign = (best.e > (xmin + xmax) / 2) ? "right" : "left";
+    const lx = best.e > (xmin + xmax) / 2 ? x - 8 : x + 8;
+    ctx.fillText(`best ${m.label} ${best[m.key].toFixed(2)}% @ep ${best.e}`, lx, y - 8);
+  }
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  drawCurve("cv_acc",
+    [{key:"ta", color:"#6b4ba0"}, {key:"va", color:"#5e8c4a"}],
+    {ymin:0, ymax:100, yfmt: v => v.toFixed(0) + "%",
+     markBest: {key:"va", color:"#b94a3d", label:"val_acc"}});
+  drawCurve("cv_f1",
+    [{key:"tf", color:"#6b4ba0"}, {key:"vf", color:"#5e8c4a"}],
+    {ymin:0, ymax:100, yfmt: v => v.toFixed(0) + "%",
+     markBest: {key:"vf", color:"#b94a3d", label:"val_F1"}});
+  drawCurve("cv_loss",
+    [{key:"tl", color:"#6b4ba0"}, {key:"vl", color:"#5e8c4a"}],
+    {ymin:0, yfmt: v => v.toFixed(2)});
+});
+</script>
+
+<p class="note">Report generated 2026-06-08 from <code>log_r0.csv</code> in this workspace.</p>
+</main>
+</body></html>

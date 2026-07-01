@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>V-JEPA 2.1 surgical pretraining — phase-2 experiments summary</title>
+<style>
+  :root {
+    --bg: #f7f5ee;
+    --fg: #1f2933;
+    --muted: #5a6473;
+    --line: #d8d3c8;
+    --accent: #6b4ba0;
+    --good: #5e8c4a;
+    --bad: #b94a3d;
+    --warm: #d68a3a;
+    --code-bg: #f1ede2;
+  }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         background: var(--bg); color: var(--fg); margin: 0; padding: 2rem; line-height: 1.45;
+         max-width: 1080px; margin-left: auto; margin-right: auto; }
+  h1 { font-size: 1.6rem; margin: 0 0 0.25rem 0; }
+  h2 { font-size: 1.2rem; margin: 2rem 0 0.5rem 0; padding-bottom: 0.25rem;
+       border-bottom: 1px solid var(--line); }
+  h3 { font-size: 1rem; margin: 1.4rem 0 0.4rem 0; color: var(--accent); }
+  p, li { font-size: 0.93rem; }
+  .subtitle { color: var(--muted); margin: 0 0 1.5rem 0; }
+  table { border-collapse: collapse; width: 100%; margin: 0.5rem 0 1rem 0;
+          font-size: 0.88rem; background: white; }
+  th, td { padding: 0.4rem 0.6rem; text-align: left; border-bottom: 1px solid var(--line); }
+  th { background: var(--code-bg); font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.best td { background: #e3eed9; font-weight: 600; }
+  tr.bad td { color: var(--bad); }
+  tr.warm td { color: var(--warm); }
+  code { background: var(--code-bg); padding: 0.05rem 0.3rem; border-radius: 3px;
+         font-family: "SF Mono", Menlo, monospace; font-size: 0.85em; }
+  .tag { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 3px;
+         font-size: 0.78rem; margin-right: 0.3rem; }
+  .tag.good { background: #dde9d6; color: #2f5d20; }
+  .tag.bad  { background: #f3d6cd; color: #6b2a1f; }
+  .tag.warm { background: #f3e2c4; color: #6b4a1f; }
+  .small { color: var(--muted); font-size: 0.85rem; }
+  ul { margin: 0.3rem 0 0.8rem 1.2rem; padding: 0; }
+  .legend { color: var(--muted); font-size: 0.82rem; margin-top: -0.3rem; }
+</style>
+</head>
+<body>
+
+<h1>V-JEPA 2.1 surgical pretraining — experiments summary</h1>
+<p class="subtitle">Phase-1 and phase-2 ablations on Aurora and Polaris. Downstream evals on SAR-RARP50 (asformer head, 20-epoch probe) and CholecT50-style triplet (10-epoch head).</p>
+
+<h2>1 &middot; Setup</h2>
+
+<table>
+<thead><tr><th>Component</th><th>Choice</th></tr></thead>
+<tbody>
+<tr><td>Backbone</td><td>ViT-L/16, tubelet 2, RoPE, sdpa</td></tr>
+<tr><td>Initial pretrained checkpoint</td><td><code>vjepa2_1_vitl_dist_vitG_384.pt</code> (Meta distilled ViT-L from ViT-G)</td></tr>
+<tr><td>Phase 1 horizon</td><td>12 epochs warmup (ipe=500)</td></tr>
+<tr><td>Phase 2 horizon</td><td>600 epochs (ipe=100)</td></tr>
+<tr><td>Pretrain compute</td><td>Aurora, 16 nodes &times; 12 tiles = 192 ranks</td></tr>
+<tr><td>Downstream probe — asformer</td><td>SAR-RARP50 8-class actions, 20 ep head training, 3-LR head sweep, early-stop patience 6</td></tr>
+<tr><td>Downstream probe — triplet</td><td>Joint tool5/verb6/target12 multilabel BCE, 10 ep head training (Polaris)</td></tr>
+</tbody>
+</table>
+
+<h2>2 &middot; The regression we discovered</h2>
+
+<p>The baseline phase-2 recipe (<code>phase2_main_n16g12_weak_lrwarmup</code>) showed a strong downstream-probe regression around epoch 150-200 of pretraining. Tracked it to the <code>lambda_progressive</code> context loss kicking in around epoch 150.</p>
+
+<table>
+<thead><tr><th>Checkpoint</th><th class="num">val_f1</th><th class="num">val_acc</th><th>note</th></tr></thead>
+<tbody>
+<tr><td>v2_e69</td><td class="num">45.89</td><td class="num">61.97</td><td>pre-ramp baseline</td></tr>
+<tr><td>v2_e99</td><td class="num">46.44</td><td class="num">62.22</td><td>pre-ramp</td></tr>
+<tr class="best"><td>v2_e139</td><td class="num">45.90</td><td class="num">62.42</td><td>last good (just before ramp)</td></tr>
+<tr class="bad"><td>v2_e189</td><td class="num">36.12</td><td class="num">48.98</td><td>post-ramp: <b>&minus;9.8 F1</b></td></tr>
+</tbody>
+</table>
+<p class="legend">All val numbers are best-of-3-LR head per epoch, peak across 20 head-training epochs.</p>
+
+<h2>3 &middot; Phase-2 EMA grid (v3, from e139, 30 epochs each)</h2>
+
+<p>Tested whether faster target-encoder EMA could absorb the &lambda; ramp shock. EMA was the only axis varied; all other phase-2 params identical to the baseline.</p>
+
+<table>
+<thead><tr><th>Variant</th><th>EMA endpoints</th><th class="num">asformer val_f1</th><th class="num">asformer val_acc</th><th class="num">triplet IVT mAP</th><th class="num">triplet tool mAP</th></tr></thead>
+<tbody>
+<tr class="warm"><td>v3_ema_low</td><td>[0.99, 0.99]</td><td class="num">40.17</td><td class="num">52.92</td><td class="num">0.083</td><td class="num">0.495</td></tr>
+<tr class="bad"><td>v3_ema_sched</td><td>[0.99 &rarr; 0.99925]</td><td class="num">19.32</td><td class="num">35.33</td><td class="num">0.075</td><td class="num">0.481</td></tr>
+<tr class="bad"><td>v3_ema_high</td><td>[0.9999, 0.9999]</td><td class="num">34.13</td><td class="num">50.98</td><td class="num">0.094</td><td class="num">0.582</td></tr>
+</tbody>
+</table>
+<p><b>Verdict:</b> EMA alone doesn't recover the regression. Fast EMA (<code>ema_low</code>) recovers only ~half the lost F1. Scheduled EMA is broken (likely from the EMA-momentum-on-resume mismatch).</p>
+
+<h2>4 &middot; Phase-2 lambda grid (v4, from e139, 30 epochs each)</h2>
+
+<p>Tested the <code>lambda_progressive</code>/<code>lambda_value_vid</code> axis directly. EMA pinned at baseline.</p>
+
+<table>
+<thead><tr><th>Variant</th><th>lambda_progressive</th><th>lambda_value_vid</th><th class="num">asformer val_f1</th><th class="num">asformer val_acc</th><th class="num">triplet IVT mAP</th><th class="num">triplet tool mAP</th></tr></thead>
+<tbody>
+<tr class="best"><td>v4_lambda_off</td><td>false</td><td>0.0</td><td class="num">46.09</td><td class="num">62.57</td><td class="num">0.117</td><td class="num">0.601</td></tr>
+<tr class="bad"><td>v4_lambda_low</td><td>true</td><td>0.1</td><td class="num">11.35 (early-stop)</td><td class="num">31.88</td><td class="num">0.077</td><td class="num">0.484</td></tr>
+<tr class="bad"><td>v4_lambda_immediate</td><td>false</td><td>0.5</td><td class="num">11.35 (early-stop)</td><td class="num">31.88</td><td class="num">0.069</td><td class="num">0.450</td></tr>
+</tbody>
+</table>
+<p><b>Verdict:</b> The context loss itself is the culprit. <code>lambda_off</code> fully recovers to the e139 plateau. Any non-zero &lambda; (ramped or immediate, large or small) catastrophically destroys probe-recoverable structure.</p>
+
+<h2>5 &middot; lambda_off continuation (v5, beyond e169)</h2>
+
+<p>Continued <code>lambda_off</code> pretraining past e169 with the original 600-epoch horizon restored. Probed three additional milestones.</p>
+
+<table>
+<thead><tr><th>Checkpoint</th><th class="num">val_f1</th><th class="num">val_acc</th></tr></thead>
+<tbody>
+<tr><td>v4_lambda_off_e169</td><td class="num">46.09</td><td class="num">62.57</td></tr>
+<tr class="best"><td><b>v5_lambda_off_e229</b></td><td class="num"><b>47.11</b></td><td class="num"><b>64.30</b></td></tr>
+<tr><td>v5_lambda_off_e309</td><td class="num">45.92</td><td class="num">61.30</td></tr>
+<tr class="warm"><td>v5_lambda_off_e369</td><td class="num">~41 (partial, stopped at ep15)</td><td class="num">~56</td></tr>
+</tbody>
+</table>
+<p><b>Verdict:</b> Performance peaks at <b>e229</b> (best result across all experiments), then slowly declines. The encoder still trains under the JEPA prediction loss alone, but past ~e250 it starts drifting from probe-readable structure.</p>
+
+<h2>6 &middot; Phase-1 ablations</h2>
+
+<p>The natural follow-up: is even the warmup itself moving us away from the Meta distilled init?</p>
+
+<table>
+<thead><tr><th>Variant</th><th>crop_size</th><th>start_lr &rarr; lr</th><th class="num">val_f1</th><th class="num">val_acc</th></tr></thead>
+<tbody>
+<tr><td>ngetty phase1_warmup e12 (default)</td><td>256</td><td>3e-5 &rarr; 5.25e-4 (warmup 1ep)</td><td class="num">44.73</td><td class="num">60.21</td></tr>
+<tr><td>v7_phase1_lowlr_384 e2</td><td>384</td><td>flat 5e-5</td><td class="num">42.64</td><td class="num">58.48</td></tr>
+<tr><td>v7_phase1_lowlr_384 e5</td><td>384</td><td>flat 5e-5</td><td class="num">42.43</td><td class="num">58.46</td></tr>
+<tr><td>v7_phase1_lowlr_384 e8</td><td>384</td><td>flat 5e-5</td><td class="num">42.07</td><td class="num">58.50</td></tr>
+<tr class="warm"><td>v8 Meta-raw (no phase1)</td><td>&mdash;</td><td>&mdash;</td><td class="num">42.30 (ep11)</td><td class="num">58.42 (ep14)</td></tr>
+</tbody>
+</table>
+<p><b>Verdict:</b> Lowering LR doesn't recover the gap to the high-LR phase1. All early-warmup checkpoints (and Meta-raw itself) sit in the same ~42-45 F1 band on this 20-epoch probe &mdash; suggesting <b>the probe is saturated for this comparison</b>. The Meta-raw &laquo;much better&raquo; signal is likely only visible on the 130-epoch long-form probe schedule.</p>
+
+<h2>7 &middot; All checkpoints, sorted by best asformer val_f1</h2>
+
+<table>
+<thead><tr><th>Rank</th><th>Checkpoint</th><th class="num">val_f1</th><th class="num">val_acc</th><th class="num">triplet IVT mAP</th></tr></thead>
+<tbody>
+<tr class="best"><td>1</td><td>v5_lambda_off_e229</td><td class="num">47.11</td><td class="num">64.30</td><td class="num">&mdash;</td></tr>
+<tr><td>2</td><td>v2_e99</td><td class="num">46.44</td><td class="num">62.22</td><td class="num">&mdash;</td></tr>
+<tr><td>3</td><td>v4_lambda_off_e169</td><td class="num">46.09</td><td class="num">62.57</td><td class="num">0.117</td></tr>
+<tr><td>4</td><td>v5_lambda_off_e309</td><td class="num">45.92</td><td class="num">61.30</td><td class="num">&mdash;</td></tr>
+<tr><td>5</td><td>v2_e139</td><td class="num">45.90</td><td class="num">62.42</td><td class="num">&mdash;</td></tr>
+<tr><td>6</td><td>v2_e69</td><td class="num">45.89</td><td class="num">61.97</td><td class="num">&mdash;</td></tr>
+<tr><td>7</td><td>ngetty phase1_e12</td><td class="num">44.73</td><td class="num">60.21</td><td class="num">&mdash;</td></tr>
+<tr><td>8</td><td>v7_phase1_lowlr_384_e2</td><td class="num">42.64</td><td class="num">58.48</td><td class="num">&mdash;</td></tr>
+<tr><td>9</td><td>v7_phase1_lowlr_384_e5</td><td class="num">42.43</td><td class="num">58.46</td><td class="num">&mdash;</td></tr>
+<tr><td>10</td><td>v8 Meta-raw</td><td class="num">42.30</td><td class="num">58.42</td><td class="num">&mdash;</td></tr>
+<tr><td>11</td><td>v7_phase1_lowlr_384_e8</td><td class="num">42.07</td><td class="num">58.50</td><td class="num">&mdash;</td></tr>
+<tr><td>12</td><td>v3_ema_low</td><td class="num">40.17</td><td class="num">52.92</td><td class="num">0.083</td></tr>
+<tr class="bad"><td>13</td><td>v2_e189 (regression)</td><td class="num">36.12</td><td class="num">48.98</td><td class="num">&mdash;</td></tr>
+<tr class="bad"><td>14</td><td>v3_ema_high</td><td class="num">34.13</td><td class="num">50.98</td><td class="num">0.094</td></tr>
+<tr class="bad"><td>15</td><td>v3_ema_sched</td><td class="num">19.32</td><td class="num">35.33</td><td class="num">0.075</td></tr>
+<tr class="bad"><td>16</td><td>v4_lambda_low</td><td class="num">11.35</td><td class="num">31.88</td><td class="num">0.077</td></tr>
+<tr class="bad"><td>17</td><td>v4_lambda_immediate</td><td class="num">11.35</td><td class="num">31.88</td><td class="num">0.069</td></tr>
+</tbody>
+</table>
+
+<h2>8 &middot; Takeaways</h2>
+
+<ul>
+<li><b>Recipe fix:</b> set <code>lambda_progressive: false</code> and <code>lambda_value_vid: 0.0</code> in phase-2. The context loss as configured is actively harmful on this data scale.</li>
+<li><b>Best operating point:</b> phase-2 lambda_off pretrained to ~e229. Continued training beyond that mildly degrades probe-readable features.</li>
+<li><b>EMA is a weak knob:</b> alone it cannot rescue the &lambda; regression. Scheduled EMA introduces a separate resume-discontinuity bug.</li>
+<li><b>Probes agree on ranking</b> (asformer vs triplet) for the catastrophic variants, but both compress the differences at the &laquo;good&raquo; end of the scale.</li>
+<li><b>Phase-1 vs Meta-raw indistinguishable</b> on the 20-epoch asformer probe (~42-45 F1 band) &mdash; <b>BUT this was a probe bug, see &sect;9.</b></li>
+</ul>
+
+<h2>9 &middot; Probe-pipeline bug (root cause of the saturation)</h2>
+
+<p>The 20-epoch asformer probe was silently producing degraded encoder features on Aurora, capping every V-JEPA 2.1 backbone at ~42-47 F1. The Polaris reference (same Meta checkpoint) hit val_acc 78.68 / val_f1 71.78 on its 130-epoch run. Investigating this gap surfaced the bug.</p>
+
+<h3>9.1 &nbsp; Diff vs the Polaris reference probe</h3>
+
+<table>
+<thead><tr><th>Knob</th><th>Polaris (79 val_acc)</th><th>Our v2&hellip;v8 probes</th></tr></thead>
+<tbody>
+<tr><td><code>module_name</code></td><td><code>vit_encoder_multiclip</code> (v2.0)</td><td><code>vit_encoder_multiclip_v21</code> (v2.1)</td></tr>
+<tr><td><code>use_sdpa</code></td><td>false (default)</td><td><b>true</b></td></tr>
+<tr><td><code>num_epochs</code></td><td>130</td><td>20</td></tr>
+<tr><td><code>early_stop_patience</code></td><td>(none)</td><td>6</td></tr>
+<tr><td><code>batch_size</code></td><td>4 (Polaris A100)</td><td>4 (Aurora XPU)</td></tr>
+</tbody>
+</table>
+
+<h3>9.2 &nbsp; Bisection on raw Meta checkpoint (val numbers at same epoch)</h3>
+
+<table>
+<thead><tr><th>variant</th><th>wrapper</th><th>use_sdpa</th><th>bs</th><th class="num">val_f1 @ep1</th><th class="num">val_f1 @ep2</th><th class="num">val_f1 @ep3</th><th class="num">val_acc @ep3</th></tr></thead>
+<tbody>
+<tr class="bad"><td>v8</td><td>v2.1</td><td><b>true</b></td><td>4</td><td class="num">10.07</td><td class="num">24.39</td><td class="num">25.70</td><td class="num">41.33</td></tr>
+<tr class="warm"><td>v8d</td><td>v2.0</td><td>false</td><td>2</td><td class="num">32.55</td><td class="num">33.58</td><td class="num">43.82</td><td class="num">58.01</td></tr>
+<tr class="best"><td>v8e</td><td>v2.1</td><td>false</td><td>2</td><td class="num">45.45</td><td class="num">65.22</td><td class="num"><b>70.04</b></td><td class="num"><b>78.62</b></td></tr>
+<tr><td>Polaris ref</td><td>v2.0</td><td>false</td><td>4</td><td class="num">28.87</td><td class="num">36.18</td><td class="num">40.35</td><td class="num">53.05</td></tr>
+</tbody>
+</table>
+
+<p><b>Findings:</b></p>
+<ul>
+<li><b><code>use_sdpa: true</code> on Aurora XPU silently produces degraded encoder activations</b> for the V-JEPA 2.1 model. Same weights, same data, same head &mdash; sdpa-on gives ~10 F1 at ep1, sdpa-off gives ~32-45 F1 at ep1.</li>
+<li><b>v2.1 wrapper &gt; v2.0 wrapper</b> when both run with sdpa off. v8e (v2.1) reaches val_f1 70 at ep3; v8d (v2.0) needs ~7-8 epochs to get there.</li>
+<li><b>v8e at epoch 3 already matches Polaris's 130-epoch best</b> (val_acc 78.62 vs 78.68; val_f1 70.04 vs 71.78). The &laquo;20-epoch probe saturation&raquo; we'd attributed to the head was actually the sdpa bug.</li>
+</ul>
+
+<h3>9.3 &nbsp; Implications for the v2/v3/v4/v5/v6/v7 results</h3>
+
+<ul>
+<li>All those probes used <code>use_sdpa: true</code> with the v2.1 wrapper. Absolute F1 numbers were systematically depressed by ~15-25 points.</li>
+<li><b>Relative rankings within those grids remain valid</b> &mdash; all variants shared the same probe bias, so the ordering (e.g. <code>lambda_off</code> beats <code>lambda_low</code>, ema_low beats ema_sched) still holds.</li>
+<li><b>Absolute conclusions need to be re-measured.</b> Specifically: re-probing <code>v5_lambda_off_e229</code> with the fixed recipe (v2.1 + no-sdpa + bs=2) is the priority &mdash; in flight as v8f.</li>
+<li>The earlier &laquo;phase-2 plateau&raquo; and &laquo;saturation&raquo; verdicts may not hold once the probe can actually distinguish encoders.</li>
+</ul>
+
+<h3>9.4 &nbsp; Corrected probe recipe (going forward)</h3>
+
+<table>
+<thead><tr><th>Knob</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td><code>model_kwargs.module_name</code></td><td><code>evals.video_classification_frozen.modelcustom.vit_encoder_multiclip_v21</code></td></tr>
+<tr><td><code>model_kwargs.pretrain_kwargs.encoder.use_sdpa</code></td><td><b>false</b></td></tr>
+<tr><td><code>experiment.optimization.batch_size</code></td><td>2 (avoids XPU OOM in naive-attention path)</td></tr>
+<tr><td>per-head LRs</td><td>halved (linear-scale with batch: 5e-4 / 1.5e-4 / 5e-5)</td></tr>
+</tbody>
+</table>
+
+<h2>10 &middot; Where the encoder regression actually lives</h2>
+
+<p>With the corrected probe, we can finally measure the per-phase damage. Every surgical pretraining variant we&rsquo;ve tried regresses the encoder vs Meta-raw. Phase 1 is short and high-rate; phase 2 is long and low-rate. Both cost real F1.</p>
+
+<table>
+<thead><tr><th>Backbone</th><th class="num">best val_f1</th><th class="num">&Delta; vs Meta</th><th>Pretrain epochs</th><th class="num">F1 lost / epoch</th></tr></thead>
+<tbody>
+<tr class="best"><td>Meta-raw (no surgical pretrain)</td><td class="num">79.38</td><td class="num">&mdash;</td><td>&mdash;</td><td class="num">&mdash;</td></tr>
+<tr><td>phase1_lowlr_384 e2 (low LR, 2ep)</td><td class="num">75.79</td><td class="num">&minus;3.59</td><td>2</td><td class="num"><b>~1.80</b></td></tr>
+<tr><td>ngetty phase1_e12 (full warmup, 12ep)</td><td class="num">76.56</td><td class="num">&minus;2.82</td><td>12</td><td class="num">~0.24</td></tr>
+<tr class="bad"><td>lambda_off_e229 (12ep phase1 + 217ep phase2)</td><td class="num">54.91</td><td class="num">&minus;24.47</td><td>229</td><td class="num">~0.11 (amortized)</td></tr>
+</tbody>
+</table>
+
+<p><b>Reading the per-epoch column:</b> phase 1&rsquo;s damage rate is roughly an order of magnitude higher than phase 2&rsquo;s. Phase 1 only <i>looks</i> harmless because it stops at epoch 12. Phase 2&rsquo;s long horizon (200+ epochs) amasses cumulative damage despite a much lower per-epoch loss rate.</p>
+
+<p>Decomposition of the &minus;24.5 F1 total for <code>lambda_off_e229</code>:</p>
+<ul>
+<li>~&minus;3 F1 attributable to phase 1 (matches the standalone phase1 ckpts).</li>
+<li>~&minus;21 F1 from the additional 217 epochs of phase 2 (even with <code>lambda_off</code>).</li>
+</ul>
+
+<p><b>What this means going forward:</b></p>
+<ul>
+<li>Both phases regress the encoder. Earlier &laquo;phase 1 is harmless&raquo; framing was wrong &mdash; it&rsquo;s just bounded.</li>
+<li>To recover Meta-raw quality on this probe, either shorten/skip phase 1, or find a phase 1 recipe that actually <i>helps</i> (different LR/mask/EMA-init).</li>
+<li>Phase 2 needs a real fix beyond removing the context loss. Even the cleanest grid variant amasses ~21 F1 of damage over 200 epochs.</li>
+<li>Open question: <b>can JEPA on our surgical data ever beat the Meta init on this probe</b>, or is the data simply too narrow/redundant to add signal a frozen Meta backbone doesn&rsquo;t already capture? Worth a controlled experiment with the new probe.</li>
+</ul>
+
+<h2>11 &middot; Second probe-pipeline bug &mdash; sdpa layout in training</h2>
+
+<p>A separate one-line bug was found in <code>app/vjepa_2_1/models/utils/modules.py::_sdpa</code> (the helper used by both encoder and predictor during pretraining): an XPU-only path transposed q/k/v from <code>[B,H,N,D]</code> to <code>[B,N,H,D]</code> before calling <code>F.scaled_dot_product_attention</code>. SDPA always attends over dim &minus;2, so this made it attend over the 16 heads and treat the 2048 tokens as heads. Cosine similarity vs reference: 0.017 isolated, 0.49 through the full encoder. Patched 2026-06-23 14:38 UTC; the buggy path is now opt-in via <code>VJEPA_SDPA_BROKEN=1</code> for back-eval only.</p>
+
+<p>Implication: <b>every prior pretraining run (v2&hellip;v7 grids, all phase-1 / phase-2 chains) trained through scrambled attention.</b> Their encoder weights are tuned for an op that no longer exists in the eval path. The &sect;10 conclusion is therefore an artifact of train-vs-eval attention mismatch and is <b>retracted</b>.</p>
+
+<h3>11.1 &nbsp; Re-measured under the fix</h3>
+
+<p>Phase 1 retrained from Meta-init under the corrected <code>_sdpa</code> (otherwise identical recipe to <code>phase1_lowlr_384</code>: crop 384, bs 2, flat LR 5e&minus;5, baseline mask families, 3 epochs). Probed with the corrected probe recipe (v2.1 wrapper, <code>use_sdpa: false</code>, bs 2, halved LRs).</p>
+
+<table>
+<thead><tr><th>Backbone</th><th>Pretrain epochs</th><th class="num">best val_f1 (ep)</th><th class="num">best val_acc (ep)</th><th class="num">&Delta; vs Meta</th></tr></thead>
+<tbody>
+<tr class="best"><td>Meta-raw (no surgical pretrain)</td><td>&mdash;</td><td class="num">79.38 (14)</td><td class="num">84.99 (16)</td><td class="num">&mdash;</td></tr>
+<tr><td>phase1_baseline_v0 e2 (3 ep, fixed sdpa)</td><td>3</td><td class="num">78.87 (14)</td><td class="num">85.83 (14)</td><td class="num">&minus;0.51</td></tr>
+<tr><td>phase1_baseline_v0 e1 (1 ep, fixed sdpa)</td><td>1</td><td class="num">78.80 (14)</td><td class="num">85.47 (14)</td><td class="num">&minus;0.58</td></tr>
+<tr class="bad"><td>lambda_off e229 (broken-sdpa-trained, fixed-sdpa-evaluated)</td><td>229</td><td class="num">54.91 (20)</td><td class="num">66.71 (16)</td><td class="num">&minus;24.47</td></tr>
+</tbody>
+</table>
+
+<h3>11.2 &nbsp; Conclusions (using &sect;10's framing)</h3>
+<ul>
+<li><b>Phase 1 with fixed sdpa is neutral, not harmful.</b> 1 and 3 epochs both land within &plusmn;0.6 F1 of Meta-raw &mdash; run-to-run noise. The &sect;10 &laquo;~1.8 F1 lost / epoch&raquo; figure was the broken-sdpa artifact.</li>
+<li><b>The lambda_off &minus;24.5 F1 gap is also an artifact.</b> It measures the cost of evaluating broken-sdpa-trained weights with the fixed op, not a real encoder regression.</li>
+<li><b>Phase 2 has not yet been re-measured under the fix.</b> Until a fixed-sdpa phase 2 run lands, &laquo;phase 2 hurts the encoder&raquo; remains an open question, not a confirmed finding.</li>
+<li>Open question shifts: does JEPA on surgical data <i>help</i> (not just &laquo;not hurt&raquo;) under correct attention? Currently testing <code>phase1_surgvu03</code> (surgvu24 weight 1.0 &rarr; 0.3, otherwise identical to <code>phase1_baseline_v0</code>) for a first signal on whether dataset rebalancing nudges phase 1 above the Meta-raw ceiling.</li>
+</ul>
+
+</body>
+</html>

@@ -48,3 +48,5 @@ core.*
 .*_staging/
 *.stock_backup
 dataset_table_content.txt
+# Large reference PDFs (papers) — keep out of the repo
+docs/vjepa2.1.pdf
