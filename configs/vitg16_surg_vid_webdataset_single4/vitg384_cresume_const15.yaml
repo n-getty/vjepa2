@@ -18,7 +18,7 @@ data:
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_robotic
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgtoolloc2022
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvisdom
-  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvu24
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvu24_clean
   datasets_weights:
   - 1
   - 1
