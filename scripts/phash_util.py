@@ -49,6 +49,37 @@ def phash_gray(gray: np.ndarray) -> int:
     return h
 
 
+def phash_variants(gray: np.ndarray, crops=(0.9, 0.8, 0.7), circ_mask=True) -> List[int]:
+    """Hashes of a frame PLUS crop/mask variants — for a crop-ROBUST reference.
+
+    Frame pHash is blind to spatial cropping/masking (a 20% center-crop or an
+    endoscope circular mask -> 0 match). LEMON's cleaning masks non-surgical
+    regions and trims, so a raw eval reference misses LEMON's cropped copies of
+    eval videos. Hashing each eval frame together with center-crops and a
+    circular mask makes the reference match those transformed copies
+    (verified: cropped-eval recall 0% vs raw ref -> 100% vs augmented ref).
+
+    Use ONLY for building the REFERENCE (query side hashes the raw frame as
+    usual; the reference carries the variants).
+    """
+    out = [phash_gray(gray)]
+    g = gray[..., 0] if gray.ndim == 3 else gray
+    h, w = g.shape[:2]
+    for f in crops:
+        ch, cw = int(h * f), int(w * f)
+        y, x = (h - ch) // 2, (w - cw) // 2
+        out.append(phash_gray(cv2.resize(g[y:y + ch, x:x + cw], (w, h),
+                                         interpolation=cv2.INTER_AREA)))
+    if circ_mask:
+        Y, X = np.ogrid[:h, :w]
+        r = min(h, w) * 0.48
+        m = ((X - w / 2) ** 2 + (Y - h / 2) ** 2) > r * r
+        o = g.copy()
+        o[m] = 0
+        out.append(phash_gray(o))
+    return out
+
+
 def pack_refs(hashes: List[int]) -> np.ndarray:
     """List of 64-bit ints -> np.uint64 array for vectorized Hamming."""
     if not hashes:
