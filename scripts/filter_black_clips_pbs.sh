@@ -22,8 +22,12 @@
 set -eo pipefail
 
 ROOT=/lus/flare/projects/ModCon/ngetty/vjepa2
-INPUT=/flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvu24
-OUTPUT=/flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvu24_clean
+RESHARD_ROOT=/flare/ModCon/ngetty/data/surg_vid_webdataset_resharded
+# DATASET selects which source to filter; defaults to surgvu24 (original use).
+# Override for the segmented sources: qsub -v DATASET=cholec80 ... / DATASET=grasp
+DATASET="${DATASET:-surgvu24}"
+INPUT="$RESHARD_ROOT/$DATASET"
+OUTPUT="$RESHARD_ROOT/${DATASET}_clean"
 PYTHON=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python
 NPROC=48
 
