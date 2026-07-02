@@ -77,17 +77,20 @@ def dup_fraction(cands: List[int], ref: np.ndarray, match_bits: int = MATCH_BITS
     return n_match / len(cands)
 
 
-def sample_gray_frames(path_or_file, n: int = 48) -> List[np.ndarray]:
+def sample_gray_frames(path_or_file, n: int = 48, seek: bool = True,
+                       max_decode: int = 2048) -> List[np.ndarray]:
     """Decode ~n grayscale frames spread across a video.
 
-    Seeks to n evenly-spaced timestamps and decodes one frame at each (cheap:
-    no full decode). Falls back to sequential decode when duration is unknown.
-    Accepts a filesystem path or a file-like object (e.g. tarfile.extractfile).
-    Raises on a genuinely unreadable/corrupt stream — the caller treats an
-    exception (or an empty return) as "corrupt, skip".
+    seek=True  (default, for LONG clips e.g. 60s LEMON/staged): seek to n
+      evenly-spaced timestamps and decode one frame at each (cheap, avoids
+      full decode).
+    seek=False (for SHORT clips e.g. 4s eval windows): decode sequentially up
+      to max_decode frames, then subsample n evenly-spaced. Faster than n seeks
+      on a tiny clip and gives dense, deterministic coverage.
 
-    Import av lazily so importing this module doesn't require PyAV (build step
-    that only hashes still works; sampling needs the frameworks env).
+    Accepts a filesystem path or a file-like object (tarfile.extractfile).
+    Raises on a genuinely unreadable/corrupt stream — the caller treats an
+    exception (or an empty return) as "corrupt, skip". av imported lazily.
     """
     import av
 
@@ -104,7 +107,7 @@ def sample_gray_frames(path_or_file, n: int = 48) -> List[np.ndarray]:
         if (total_s is None or total_s <= 0) and c.duration:
             total_s = float(c.duration) / 1_000_000.0  # AV_TIME_BASE microseconds
 
-        if total_s and total_s > 1.0 and vs.time_base:
+        if seek and total_s and total_s > 1.0 and vs.time_base:
             for i in range(n):
                 t = total_s * (i + 0.5) / n
                 ts = int(t / float(vs.time_base))
@@ -116,11 +119,17 @@ def sample_gray_frames(path_or_file, n: int = 48) -> List[np.ndarray]:
                 except Exception:
                     continue
         else:
-            # Unknown/short duration: decode sequentially and keep up to n frames.
+            # Sequential: decode (capped) then subsample n evenly-spaced.
+            buf = []
             for fr in c.decode(vs):
-                frames.append(fr.to_ndarray(format="gray"))
-                if len(frames) >= n:
+                buf.append(fr.to_ndarray(format="gray"))
+                if len(buf) >= max_decode:
                     break
+            if len(buf) <= n:
+                frames = buf
+            else:
+                idx = [int(len(buf) * (i + 0.5) / n) for i in range(n)]
+                frames = [buf[j] for j in idx]
     finally:
         c.close()
     return frames
