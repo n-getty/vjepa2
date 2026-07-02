@@ -76,10 +76,14 @@ def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--dataset", required=True, choices=["cholec80", "grasp", "lemon"])
+    p.add_argument("--dataset", required=True,
+                   choices=["cholec80", "grasp", "lemon", "heichole", "multibypass140",
+                            "gynsurg", "lapgyn6_events"])
     p.add_argument("--archive", default=None, help="Source zip (cholec80) or tar.gz (grasp).")
+    p.add_argument("--archives", default=None, nargs="+",
+                   help="multibypass140/gynsurg/lapgyn6_events: one or more source zips.")
     p.add_argument("--input-dir", default=None,
-                   help="lemon: directory of loose *.mp4 files (used instead of --archive).")
+                   help="lemon/heichole: directory of loose *.mp4 files (used instead of --archive).")
     p.add_argument("--output-staging", required=True, help="Dir for per-source *.tar (created).")
     p.add_argument("--tmpdir", default="/tmp/segwork", help="Scratch for extracted source videos.")
     p.add_argument("--segment-seconds", type=float, default=60.0)
@@ -219,8 +223,77 @@ def segment_one(src_path, source_name, dataset, out_tar, seg_s, min_s, source_re
     return n_clips, n_dropped
 
 
+def _clip_duration_s(src_path):
+    """Return the video duration in seconds (best-effort), or None."""
+    try:
+        c = av.open(src_path)
+    except Exception:
+        return None
+    try:
+        v = c.streams.video[0]
+        if v.duration is not None and v.time_base is not None:
+            return float(v.duration * v.time_base)
+        if c.duration is not None:
+            return float(c.duration) / 1e6  # AV_TIME_BASE
+    except (IndexError, KeyError):
+        return None
+    finally:
+        c.close()
+    return None
+
+
+def passthrough_one(src_path, source_name, dataset, out_tar, min_s, source_ref=None,
+                    extra=None):
+    """Emit a PRE-CUT clip as a single sample (no re-segmentation).
+
+    GynSurg / LapGyn6-Events ship as already-short action/event clips. We keep
+    each as one clip, dropping those shorter than min_s (V-JEPA needs >=4s for a
+    16f@4fps window). Stream-copy remux so PTS/DTS are rebased to ~0 (decord's
+    get_avg_fps/seek expect this), matching what segment_one produces. Returns
+    (n_clips in {0,1}, n_dropped_short in {0,1}).
+    """
+    dur = _clip_duration_s(src_path)
+    if dur is not None and dur < min_s:
+        return 0, 1
+    inp = av.open(src_path)
+    try:
+        vs = inp.streams.video[0]
+    except (IndexError, KeyError):
+        inp.close()
+        return 0, 0
+    buf = io.BytesIO()
+    out = av.open(buf, mode="w", format="mp4")
+    ostream = out.add_stream_from_template(vs)
+    start_dts = None
+    npkts = 0
+    for pkt in inp.demux(vs):
+        if pkt.dts is None or pkt.pts is None:
+            continue
+        if start_dts is None:
+            start_dts = pkt.dts
+        pkt.stream = ostream
+        pkt.pts = pkt.pts - start_dts
+        pkt.dts = pkt.dts - start_dts
+        try:
+            out.mux(pkt)
+        except Exception:
+            continue
+        npkts += 1
+    out.close()
+    inp.close()
+    if npkts == 0:
+        return 0, 0
+    data = buf.getvalue()
+    key = f"{dataset}__{source_name}_clip_0000"
+    _add_bytes(out_tar, f"{key}.mp4", data)
+    jb, cb = _sidecars(key, dataset, source_ref or src_path, extra=extra)
+    _add_bytes(out_tar, f"{key}.json", jb)
+    _add_bytes(out_tar, f"{key}.cls", cb)
+    return 1, 0
+
+
 def _process_source(video_bytes, source_name, args, out_dir, source_ref,
-                    extra=None, gate=None):
+                    extra=None, gate=None, mode="segment"):
     """Write one source video's bytes to tmp, segment into its own per-source tar.
 
     source_ref is the STABLE provenance string recorded in each clip's .json
@@ -264,9 +337,14 @@ def _process_source(video_bytes, source_name, args, out_dir, source_ref,
     tmp_tar = out_tar_path + ".tmp"
     try:
         with tarfile.open(tmp_tar, "w") as out:
-            n_clips, n_drop = segment_one(tmp_vid, source_name, dataset, out,
-                                          args.segment_seconds, args.min_clip_seconds,
-                                          source_ref=source_ref, extra=extra)
+            if mode == "passthrough":
+                n_clips, n_drop = passthrough_one(tmp_vid, source_name, dataset, out,
+                                                  args.min_clip_seconds,
+                                                  source_ref=source_ref, extra=extra)
+            else:
+                n_clips, n_drop = segment_one(tmp_vid, source_name, dataset, out,
+                                              args.segment_seconds, args.min_clip_seconds,
+                                              source_ref=source_ref, extra=extra)
     except Exception as e:
         if os.path.exists(tmp_tar):
             os.remove(tmp_tar)
@@ -412,6 +490,121 @@ def run_lemon(args, out_dir):
     return results, (lo, hi)
 
 
+def run_heichole(args, out_dir):
+    """HeiChole: a directory of loose full-procedure HD mp4s -> 60s segments.
+
+    Same shape as run_lemon but no pHash gate (distinct source, not YouTube) and
+    segment (not passthrough) mode since these are full ~30-40min procedures.
+    """
+    input_dir = args.input_dir or args.archive
+    if not input_dir or not os.path.isdir(input_dir):
+        raise SystemExit(f"heichole: --input-dir must be a directory (got {input_dir!r})")
+    vids = sorted(f for f in os.listdir(input_dir) if f.lower().endswith(VIDEO_EXTS))
+    lo = args.video_start if args.video_start is not None else 0
+    hi = args.video_end if args.video_end is not None else len(vids)
+    hi = min(hi, len(vids))
+    sel = vids[lo:hi]
+    if args.max_videos is not None:
+        sel = sel[:args.max_videos]
+    print(f"[heichole] {len(vids)} videos total; processing [{lo}:{hi}) -> {len(sel)}", flush=True)
+    results = []
+    for fn in sel:
+        source_name = _sanitize(os.path.splitext(fn)[0])  # HeiChole1
+        src_path = os.path.join(input_dir, fn)
+        with open(src_path, "rb") as f:
+            data = f.read()
+        r = _process_source(data, source_name, args, out_dir, os.path.abspath(src_path))
+        if r:
+            results.append(r)
+    return results, (lo, hi)
+
+
+def run_multibypass140(args, out_dir):
+    """MultiBypass140: nested zips, <center>/videos/<ID>.mp4 -> 60s segments.
+
+    Fan-out is per-ARCHIVE (pass one --archives entry per worker) since a single
+    zip is seekable but the set is large. Center prefix kept in source_name so
+    Bern/Stras IDs never collide.
+    """
+    archives = args.archives or ([args.archive] if args.archive else [])
+    if not archives:
+        raise SystemExit("multibypass140: pass --archives <zip> [<zip> ...]")
+    results = []
+    n_done = 0
+    for arc in archives:
+        zf = zipfile.ZipFile(arc)
+        vids = sorted(n for n in zf.namelist()
+                      if n.lower().endswith(VIDEO_EXTS) and "/videos/" in n.lower()
+                      and not n.endswith("/"))
+        print(f"[multibypass140] {os.path.basename(arc)}: {len(vids)} videos", flush=True)
+        for zpath in vids:
+            if args.max_videos is not None and n_done >= args.max_videos:
+                break
+            parts = zpath.replace("\\", "/").split("/")
+            stem = os.path.splitext(parts[-1])[0]           # BBP01
+            center = parts[-3] if len(parts) >= 3 else ""    # BernBypass70
+            source_name = _sanitize(f"{center}_{stem}" if center else stem)
+            data = zf.read(zpath)
+            source_ref = f"{os.path.abspath(arc)}::{zpath}"
+            r = _process_source(data, source_name, args, out_dir, source_ref)
+            if r:
+                results.append(r)
+            n_done += 1
+        zf.close()
+        if args.max_videos is not None and n_done >= args.max_videos:
+            break
+    return results, (0, len(results))
+
+
+def run_preclip_zip(args, out_dir):
+    """GynSurg / LapGyn6-Events: zip(s) of PRE-CUT action/event clips.
+
+    Each clip becomes ONE sample (passthrough mode) — no re-segmentation — with a
+    min-length filter (drop <min_clip_seconds; default 8s but pass 4.0 for these).
+    Every clip is its own 'source' (unique name from its zip path + running index)
+    so reshard shuffles them across shards. Range fan-out is over the flat sorted
+    clip list so multiple workers can split one big zip.
+    """
+    archives = args.archives or ([args.archive] if args.archive else [])
+    if not archives:
+        raise SystemExit(f"{args.dataset}: pass --archives <zip> [<zip> ...]")
+    # Build the flat (archive, member) list across all archives, sorted for stable ranges.
+    entries = []
+    for arc in archives:
+        zf = zipfile.ZipFile(arc)
+        for n in sorted(zf.namelist()):
+            if n.lower().endswith(VIDEO_EXTS) and not n.endswith("/"):
+                entries.append((arc, n))
+        zf.close()
+    lo = args.video_start if args.video_start is not None else 0
+    hi = args.video_end if args.video_end is not None else len(entries)
+    hi = min(hi, len(entries))
+    sel = entries[lo:hi]
+    if args.max_videos is not None:
+        sel = sel[:args.max_videos]
+    print(f"[{args.dataset}] {len(entries)} clips total; processing [{lo}:{hi}) -> {len(sel)}",
+          flush=True)
+    # Open each archive once (cache handles).
+    zcache = {}
+    results = []
+    for idx, (arc, member) in enumerate(sel, start=lo):
+        zf = zcache.get(arc)
+        if zf is None:
+            zf = zcache[arc] = zipfile.ZipFile(arc)
+        stem = os.path.splitext(os.path.basename(member))[0]
+        # URL-encoded timestamps (%3A) + running index -> unique, reshard-safe.
+        source_name = f"{_sanitize(stem)}_{idx:06d}"
+        data = zf.read(member)
+        source_ref = f"{os.path.abspath(arc)}::{member}"
+        r = _process_source(data, source_name, args, out_dir, source_ref,
+                            mode="passthrough")
+        if r:
+            results.append(r)
+    for zf in zcache.values():
+        zf.close()
+    return results, (lo, hi)
+
+
 def main():
     args = parse_args()
     out_dir = args.output_staging
@@ -423,6 +616,12 @@ def main():
         results, rng = run_cholec80(args, out_dir)
     elif args.dataset == "grasp":
         results, rng = run_grasp(args, out_dir)
+    elif args.dataset == "heichole":
+        results, rng = run_heichole(args, out_dir)
+    elif args.dataset == "multibypass140":
+        results, rng = run_multibypass140(args, out_dir)
+    elif args.dataset in ("gynsurg", "lapgyn6_events"):
+        results, rng = run_preclip_zip(args, out_dir)
     else:
         results, rng = run_lemon(args, out_dir)
 

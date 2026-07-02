@@ -1,0 +1,246 @@
+# =============================================================================
+# ViT-g 384 cooldown (64f) — IMAGE-BRANCH A/B  [DRAFT TEMPLATE]
+# =============================================================================
+# Variant of vitg384_cooldown_64f.yaml that adds an `img_data`/`img_mask` image
+# branch to test whether mixing surgical STILLS into cooldown lifts SPATIAL /
+# per-frame downstream tasks (CholecT50 triplet, SAR-RARP50 per-frame metrics).
+#
+# A/B = this file (image branch ON) vs vitg384_cooldown_64f.yaml (OFF). Same
+# init checkpoint (e19), same steps, same video mix. Only difference = img_data.
+# Compare the triplet probe (per-frame task) between the two cooldown outputs.
+#
+# ---------------------------------------------------------------------------
+# ⚠️ TWO THINGS MUST HAPPEN BEFORE THIS RUNS:
+#
+# 1. PACK THE IMAGE SETS INTO IMAGE-WEBDATASET TARS.
+#    The WebDataset loader (src/datasets/webdataset.py:321) already handles image
+#    tars natively — it detects image.jpg/png members, decodes, and repeats the
+#    frame to fpc (min_clip_std is auto-skipped for images). So each image source
+#    must be packed as tars of {<key>.jpg, <key>.json:{"label":0,...}} under
+#    surg_vid_webdataset_resharded/<name>_img/. Sources to pack (4):
+#    hyperkvasir (23-class GI), dsad (rectal anatomy), esad + psi_ava (robotic
+#    prostatectomy). CholecSeg8k is NOT packed (Cholec80-frame redundancy; see
+#    img_data below). Unpack zips -> flatten images -> pack (reuse
+#    scripts/segment_videos_to_wds.py's tar writer / a small packer).
+#
+# 2. VERIFY THE RANK/BATCH MATH FITS MEMORY (see optimization note below).
+# ---------------------------------------------------------------------------
+#
+# RANK/BATCH MATH (train.py:236-274) — this is the load-bearing constraint:
+#   img_world  = int(world_size * rank_ratio)     # ranks that do images
+#   vid_world  = world_size - img_world            # ranks that do video
+#   per_vid_rank_batch = data.batch_size * world_size / vid_world   # must be int
+#   per_img_rank_batch = img_data.batch_size                        # as-set
+#   also required: (img_data.batch_size * world_size) % img_world == 0
+#
+#   At world_size=192 (16 nodes x 12): the ONLY way to keep divisibility with an
+#   image branch forces per_vid_rank_batch >= 2 (you cannot get back to the
+#   baseline's bs=1 once any ranks leave the video pool — vid_world/world_size is
+#   never an integer reciprocal). With rank_ratio: 0.5 and data.batch_size: 1 you
+#   get per_vid_rank_batch = 1*192/96 = 2. That is 2x the baseline 64f video
+#   memory per rank. 64f@384 ViT-g baseline runs bs=1 deliberately, so THIS DOUBLES
+#   IT — smoke-test for OOM on 12 tiles before a full run (activation checkpointing
+#   is already on, which helps). Images are single-frame 2D so per_img_rank_batch
+#   can be large and cheap (8 here).
+#
+#   >>> If the 2x video memory OOMs, run the A/B at the 16f pretrain resolution
+#       instead (vitg384_resume_16f.yaml already uses bs=2/rank — an image branch
+#       there needs no memory increase). Spatial signal during main pretraining is
+#       arguably a stronger lever than during a short cooldown anyway.
+# =============================================================================
+app: vjepa_2_1
+nodes: 16
+tasks_per_node: 12
+cpus_per_task: 16
+mem_per_gpu: 40G
+folder: /flare/ModCon/ngetty/checkpoints/surg_2_1_vitg384_cooldown/vitg384_cd64f_imgbranch
+data:
+  num_clips: 10
+  dataset_type: WebDataset
+  datasets:
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/small_surg
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/kinetics400
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/sitl
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_robotic
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgtoolloc2022
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvu24_clean
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/grasp
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/cholec80
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/sitl_2026
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/lemon
+  datasets_weights:
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  sampling_temperature: 0.5
+  min_clip_std: 1.0
+  # per_vid_rank_batch = 1 * 192 / 96 = 2  (with rank_ratio 0.5). See header.
+  batch_size: 1
+  crop_size: 384
+  patch_size: 16
+  dataset_fpcs:
+  - 64
+  - 64
+  - 64
+  - 64
+  - 64
+  - 64
+  - 64
+  - 64
+  - 64
+  - 64
+  tubelet_size: 2
+  fps: 4
+  num_workers: 2
+  persistent_workers: true
+  pin_mem: true
+# -----------------------------------------------------------------------------
+# IMAGE BRANCH. Single-frame surgical stills packed as image-WebDataset tars.
+# dataset_type: WebDataset (our loader handles image tars); NOT upstream's
+# VideoDataset+CSV path. dataset_fpcs MUST be [1] and tubelet_size is forced to 1
+# for image ranks (train.py:262). rank_ratio 0.5 chosen for batch divisibility
+# at world_size=192 (see header). Start with equal weights; the anatomy/mask sets
+# (dsad, cholecseg8k) are the most on-target for the spatial gap.
+# -----------------------------------------------------------------------------
+img_data:
+  dataset_type: WebDataset
+  # CholecSeg8k deliberately EXCLUDED: its images are Cholec80 frames (we already
+  # hold all of Cholec80 as video) -> zero new pixels for SSL pretraining. Its only
+  # value is the 13-class dense masks, which the image branch never consumes. Kept
+  # on disk (cholecseg8k/) as a future segmentation-PROBE set, not packed here.
+  datasets:
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/hyperkvasir_img
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/dsad_img
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/esad_img
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/psi_ava_img
+  datasets_weights:
+  - 1
+  - 1
+  - 1
+  - 1
+  sampling_temperature: 0.5
+  # per_img_rank_batch = 8 (single-frame 2D, cheap). img_total = 8*192 = 1536,
+  # 1536 % img_world(96) == 0 ✓
+  batch_size: 8
+  crop_size: 384
+  dataset_fpcs:
+  - 1
+  rank_ratio: 0.5
+  num_workers: 2
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+loss:
+  loss_exp: 1.0
+  predict_all: true
+  shift_by_n: 0
+  weight_distance_loss: false
+mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 8
+  spatial_scale:
+  - 0.15
+  - 0.15
+  temporal_scale:
+  - 1.0
+  - 1.0
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 2
+  spatial_scale:
+  - 0.7
+  - 0.7
+  temporal_scale:
+  - 1.0
+  - 1.0
+# -----------------------------------------------------------------------------
+# IMAGE MASK: spatial-only (temporal_scale [1,1], single frame). Mirrors Meta's
+# 2.1 image-branch mask (configs/train_2_1/vitG16/*): num_blocks 10, spatial 0.15.
+# -----------------------------------------------------------------------------
+img_mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 10
+  spatial_scale:
+  - 0.15
+  - 0.15
+  temporal_scale:
+  - 1.0
+  - 1.0
+meta:
+  context_encoder_key: encoder
+  dtype: bfloat16
+  eval_freq: 1000000000
+  load_checkpoint: true
+  load_predictor: true
+  pretrain_checkpoint: /flare/ModCon/ngetty/checkpoints/surg_2_1_vitg384_cleandata/vitg384_n16g12_weak/e19.pth.tar
+  read_checkpoint: null
+  save_every_freq: 5
+  seed: 239
+  target_encoder_key: target_encoder
+  use_sdpa: true
+model:
+  has_cls_first: false
+  img_temporal_dim_size: 1
+  interpolate_rope: true
+  is_causal: false
+  # lambda_value_img selects the image-branch loss lambda (train.py:282). Match
+  # the video lambda to weight both objectives equally; tune if images dominate.
+  lambda_value_img: 0.5
+  lambda_value_vid: 0.5
+  lambda_start_iter: 0
+  lambda_end_iter: 1
+  modality_embedding: true
+  model_name: vit_giant_xformers
+  n_registers: 0
+  n_registers_predictor: 0
+  normalize_predictor: false
+  pred_depth: 24
+  pred_embed_dim: 384
+  pred_is_causal: false
+  pred_num_heads: 12
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_mask_tokens: true
+  use_rope: true
+  zero_init_mask_tokens: true
+optimization:
+  ema:
+  - 0.99925
+  - 0.99925
+  epochs: 20
+  final_lr: 1.0e-06
+  final_weight_decay: 0.04
+  ipe: 150
+  ipe_scale: 1.0
+  lr: 7.5e-05
+  start_lr: 7.5e-05
+  warmup: 0.0
+  weight_decay: 0.04

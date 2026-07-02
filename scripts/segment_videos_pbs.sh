@@ -75,6 +75,68 @@ case "$DATASET" in
         --output-staging "$STAGING" --tmpdir "/tmp/segwork_grasp" \
         > "$STAGING/_worker_serial.log" 2>&1
     ;;
+  heichole)
+    # 24 loose full-procedure HD mp4s -> 60s segments. Seekable dir -> fan by range.
+    DIR="$INCOMING/heichole/full_hd"
+    NVID=$(ls "$DIR"/*.mp4 2>/dev/null | wc -l)
+    echo "heichole videos: $NVID; fanning $NPROC workers"
+    CHUNK=$(( (NVID + NPROC - 1) / NPROC ))
+    pids=()
+    for (( lo=0; lo<NVID; lo+=CHUNK )); do
+      hi=$(( lo + CHUNK )); (( hi > NVID )) && hi=$NVID
+      log="$STAGING/_worker_${lo}_${hi}.log"
+      "$PYTHON" "$ROOT/scripts/segment_videos_to_wds.py" \
+          --dataset heichole --input-dir "$DIR" \
+          --output-staging "$STAGING" --tmpdir "/tmp/segwork_${lo}" \
+          --video-start "$lo" --video-end "$hi" > "$log" 2>&1 &
+      pids+=($!)
+    done
+    fail=0; for pid in "${pids[@]}"; do wait "$pid" || fail=$((fail+1)); done
+    echo "heichole workers done, failed=$fail"; (( fail > 0 )) && { echo "see $STAGING/_worker_*.log" >&2; exit 1; }
+    ;;
+  multibypass140)
+    # 6 zips (4 video + 2 label). Fan ONE worker per video zip (each is seekable
+    # but ~85GB; per-archive parallelism avoids one worker reading all 365GB).
+    ZIPS=( "$INCOMING/multibypass140/multibypass01_corrected.zip" \
+           "$INCOMING/multibypass140/multibypass02.zip" \
+           "$INCOMING/multibypass140/multibypass04.zip" \
+           "$INCOMING/multibypass140/multibypass05.zip" )
+    echo "multibypass140: ${#ZIPS[@]} video zips, one worker each"
+    pids=()
+    for i in "${!ZIPS[@]}"; do
+      log="$STAGING/_worker_zip${i}.log"
+      "$PYTHON" "$ROOT/scripts/segment_videos_to_wds.py" \
+          --dataset multibypass140 --archives "${ZIPS[$i]}" \
+          --output-staging "$STAGING" --tmpdir "/tmp/segwork_mbp${i}" \
+          --segment-seconds 60 --min-clip-seconds 8 > "$log" 2>&1 &
+      pids+=($!)
+    done
+    fail=0; for pid in "${pids[@]}"; do wait "$pid" || fail=$((fail+1)); done
+    echo "multibypass140 workers done, failed=$fail"; (( fail > 0 )) && { echo "see $STAGING/_worker_*.log" >&2; exit 1; }
+    ;;
+  gynsurg|lapgyn6_events)
+    # Pre-cut clips -> passthrough (one clip = one sample), min 4s (16f@4fps).
+    # Fan workers over the flat clip-index range within the single segments zip.
+    case "$DATASET" in
+      gynsurg)        ARCHIVE="$INCOMING/gynsurg/GynSurg_Action_Segments.zip" ;;
+      lapgyn6_events) ARCHIVE="$INCOMING/lapgyn6_events/Event_Segments_LapGyn_dataset.zip" ;;
+    esac
+    NCLIP=$("$PYTHON" -c "import zipfile;z=zipfile.ZipFile('$ARCHIVE');print(sum(1 for n in z.namelist() if n.lower().endswith(('.mp4','.avi','.mov','.mkv','.m4v')) and not n.endswith('/')))")
+    echo "$DATASET clips: $NCLIP; fanning $NPROC workers (passthrough, min 4s)"
+    CHUNK=$(( (NCLIP + NPROC - 1) / NPROC ))
+    pids=()
+    for (( lo=0; lo<NCLIP; lo+=CHUNK )); do
+      hi=$(( lo + CHUNK )); (( hi > NCLIP )) && hi=$NCLIP
+      log="$STAGING/_worker_${lo}_${hi}.log"
+      "$PYTHON" "$ROOT/scripts/segment_videos_to_wds.py" \
+          --dataset "$DATASET" --archives "$ARCHIVE" \
+          --output-staging "$STAGING" --tmpdir "/tmp/segwork_${lo}" \
+          --video-start "$lo" --video-end "$hi" --min-clip-seconds 4 > "$log" 2>&1 &
+      pids+=($!)
+    done
+    fail=0; for pid in "${pids[@]}"; do wait "$pid" || fail=$((fail+1)); done
+    echo "$DATASET workers done, failed=$fail"; (( fail > 0 )) && { echo "see $STAGING/_worker_*.log" >&2; exit 1; }
+    ;;
   *) echo "unknown DATASET=$DATASET" >&2; exit 2 ;;
 esac
 
