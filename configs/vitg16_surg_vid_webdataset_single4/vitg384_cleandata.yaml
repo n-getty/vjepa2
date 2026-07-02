@@ -58,7 +58,15 @@ data:
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_robotic
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgtoolloc2022
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvu24_clean
+  # New video-native adds (segmented from raw full-procedure video this session):
+  # grasp = robotic prostatectomy (1988 clips, modality-matched to our evals),
+  # cholec80 = laparoscopic chole 25fps (2916 clips, domain-broadening). Weight 1
+  # like the other sources; sqrt-size temperature sampling handles their scale.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/grasp
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/cholec80
   datasets_weights:
+  - 1
+  - 1
   - 1
   - 1
   - 1
@@ -74,6 +82,8 @@ data:
   crop_size: 384
   patch_size: 16
   dataset_fpcs:
+  - 16
+  - 16
   - 16
   - 16
   - 16
