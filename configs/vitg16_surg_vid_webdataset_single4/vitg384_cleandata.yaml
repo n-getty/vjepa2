@@ -69,7 +69,16 @@ data:
   # existing `sitl` (older segmentation) per user decision, weight 1. Owner-only
   # perms on disk (protected data). Fills the 64f cooldown window like grasp/cholec80.
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/sitl_2026
+  # lemon = LEMON/Surg-3M (arXiv 2503.19740): 4194 YouTube surgical videos
+  # segmented -> 53650 clips across 35 procedure types (2527 lap + 1667 robotic),
+  # the big procedure-diversity broadening. Already cleaned by LEMON's pipeline
+  # (static/out-of-body removed) so our black filter is a no-op here (0% dropped,
+  # like grasp/cholec80). pHash-DEDUPED vs eval + surgenet_robotic: dropped 3
+  # (1 eval-leak @12.5%, 2 train-dup) with 100% eval self-recall, so the triplet
+  # eval is protected from leakage. Weight 1 like every other source. Owner-only.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/lemon
   datasets_weights:
+  - 1
   - 1
   - 1
   - 1
@@ -88,6 +97,7 @@ data:
   crop_size: 384
   patch_size: 16
   dataset_fpcs:
+  - 16
   - 16
   - 16
   - 16

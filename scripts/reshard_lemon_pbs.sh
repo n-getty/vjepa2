@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Reshard LEMON staging (per-source tars from segment_lemon_pbs.sh) into the
-# loader-ready WebDataset format: fine shards + metadata.json. Reuses the
-# generic scripts/reshard_webdataset.py (source-aware shuffle across the many
-# lemon__<youtubeId> source tars). CPU/IO only.
+# Reshard LEMON staging -> loader-ready fine shards, PARALLEL (the serial
+# scripts/reshard_webdataset.py walltime-killed on 4162 tars / ~1.9 TB: its
+# single-threaded index-then-write can't fit 1h). Fan N workers over disjoint
+# source-tar subsets; each writes its own lemon-wII-*.tar shards; finalize
+# merges metadata. See scripts/reshard_lemon_parallel.py.
 #
-# Submit (after segment_lemon_pbs.sh finishes):
+# Submit (after regate):
 #   qsub scripts/reshard_lemon_pbs.sh
 #
 #PBS -N lemon_reshard
@@ -26,26 +27,29 @@ DATA=/flare/ModCon/ngetty/data
 STAGING="$DATA/surg_vid_webdataset_resharded/lemon_staging"
 OUTPUT="$DATA/surg_vid_webdataset_resharded/lemon"
 PYTHON="$(command -v python3)"
+NWORK="${NWORK:-24}"
+SHARDS_PER_WORKER="${SHARDS_PER_WORKER:-22}"   # ~24*22 = 528 total shards (>world_size 192)
 
-mkdir -p /flare/ModCon/ngetty/logs
+mkdir -p "$OUTPUT" /flare/ModCon/ngetty/logs
 cd "$ROOT"
-echo "JOB START: $(date) PBS_JOBID=${PBS_JOBID:-}"
+echo "JOB START: $(date) PBS_JOBID=${PBS_JOBID:-} NWORK=$NWORK"
+# fresh output
+rm -f "$OUTPUT"/*.tar "$OUTPUT"/_wpartial_*.json "$OUTPUT"/metadata.json "$OUTPUT"/reshard_summary.json 2>/dev/null || true
 
-# Count clips in staging to size shards (~8 clips/shard, floor 512 so world_size=192
-# rank-slicing works; ceil for the true count).
-NCLIPS=$("$PYTHON" -c "import glob,tarfile
-tot=0
-for t in glob.glob('$STAGING/*.tar'):
-    with tarfile.open(t,'r|') as tf:
-        tot+=sum(1 for m in tf if m.isfile() and m.name.endswith('.mp4'))
-print(tot)")
-echo "staging clips: $NCLIPS"
-TARGET=$(( NCLIPS / 8 )); (( TARGET < 512 )) && TARGET=512
-echo "target shards: $TARGET"
+pids=()
+for (( w=0; w<NWORK; w++ )); do
+  "$PYTHON" "$ROOT/scripts/reshard_lemon_parallel.py" \
+      --staging "$STAGING" --output "$OUTPUT" \
+      --n-workers "$NWORK" --worker-id "$w" \
+      --shards-per-worker "$SHARDS_PER_WORKER" --seed 0 \
+      > "$OUTPUT/_wlog_${w}.log" 2>&1 &
+  pids+=($!)
+done
+fail=0; for pid in "${pids[@]}"; do wait "$pid" || fail=$((fail+1)); done
+echo "workers done, failed=$fail"; (( fail>0 )) && { echo "see $OUTPUT/_wlog_*.log" >&2; exit 1; }
 
-"$PYTHON" "$ROOT/scripts/reshard_webdataset.py" \
-    --input "$STAGING" --output "$OUTPUT" \
-    --prefix lemon --target-shards "$TARGET" --seed 0 --force
+"$PYTHON" "$ROOT/scripts/reshard_lemon_parallel.py" \
+    --staging "$STAGING" --output "$OUTPUT" --finalize
 
 chmod 700 "$OUTPUT"; chmod 600 "$OUTPUT"/*.tar "$OUTPUT"/*.json 2>/dev/null || true
 echo "JOB END: $(date)"

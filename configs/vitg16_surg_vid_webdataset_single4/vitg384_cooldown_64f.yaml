@@ -30,7 +30,13 @@ data:
   # existing `sitl` (older segmentation) per user decision, weight 1. Owner-only
   # perms on disk (protected data). 60s clips fill the 64f window natively.
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/sitl_2026
+  # lemon = LEMON/Surg-3M: 53650 clips, 35 procedures (2527 lap + 1667 robotic),
+  # procedure-diversity broadening. Already cleaned upstream (black filter no-op);
+  # pHash-deduped vs eval+surgenet_robotic (3 dropped, 100% eval self-recall).
+  # Weight 1. ~60s clips fill the 64f window natively. Owner-only on disk.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/lemon
   datasets_weights:
+  - 1
   - 1
   - 1
   - 1
@@ -46,6 +52,7 @@ data:
   crop_size: 384
   patch_size: 16
   dataset_fpcs:
+  - 64
   - 64
   - 64
   - 64
