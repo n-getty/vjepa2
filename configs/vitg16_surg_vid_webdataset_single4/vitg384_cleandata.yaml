@@ -64,7 +64,13 @@ data:
   # like the other sources; sqrt-size temperature sampling handles their scale.
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/grasp
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/cholec80
+  # sitl_2026 = Leo's newer re-segmentation of the SITL corpus (4144 clips, 60s
+  # @30fps/1080p, distinct v2_ keys). Added as its OWN source alongside the
+  # existing `sitl` (older segmentation) per user decision, weight 1. Owner-only
+  # perms on disk (protected data). Fills the 64f cooldown window like grasp/cholec80.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/sitl_2026
   datasets_weights:
+  - 1
   - 1
   - 1
   - 1
@@ -82,6 +88,7 @@ data:
   crop_size: 384
   patch_size: 16
   dataset_fpcs:
+  - 16
   - 16
   - 16
   - 16
