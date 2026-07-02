@@ -25,9 +25,18 @@ Keys are ``<dataset>__<source>_clip_<NNN>`` so scripts/reshard_webdataset.py's
 SOURCE_VIDEO_RE parses the source video and shuffles clips across sources into
 shards (+ writes metadata.json). Run reshard on <staging> after this.
 
+A third input mode handles LEMON (Surg-3M): a flat DIRECTORY of loose YouTube
+.mp4 files (no archive). Because LEMON is YouTube-scraped like our corpus but
+lost its IDs, each source video is gated through a perceptual-hash reference
+(scripts/build_phash_ref.py -> phash_ref.json) BEFORE segmenting: a video whose
+sampled frames match the eval or surgenet_robotic pools above a threshold is
+skipped (eval leakage / train duplication). LEMON sidecars also carry the
+per-video ``robotic`` + ``procedure`` labels from labels.json.
+
 Parallelism: cholec80's zip is seekable -> fan workers over --video-start/--end
 disjoint slices of the 80-video list. GraSP's 127GB tar.gz is a serial gzip
-stream -> ONE serial worker (cannot fan within the archive).
+stream -> ONE serial worker (cannot fan within the archive). LEMON's directory
+is seekable -> fan workers over --video-start/--end slices of the sorted file list.
 
 Usage (frameworks python; PyAV required):
   # cholec80 smoke, first video:
@@ -56,6 +65,9 @@ from fractions import Fraction
 
 import av
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import phash_util as ph  # noqa: E402
+
 VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v")
 _SANITIZE = re.compile(r"[^A-Za-z0-9_]+")
 
@@ -64,27 +76,47 @@ def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--dataset", required=True, choices=["cholec80", "grasp"])
-    p.add_argument("--archive", required=True, help="Source zip (cholec80) or tar.gz (grasp).")
+    p.add_argument("--dataset", required=True, choices=["cholec80", "grasp", "lemon"])
+    p.add_argument("--archive", default=None, help="Source zip (cholec80) or tar.gz (grasp).")
+    p.add_argument("--input-dir", default=None,
+                   help="lemon: directory of loose *.mp4 files (used instead of --archive).")
     p.add_argument("--output-staging", required=True, help="Dir for per-source *.tar (created).")
     p.add_argument("--tmpdir", default="/tmp/segwork", help="Scratch for extracted source videos.")
     p.add_argument("--segment-seconds", type=float, default=60.0)
     p.add_argument("--min-clip-seconds", type=float, default=8.0,
                    help="Drop a trailing segment shorter than this.")
-    p.add_argument("--video-start", type=int, default=None, help="cholec80: first video index (incl).")
-    p.add_argument("--video-end", type=int, default=None, help="cholec80: last video index (excl).")
+    p.add_argument("--video-start", type=int, default=None,
+                   help="cholec80/lemon: first video index (incl) for range fan-out.")
+    p.add_argument("--video-end", type=int, default=None,
+                   help="cholec80/lemon: last video index (excl) for range fan-out.")
     p.add_argument("--max-videos", type=int, default=None, help="Process at most this many source videos.")
     p.add_argument("--force", action="store_true", help="Overwrite existing per-source output tars.")
+    # --- lemon-only: perceptual-hash dedup gate + label enrichment ---
+    p.add_argument("--phash-ref", default=None,
+                   help="lemon: phash_ref.json (eval+surgenet pools). If set, gate each source video.")
+    p.add_argument("--labels-json", default=None,
+                   help="lemon: labels.json for per-video robotic/procedure sidecar enrichment.")
+    p.add_argument("--phash-threshold", type=float, default=0.10,
+                   help="lemon: drop a video if >this fraction of sampled frames match the ref.")
+    p.add_argument("--phash-sample-frames", type=int, default=48,
+                   help="lemon: frames sampled per source video for the pHash gate.")
     return p.parse_args()
 
 
-def _sanitize(stem: str) -> str:
-    return _SANITIZE.sub("_", stem).strip("_")
+def _sanitize(stem: str, strip_edges: bool = True) -> str:
+    s = _SANITIZE.sub("_", stem)
+    return s.strip("_") if strip_edges else s
 
 
-def _sidecars(key: str, dataset: str, source_path: str):
-    """Return (json_bytes, cls_bytes) matching the existing sample contract."""
+def _sidecars(key: str, dataset: str, source_path: str, extra: dict = None):
+    """Return (json_bytes, cls_bytes) matching the existing sample contract.
+
+    ``extra`` (LEMON: {"robotic":..., "procedure":[...]}) is merged in to
+    preserve provenance the loader ignores but downstream analysis can use.
+    """
     meta = {"source_dataset": dataset, "source_path": source_path, "label": 0}
+    if extra:
+        meta.update(extra)
     return json.dumps(meta).encode("utf-8"), b"0"
 
 
@@ -95,12 +127,14 @@ def _add_bytes(tar: tarfile.TarFile, name: str, data: bytes):
     tar.addfile(ti, io.BytesIO(data))
 
 
-def segment_one(src_path, source_name, dataset, out_tar, seg_s, min_s, source_ref=None):
+def segment_one(src_path, source_name, dataset, out_tar, seg_s, min_s, source_ref=None,
+                extra=None):
     """Stream-copy segment one video file into <=seg_s clips, writing triples to out_tar.
 
     Returns (n_clips, n_dropped_short). Cuts on keyframes at/after each segment
     boundary; per-segment first packet is rebased to PTS/DTS 0 so decord's
     get_avg_fps()/seek behave (equivalent of ffmpeg -reset_timestamps 1).
+    ``extra`` is merged into every clip's .json sidecar (LEMON labels).
     """
     inp = av.open(src_path)
     try:
@@ -146,7 +180,7 @@ def segment_one(src_path, source_name, dataset, out_tar, seg_s, min_s, source_re
             return
         key = f"{dataset}__{source_name}_clip_{n_clips:04d}"
         _add_bytes(out_tar, f"{key}.mp4", data)
-        jb, cb = _sidecars(key, dataset, source_ref or src_path)
+        jb, cb = _sidecars(key, dataset, source_ref or src_path, extra=extra)
         _add_bytes(out_tar, f"{key}.json", jb)
         _add_bytes(out_tar, f"{key}.cls", cb)
         n_clips += 1
@@ -185,11 +219,17 @@ def segment_one(src_path, source_name, dataset, out_tar, seg_s, min_s, source_re
     return n_clips, n_dropped
 
 
-def _process_source(video_bytes, source_name, args, out_dir, source_ref):
+def _process_source(video_bytes, source_name, args, out_dir, source_ref,
+                    extra=None, gate=None):
     """Write one source video's bytes to tmp, segment into its own per-source tar.
 
     source_ref is the STABLE provenance string recorded in each clip's .json
     (e.g. ``<archive>::videos/video01.mp4``), not the ephemeral tmp path.
+    ``extra`` is merged into every sidecar (LEMON labels). ``gate`` (LEMON) is a
+    callable(tmp_vid_path) -> (drop:bool, reason:str, dup_frac_eval, dup_frac_train)
+    run BEFORE segmentation; if it returns drop=True the video is skipped and a
+    status dict with status="dropped" is returned. A decode/integrity failure is
+    caught and returned as status="corrupt" rather than aborting the worker.
     """
     dataset = args.dataset
     out_tar_path = os.path.join(out_dir, f"{dataset}__{source_name}.tar")
@@ -200,25 +240,53 @@ def _process_source(video_bytes, source_name, args, out_dir, source_ref):
     tmp_vid = os.path.join(args.tmpdir, f"{source_name}.mp4")
     with open(tmp_vid, "wb") as f:
         f.write(video_bytes)
-    tmp_tar = out_tar_path + ".tmp"
     t0 = time.time()
-    with tarfile.open(tmp_tar, "w") as out:
-        n_clips, n_drop = segment_one(tmp_vid, source_name, dataset, out,
-                                      args.segment_seconds, args.min_clip_seconds,
-                                      source_ref=source_ref)
+
+    # pHash dedup gate (LEMON): also serves as the integrity probe — a corrupt
+    # video raises here and is logged as such, not fatal.
+    if gate is not None:
+        try:
+            drop, reason, dfe, dft = gate(tmp_vid)
+        except Exception as e:
+            if os.path.exists(tmp_vid):
+                os.remove(tmp_vid)
+            print(f"  [corrupt] {source_name}: {repr(e)[:70]}", flush=True)
+            return {"source": source_name, "clips": 0, "dropped": 0, "status": "corrupt"}
+        if drop:
+            if os.path.exists(tmp_vid):
+                os.remove(tmp_vid)
+            print(f"  [dup-drop] {source_name}: {reason} "
+                  f"(eval={dfe:.2f} train={dft:.2f})", flush=True)
+            return {"source": source_name, "clips": 0, "dropped": 0,
+                    "status": "dropped", "reason": reason,
+                    "dup_eval": dfe, "dup_train": dft}
+
+    tmp_tar = out_tar_path + ".tmp"
+    try:
+        with tarfile.open(tmp_tar, "w") as out:
+            n_clips, n_drop = segment_one(tmp_vid, source_name, dataset, out,
+                                          args.segment_seconds, args.min_clip_seconds,
+                                          source_ref=source_ref, extra=extra)
+    except Exception as e:
+        if os.path.exists(tmp_tar):
+            os.remove(tmp_tar)
+        if os.path.exists(tmp_vid):
+            os.remove(tmp_vid)
+        print(f"  [corrupt] {source_name}: segment failed {repr(e)[:60]}", flush=True)
+        return {"source": source_name, "clips": 0, "dropped": 0, "status": "corrupt"}
     if n_clips == 0:
         if os.path.exists(tmp_tar):
             os.remove(tmp_tar)
         print(f"  [warn] {source_name}: 0 clips produced (skipped)", flush=True)
         if os.path.exists(tmp_vid):
             os.remove(tmp_vid)
-        return {"source": source_name, "clips": 0, "dropped": n_drop}
+        return {"source": source_name, "clips": 0, "dropped": n_drop, "status": "empty"}
     os.replace(tmp_tar, out_tar_path)
     if os.path.exists(tmp_vid):
         os.remove(tmp_vid)
     dt = time.time() - t0
     print(f"  [{source_name}] clips={n_clips} dropped_short={n_drop} ({dt:.1f}s)", flush=True)
-    return {"source": source_name, "clips": n_clips, "dropped": n_drop}
+    return {"source": source_name, "clips": n_clips, "dropped": n_drop, "status": "ok"}
 
 
 def run_cholec80(args, out_dir):
@@ -269,6 +337,81 @@ def run_grasp(args, out_dir):
     return results, (0, count)
 
 
+def _make_phash_gate(args):
+    """Build the LEMON pHash gate closure, or None if --phash-ref not given.
+
+    Returns callable(tmp_vid) -> (drop, reason, dup_eval, dup_train). Also acts
+    as the integrity probe: sampling frames from a corrupt file raises, which
+    _process_source catches and logs as corrupt.
+    """
+    if not args.phash_ref:
+        return None
+    ev_ref, tr_ref, meta = ph.load_ref(args.phash_ref)
+    thr = args.phash_threshold
+    n = args.phash_sample_frames
+    print(f"[phash] ref: {ev_ref.size} eval + {tr_ref.size} train hashes; "
+          f"threshold={thr}, sample={n} frames/video", flush=True)
+
+    def gate(tmp_vid):
+        frames = ph.sample_gray_frames(tmp_vid, n=n)
+        if not frames:
+            raise RuntimeError("no decodable frames")
+        cands = [ph.phash_gray(f) for f in frames]
+        dfe = ph.dup_fraction(cands, ev_ref)
+        dft = ph.dup_fraction(cands, tr_ref)
+        if dfe > thr:
+            return True, "eval-leak", dfe, dft
+        if dft > thr:
+            return True, "train-dup", dfe, dft
+        return False, "", dfe, dft
+
+    return gate
+
+
+def run_lemon(args, out_dir):
+    """Segment a flat directory of loose LEMON *.mp4 files (range fan-out)."""
+    input_dir = args.input_dir or args.archive
+    if not input_dir or not os.path.isdir(input_dir):
+        raise SystemExit(f"lemon: --input-dir must be a directory (got {input_dir!r})")
+    vids = sorted(f for f in os.listdir(input_dir) if f.lower().endswith(VIDEO_EXTS))
+    lo = args.video_start if args.video_start is not None else 0
+    hi = args.video_end if args.video_end is not None else len(vids)
+    hi = min(hi, len(vids))
+    sel = vids[lo:hi]
+    if args.max_videos is not None:
+        sel = sel[:args.max_videos]
+    print(f"[lemon] {len(vids)} videos total; processing [{lo}:{hi}) -> {len(sel)}", flush=True)
+
+    labels = {}
+    if args.labels_json and os.path.exists(args.labels_json):
+        with open(args.labels_json) as f:
+            for e in json.load(f):
+                labels[e["youtubeId"]] = e
+        print(f"[lemon] loaded {len(labels)} label entries", flush=True)
+
+    gate = _make_phash_gate(args)
+    results = []
+    for fn in sel:
+        yid = os.path.splitext(fn)[0]          # youtubeId (11-char, reshard-safe)
+        # Keep leading/trailing so a leading '-'/'_' (60/73 of 4194 IDs) isn't
+        # stripped -> source_name stays faithful & unique (verified 0 collisions).
+        source_name = _sanitize(yid, strip_edges=False)
+        src_path = os.path.join(input_dir, fn)
+        source_ref = os.path.abspath(src_path)
+        extra = None
+        lab = labels.get(yid)
+        if lab is not None:
+            extra = {"robotic": bool(lab.get("robotic")),
+                     "procedure": lab.get("procedureName", [])}
+        with open(src_path, "rb") as f:
+            data = f.read()
+        r = _process_source(data, source_name, args, out_dir, source_ref,
+                            extra=extra, gate=gate)
+        if r:
+            results.append(r)
+    return results, (lo, hi)
+
+
 def main():
     args = parse_args()
     out_dir = args.output_staging
@@ -278,18 +421,26 @@ def main():
 
     if args.dataset == "cholec80":
         results, rng = run_cholec80(args, out_dir)
-    else:
+    elif args.dataset == "grasp":
         results, rng = run_grasp(args, out_dir)
+    else:
+        results, rng = run_lemon(args, out_dir)
 
     total_clips = sum(r["clips"] for r in results)
     total_drop = sum(r["dropped"] for r in results)
+    n_corrupt = sum(1 for r in results if r.get("status") == "corrupt")
+    n_leak = sum(1 for r in results if r.get("reason") == "eval-leak")
+    n_traindup = sum(1 for r in results if r.get("reason") == "train-dup")
     partial = os.path.join(out_dir, f"_partial_{rng[0]}_{rng[1]}.json")
     with open(partial, "w") as f:
         json.dump({"dataset": args.dataset, "range": list(rng),
                    "sources": len(results), "clips": total_clips,
-                   "dropped_short": total_drop, "per_source": results}, f, indent=2)
+                   "dropped_short": total_drop,
+                   "corrupt": n_corrupt, "eval_leak": n_leak, "train_dup": n_traindup,
+                   "per_source": results}, f, indent=2)
     print(f"DONE range {rng}: {len(results)} sources, {total_clips} clips, "
-          f"{total_drop} short-dropped. wrote {partial}", flush=True)
+          f"{total_drop} short-dropped, {n_corrupt} corrupt, "
+          f"{n_leak} eval-leak, {n_traindup} train-dup. wrote {partial}", flush=True)
 
 
 if __name__ == "__main__":
