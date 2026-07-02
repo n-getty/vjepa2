@@ -55,7 +55,12 @@ data:
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/small_surg
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/kinetics400
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/sitl
-  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_robotic
+  # surgenet_robotic_clean = surgenet_robotic with 40 eval-leaked source videos
+  # dropped (318 clips, 3624->3306). The eval (yt_robotic_chole triplet) was
+  # carved from the same YouTube robotic-chole scrape; some surgenet_robotic
+  # clips were byte-for-byte eval frames (dup=1.0). Scrubbed for doubt-free
+  # future evals (crop-augmented pHash gate; see scripts/scrub_eval_leakage.py).
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_robotic_clean
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgtoolloc2022
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvu24_clean
   # New video-native adds (segmented from raw full-procedure video this session):
