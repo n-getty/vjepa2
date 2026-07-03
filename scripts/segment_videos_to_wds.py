@@ -78,7 +78,7 @@ def parse_args():
     )
     p.add_argument("--dataset", required=True,
                    choices=["cholec80", "grasp", "lemon", "heichole", "multibypass140",
-                            "gynsurg", "lapgyn6_events"])
+                            "gynsurg", "lapgyn6_events", "surgenet_lap"])
     p.add_argument("--archive", default=None, help="Source zip (cholec80) or tar.gz (grasp).")
     p.add_argument("--archives", default=None, nargs="+",
                    help="multibypass140/gynsurg/lapgyn6_events: one or more source zips.")
@@ -556,6 +556,57 @@ def run_multibypass140(args, out_dir):
     return results, (0, len(results))
 
 
+def run_surgenet_lap(args, out_dir):
+    """surgenet_laparoscopic RAW procedure dirs -> 60s segments (eval-gated).
+
+    The tree has procedure subdirs (cholestectomy/, colectomy/, ...) of raw
+    VARIABLE-length 4fps video (0.5s runts to 22min procedures) PLUS a clips_1min/
+    subdir that is ALREADY segmented (handled separately, ingested as-is). This
+    walks ONLY the raw procedure dirs (excludes clips_1min/ and _evalleak*/),
+    segments each into <=60s clips (min 8s default drops runts). Because
+    re-segmentation changes clip boundaries, the eval-leak gate is re-run here
+    (pass --phash-ref eval_aug_ref.json) so the output is doubt-free.
+
+    Key: surgenet_lap__<procedure>_<segstem>_clip_NNNN  (procedure kept for
+    provenance + uniqueness; segment_NNN restarts per-dir so the dir must be in
+    the source name). Range fan-out over the flat sorted (dir,file) list.
+    """
+    root = args.input_dir or args.archive
+    if not root or not os.path.isdir(root):
+        raise SystemExit(f"surgenet_lap: --input-dir must be a directory (got {root!r})")
+    vids = []
+    for dirpath, _, files in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        top = rel.split(os.sep)[0]
+        if top == "clips_1min" or top.startswith("_evalleak"):
+            continue
+        for fn in files:
+            if fn.lower().endswith(VIDEO_EXTS):
+                vids.append((top, os.path.join(dirpath, fn), fn))
+    vids.sort(key=lambda t: (t[0], t[2]))
+    lo = args.video_start if args.video_start is not None else 0
+    hi = args.video_end if args.video_end is not None else len(vids)
+    hi = min(hi, len(vids))
+    sel = vids[lo:hi]
+    if args.max_videos is not None:
+        sel = sel[:args.max_videos]
+    print(f"[surgenet_lap] {len(vids)} raw procedure videos; processing [{lo}:{hi}) -> {len(sel)}",
+          flush=True)
+
+    gate = _make_phash_gate(args)   # eval gate if --phash-ref given
+    results = []
+    for proc, src_path, fn in sel:
+        stem = os.path.splitext(fn)[0]                       # segment_113
+        source_name = _sanitize(f"{proc}_{stem}")            # cholestectomy_segment_113
+        with open(src_path, "rb") as f:
+            data = f.read()
+        r = _process_source(data, source_name, args, out_dir, os.path.abspath(src_path),
+                            extra={"procedure": proc}, gate=gate)
+        if r:
+            results.append(r)
+    return results, (lo, hi)
+
+
 def run_preclip_zip(args, out_dir):
     """GynSurg / LapGyn6-Events: zip(s) of PRE-CUT action/event clips.
 
@@ -622,6 +673,8 @@ def main():
         results, rng = run_multibypass140(args, out_dir)
     elif args.dataset in ("gynsurg", "lapgyn6_events"):
         results, rng = run_preclip_zip(args, out_dir)
+    elif args.dataset == "surgenet_lap":
+        results, rng = run_surgenet_lap(args, out_dir)
     else:
         results, rng = run_lemon(args, out_dir)
 
