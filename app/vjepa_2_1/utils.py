@@ -242,10 +242,14 @@ def load_checkpoint(
             f"loaded pretrained target encoder from epoch {epoch} with msg: {msg}"
         )
 
-    # checkpoint["opt"] is None for HSDP checkpoints (sharded optimizer state is
-    # not saved; optimizer is reinitialized on resume — see save_checkpoint note
-    # in train.py). Skip the load cleanly in that case.
-    if checkpoint.get("opt") is None:
+    # Skip optimizer restore when either (a) the caller passed opt=None (the HSDP
+    # path builds the optimizer AFTER FSDP-wrapping, so load runs with no optimizer
+    # object yet — it is reinitialized post-wrap), or (b) the checkpoint has no opt
+    # state. Guarding on the local `opt` object too avoids derefing None when
+    # resuming a checkpoint that DOES contain opt state on the HSDP path.
+    if opt is None:
+        print("[warn] opt=None passed to load_checkpoint (HSDP: optimizer reinit post-wrap); skipping opt restore.")
+    elif checkpoint.get("opt") is None:
         print("[warn] No optimizer state in checkpoint (HSDP or fresh); keeping current optimizer.")
     else:
         try:

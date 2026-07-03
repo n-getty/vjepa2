@@ -43,6 +43,8 @@ class MaskCollator(object):
                     full_complement=m.get("full_complement", False),
                     pred_full_complement=m.get("pred_full_complement", False),
                     inv_block=m.get("inv_block", False),
+                    num_keep_enc=m.get("num_keep_enc", None),
+                    num_keep_pred=m.get("num_keep_pred", None),
                 )
                 self.mask_generators[fpc].append(mask_generator)
 
@@ -107,6 +109,8 @@ class _MaskGenerator(object):
         inv_block=False,
         full_complement=False,
         pred_full_complement=False,
+        num_keep_enc=None,
+        num_keep_pred=None,
     ):
         super(_MaskGenerator, self).__init__()
         if not isinstance(crop_size, tuple):
@@ -132,6 +136,19 @@ class _MaskGenerator(object):
             1, int(self.duration * max_context_frames_ratio)
         )  # maximum number of time-steps (frames) spanned by context mask
         self.max_keep = max_keep  # maximum number of patches to keep in context
+        # FIXED-SHAPE MODE (num_keep_enc/num_keep_pred): pin the enc/pred kept-token
+        # counts to an EXACT constant every step (truncate longer draws, pad shorter
+        # ones by repeating kept indices). Default None = original variable-length
+        # behavior, bit-for-bit. On Aurora XPU, variable per-step tensor lengths make
+        # the caching allocator hand out new virtual addresses each step, so CCL
+        # registers a fresh L0 IPC handle + OFI MR every iteration -> unbounded
+        # external-memory growth invisible to torch, which drives the 16n HSDP
+        # iter-time drift. A constant length keeps VAs stable (torchtune
+        # allocator_strategy.md:29-30; PRISM does the same via seq-length bucketing).
+        # The random BLOCK SHAPE/POSITION is unchanged — only the kept COUNT is fixed,
+        # so masking diversity is preserved.
+        self.num_keep_enc = num_keep_enc
+        self.num_keep_pred = num_keep_pred
         self._itr_counter = Value("i", -1)  # collator is shared across worker processes
         self.inv_block = inv_block
 
@@ -231,8 +248,39 @@ class _MaskGenerator(object):
         if self.max_keep is not None:
             min_keep_enc = min(min_keep_enc, self.max_keep)
 
-        collated_masks_enc = [cm[:min_keep_enc] for cm in collated_masks_enc]
-        collated_masks_pred = [cm[:min_keep_pred] for cm in collated_masks_pred]
+        # FIXED-SHAPE MODE: force the enc/pred kept counts to an EXACT constant so
+        # tensor lengths (hence allocator VAs) are identical every step. Truncate
+        # when the draw kept more than the target; pad (by repeating kept indices
+        # from the front) when it kept fewer. Repeated indices are valid gather
+        # targets — the model attends/predicts those tokens twice, a negligible and
+        # constant duplication that removes the per-step VA churn. Off by default.
+        if self.num_keep_enc is not None:
+            min_keep_enc = self.num_keep_enc
+        if self.num_keep_pred is not None:
+            min_keep_pred = self.num_keep_pred
+
+        def _fit(cm, n):
+            # cm: 1D LongTensor of kept indices. Return exactly length n.
+            L = cm.numel()
+            if L == n:
+                return cm
+            if L > n:
+                return cm[:n]
+            if L == 0:
+                # degenerate (no kept tokens) — fill with zeros so the shape is
+                # constant; empty_context guards make this essentially unreachable.
+                return torch.zeros(n, dtype=cm.dtype)
+            reps = (n + L - 1) // L
+            return cm.repeat(reps)[:n]
+
+        if self.num_keep_enc is not None:
+            collated_masks_enc = [_fit(cm, min_keep_enc) for cm in collated_masks_enc]
+        else:
+            collated_masks_enc = [cm[:min_keep_enc] for cm in collated_masks_enc]
+        if self.num_keep_pred is not None:
+            collated_masks_pred = [_fit(cm, min_keep_pred) for cm in collated_masks_pred]
+        else:
+            collated_masks_pred = [cm[:min_keep_pred] for cm in collated_masks_pred]
         if self.full_complement:  # predictor mask is just complement of encoder mask
             collated_masks_pred = [
                 torch.tensor(
