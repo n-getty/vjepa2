@@ -44,7 +44,7 @@ import sys, yaml
 src, dst, folder = sys.argv[1], sys.argv[2], sys.argv[3]
 d = yaml.safe_load(open(src))
 d["folder"] = folder
-d["optimization"]["ipe"] = 120           # long enough to see the DDP wedge onset (~42)
+d["optimization"]["ipe"] = 200           # drift onset was iter ~41-60; 200 confirms truly flat
 d["optimization"]["epochs"] = 1
 d["meta"]["save_every_freq"] = 1000000000 # no checkpoint saving
 yaml.safe_dump(d, open(dst, "w"), sort_keys=False)
@@ -146,4 +146,38 @@ mpiexec -n 192 -ppn 12 --cpu-bind depth --depth 16 \
         --fname $PARAMS --params_path $PARAMS \
         --local_data_root $LOCAL_DATA_ROOT
 kill $WATCHDOG_PID 2>/dev/null
+
+# ---- DRIFT VERDICT: windowed mean iter-time from rank-0 CSV ----
+# PASS = later windows do NOT climb vs early windows (top-level wrap fixed the
+# ~72x IPC-handle churn). The per-layer run drifted 8.9->9.9->16.9->32.3s over
+# iters 1..80; a flat trajectory here confirms the fix.
+CSV="$CKPT_DIR/log_r0.csv"
+if [[ -f "$CSV" ]]; then
+  echo "=== iter-time trajectory (rank0, 20-iter windows) — PASS if flat, not climbing ==="
+  $PY_STAGE - "$CSV" <<'PY'
+import sys, csv
+rows = list(csv.DictReader(open(sys.argv[1])))
+# find the iter-time column (ms). PhaseTimer writes 'iter-ms' or similar.
+cand = [c for c in (rows[0].keys() if rows else []) if 'iter' in c.lower() and 'ms' in c.lower()]
+col = cand[0] if cand else None
+if not col:
+    print(f"(no iter-ms column; columns={list(rows[0].keys()) if rows else []})"); sys.exit(0)
+vals = []
+for r in rows:
+    try: vals.append(float(r[col]))
+    except (ValueError, KeyError, TypeError): pass
+if not vals:
+    print("(no numeric iter-times)"); sys.exit(0)
+W = 20
+for s in range(0, len(vals), W):
+    w = vals[s:s+W]
+    if w: print(f"  iters {s+1:>3}-{s+len(w):<3}: mean={sum(w)/len(w)/1000:.2f}s  n={len(w)}")
+early = vals[:W]; late = vals[-W:]
+if early and late:
+    e, l = sum(early)/len(early)/1000, sum(late)/len(late)/1000
+    ratio = l/e if e else 0
+    verdict = "PASS (flat)" if ratio < 1.5 else "FAIL (drift)"
+    print(f"  first-window={e:.2f}s last-window={l:.2f}s ratio={ratio:.2f}x -> {verdict}")
+PY
+fi
 echo "JOB END: $(date)"
