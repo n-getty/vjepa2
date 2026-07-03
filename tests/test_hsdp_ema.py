@@ -128,19 +128,6 @@ def _run_mpi(dim=32, depth=4, heads=4, m=0.996, seed=1234):
         )
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
-        torch.manual_seed(seed)
-        dev_t = torch.device(f"{dev}:0")
-        encoder = _toy_encoder(dim, depth, heads).to(dev_t)
-        target = copy.deepcopy(encoder)
-        with torch.no_grad():
-            for p in target.parameters():
-                p.add_(torch.randn_like(p) * 0.1)
-
-        # Reference computed identically on every rank from the pre-wrap fulls.
-        enc_ref = {k: v.clone() for k, v in encoder.state_dict().items()}
-        tgt_ref = {k: v.clone() for k, v in target.state_dict().items()}
-        expected = _reference_ema(enc_ref, tgt_ref, m)
-
         # 1D mesh + plain SHARD_GRAD_OP: validates EMA over aligned shards (the
         # shard axis is what the _foreach EMA runs over). Hybrid strategies need
         # a 2D mesh; production build_hsdp_mesh supplies that. Here 1D suffices.
@@ -148,51 +135,80 @@ def _run_mpi(dim=32, depth=4, heads=4, m=0.996, seed=1234):
         wrap_policy = partial(
             transformer_auto_wrap_policy, transformer_layer_cls={Block}
         )
-        common = dict(
-            auto_wrap_policy=wrap_policy,
-            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-            device_mesh=mesh,
-            use_orig_params=True,
-            sync_module_states=False,  # keep our distinct init on each module
-        )
-        fenc = FSDP(encoder, **common)
-        ftgt = FSDP(target, **common)
-        for p in ftgt.parameters():
-            p.requires_grad = False
 
-        # The EXACT trainer EMA op (app/vjepa_2_1/train.py).
-        params_k, params_q = [], []
-        for pq, pk in zip(fenc.parameters(), ftgt.parameters()):
-            params_q.append(pq)
-            params_k.append(pk)
-        with torch.no_grad():
-            torch._foreach_mul_(params_k, m)
-            torch._foreach_add_(params_k, params_q, alpha=1 - m)
+        # Validate BOTH wrap modes: top-level (production default for
+        # shard_grad_op — a single flat sharded param) AND per-Block (the
+        # full_shard fallback). The EMA _foreach alignment must hold for both.
+        max_err_by_mode = {}
+        for mode in ("toplevel", "perlayer"):
+            torch.manual_seed(seed)
+            dev_t = torch.device(f"{dev}:0")
+            encoder = _toy_encoder(dim, depth, heads).to(dev_t)
+            target = copy.deepcopy(encoder)
+            with torch.no_grad():
+                for p in target.parameters():
+                    p.add_(torch.randn_like(p) * 0.1)
 
-        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(ftgt, StateDictType.FULL_STATE_DICT, cfg):
-            got_full = ftgt.state_dict()
+            # Reference computed identically on every rank from pre-wrap fulls.
+            enc_ref = {k: v.clone() for k, v in encoder.state_dict().items()}
+            tgt_ref = {k: v.clone() for k, v in target.state_dict().items()}
+            expected = _reference_ema(enc_ref, tgt_ref, m)
+
+            common = dict(
+                sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+                device_mesh=mesh,
+                use_orig_params=True,
+                sync_module_states=False,  # keep our distinct init on each module
+            )
+            if mode == "perlayer":
+                common["auto_wrap_policy"] = wrap_policy
+            # top-level: no auto_wrap_policy (mirrors production shard_grad_op)
+            fenc = FSDP(encoder, **common)
+            ftgt = FSDP(target, **common)
+            for p in ftgt.parameters():
+                p.requires_grad = False
+
+            # The EXACT trainer EMA op (app/vjepa_2_1/train.py).
+            params_k, params_q = [], []
+            for pq, pk in zip(fenc.parameters(), ftgt.parameters()):
+                params_q.append(pq)
+                params_k.append(pk)
+            with torch.no_grad():
+                torch._foreach_mul_(params_k, m)
+                torch._foreach_add_(params_k, params_q, alpha=1 - m)
+
+            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(ftgt, StateDictType.FULL_STATE_DICT, cfg):
+                got_full = ftgt.state_dict()
+
+            if rank == 0:
+                max_err, missing = 0.0, []
+                for k, exp in expected.items():
+                    cand = next(
+                        (gv for gk, gv in got_full.items() if gk.endswith(k)), None
+                    )
+                    if cand is None:
+                        missing.append(k)
+                        continue
+                    # FULL_STATE_DICT + offload_to_cpu returns CPU tensors; the
+                    # reference `expected` is on the accelerator. Compare on CPU.
+                    max_err = max(
+                        max_err,
+                        (cand.float().cpu() - exp.float().cpu()).abs().max().item(),
+                    )
+                assert missing == [], f"[{mode}] target keys missing after gather: {missing}"
+                assert len(expected) > 0, f"[{mode}] no parameters compared"
+                assert max_err < 1e-5, (
+                    f"[{mode}] HSDP EMA diverged from unsharded reference: "
+                    f"max_err={max_err:.2e}. encoder/target shards are misaligned "
+                    "or the EMA is a no-op."
+                )
+                max_err_by_mode[mode] = max_err
+            dist.barrier()  # keep ranks lockstep between the two wrap modes
 
         if rank == 0:
-            max_err, missing = 0.0, []
-            for k, exp in expected.items():
-                cand = next((gv for gk, gv in got_full.items() if gk.endswith(k)), None)
-                if cand is None:
-                    missing.append(k)
-                    continue
-                # FULL_STATE_DICT with offload_to_cpu returns CPU tensors; the
-                # reference `expected` is on the accelerator. Compare on CPU.
-                max_err = max(
-                    max_err,
-                    (cand.float().cpu() - exp.float().cpu()).abs().max().item(),
-                )
-            assert missing == [], f"target keys missing after gather: {missing}"
-            assert len(expected) > 0, "no parameters compared"
-            assert max_err < 1e-5, (
-                f"HSDP EMA diverged from unsharded reference: max_err={max_err:.2e}. "
-                "encoder/target shards are misaligned or the EMA is a no-op."
-            )
-            result = max_err
+            result = max(max_err_by_mode.values())
+            print(f"  EMA max_err by wrap mode: {max_err_by_mode}")
     finally:
         dist.barrier()
         dist.destroy_process_group()

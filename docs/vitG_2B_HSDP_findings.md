@@ -88,7 +88,57 @@ and the production `scripts/vitG384_capacity.sh`.
 
 ---
 
-## 4. OPEN PROBLEM: iter-time drift at 16n (needs the real workaround)
+## 4. ROOT CAUSE OF THE DRIFT (RESOLVED by review, 2026-07-03): per-layer FSDP wrapping
+
+**Verdict:** the §4-below drift was driven by **per-layer FSDP wrapping** —
+`transformer_auto_wrap_policy({Block})` in `hsdp.py`. On ViT-G 2B that is
+~48 encoder Blocks + 24 predictor Blocks = **~72 FSDP units → ~72 inter-node
+collective triples per step** instead of ~1. This is the single most-condemned
+pattern in both sibling KBs, and it is the actual "production mechanism" §6 asked
+for — **not an env var, the wrap granularity.**
+
+**Ground truth in the sibling repos (verified by reading the code, not inferred):**
+- **PRISM** `src/training/distributed.py:458-469` — for `shard_grad_op` it sets
+  `wrap_policy = None` (top-level only), with the comment: *"Per-module wrapping
+  causes catastrophic overhead on XPU because each wrapped module does independent
+  communication ops. With top-level-only, FSDP does a single ReduceScatter for
+  gradients (like DDP AllReduce)."* Their production OLMo-3 E2E (2/4-node) runs this.
+- **torchtune** `CLAUDE.md:15` & `:353` — *"FSDP per-module wrapping causes
+  catastrophic overhead on XPU — use top-level-only wrapping."*
+- **torchtune** `allocator_strategy.md:29-30` — bounded external growth ==
+  **stable L0 VAs**; the caching allocator keeps segment VAs pooled so CCL's IPC
+  handle cache stays valid. The 10 MiB/100-step figure is that regime.
+
+**Why per-layer explains the *drift* (not just a high-but-flat cost):** each unit's
+collective registers L0 IPC handles keyed by buffer VA. 72× the collectives = 72×
+the IPC-handle churn rate; with `CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536`
+(accumulation mode) handles pile up and lookup cost grows → progressive stall →
+drift + spike-and-recover, all with flat torch-mem (growth is external/CCL). Same
+signature as `ccl_external_memory_growth_32b.md`, ~36-72× faster than torchtune's
+top-level baseline — which is exactly why our drift is so much steeper than their
+~10 MiB/100 steps.
+
+**Fix applied (`hsdp.py`):** wrapping is now strategy-aware, mirroring PRISM:
+`shard_grad_op` (our default) → **top-level, no auto_wrap_policy** (~72 → ~1
+collective/step); per-Block policy kept only for the `full_shard`/HYBRID_SHARD
+fallback (which needs it for memory, and which PRISM flags as the slow XPU path).
+`HSDP_WRAP={toplevel,perlayer}` overrides. `tests/test_hsdp_ema.py` now validates
+EMA-shard alignment under **both** wrap modes. Our 2B at 22 GB (42 GB headroom) is
+squarely the regime where top-level `shard_grad_op` is the production default —
+PRISM only OOM'd top-level `shard_grad_op` at **7B** (14 GB flat param).
+
+**Second, complementary VA-churn source (NOT yet applied — deferred):** V-JEPA's
+mask collator (`src/masks/multiseq_multiblock3d.py:197-235`) draws a new
+`min_keep_enc/pred` **every step** (`max_keep: null` in configs), so activation
+tensor lengths vary step-to-step → fresh VAs → fresh IPC/MR registrations. This is
+the churn source PRISM removes with `BucketedMultiWebDatasetWrapper` (fixed shape)
+and torchtune with its bucketing allocator. **Plan: test top-level wrap ALONE
+first** (72× is the dominant multiplier; may flatten the drift entirely). Only if a
+residual remains, pin the mask keep-lengths (a recipe change — do last, carefully).
+
+---
+
+## 4b. (HISTORICAL) OPEN PROBLEM as originally written: iter-time drift at 16n
 
 With HSDP + OFI applied, the 16n run (job 8643156, `SMOKE`-corpus, ipe120) **trains** — it
 is *not* the DDP wedge — but iter-time **drifts upward**:

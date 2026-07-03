@@ -109,6 +109,36 @@ def _resolve_sharding(logger=None):
     return ShardingStrategy.HYBRID_SHARD, "HYBRID_SHARD (full_shard intra-node, DDP inter-node)"
 
 
+def _use_toplevel_wrap():
+    """Whether to wrap each module as a SINGLE top-level FSDP unit (no
+    auto_wrap_policy) vs. per-Block units.
+
+    PRISM and torchtune both document that PER-MODULE (per-transformer-layer)
+    FSDP wrapping causes CATASTROPHIC overhead on Aurora XPU: each wrapped unit
+    issues its own inter-node collective, so a 72-Block ViT-G 2B mints ~72
+    AllGather/ReduceScatter triples per step instead of ~1. On XPU that is not
+    just latency — every collective registers Level-Zero IPC handles keyed by
+    buffer VA, so 72x the collectives = 72x the IPC-handle churn rate, which is
+    the accumulator behind the observed 16n iter-time drift (8.9s -> 32s over 80
+    iters at flat torch-mem). torchtune CLAUDE.md:15 / PRISM distributed.py:458.
+
+    For SHARD_GRAD_OP (_HYBRID_SHARD_ZERO2) params stay resident after forward,
+    so a single top-level unit does ONE ReduceScatter per backward (like DDP's
+    AllReduce) — this is PRISM's validated production default. Only FULL_SHARD /
+    HYBRID_SHARD (params re-AllGathered) NEEDS per-layer units for memory, and
+    PRISM's table shows that path is the slow one on XPU. Default: top-level for
+    shard_grad_op, per-layer only for full_shard. Override with HSDP_WRAP=
+    {toplevel,perlayer}.
+    """
+    override = os.environ.get("HSDP_WRAP", "").lower()
+    if override in ("toplevel", "top-level", "top_level", "none"):
+        return True
+    if override in ("perlayer", "per-layer", "per_layer", "block"):
+        return False
+    env = os.environ.get("FSDP_SHARDING", _DEFAULT_FSDP_SHARDING).lower()
+    return env == "shard_grad_op"
+
+
 def wrap_hsdp(module, mesh, *, requires_grad=True, logger=None):
     """FSDP1-wrap an encoder/predictor/target_encoder for HSDP.
 
@@ -138,11 +168,8 @@ def wrap_hsdp(module, mesh, *, requires_grad=True, logger=None):
         reduce_dtype=torch.bfloat16,
         buffer_dtype=torch.bfloat16,
     )
-    wrap_policy = partial(
-        transformer_auto_wrap_policy, transformer_layer_cls={Block}
-    )
+    toplevel = _use_toplevel_wrap()
     kwargs = dict(
-        auto_wrap_policy=wrap_policy,
         mixed_precision=mp_policy,
         sharding_strategy=sharding,
         device_mesh=mesh,
@@ -157,20 +184,39 @@ def wrap_hsdp(module, mesh, *, requires_grad=True, logger=None):
         # also omits it.
         limit_all_gathers=True,
     )
-    # Prefetch overlap (default on; per-unit wrapping makes them effective).
-    from torch.distributed.fsdp import BackwardPrefetch
+    if toplevel:
+        # TOP-LEVEL wrap: one FSDP unit for the whole module -> ONE ReduceScatter
+        # per backward (like DDP AllReduce). No auto_wrap_policy. This is the
+        # PRISM/torchtune-validated XPU default for shard_grad_op: it avoids the
+        # ~72x collective count (and ~72x IPC-handle churn) of per-Block wrapping
+        # that drove the 16n iter-time drift. Prefetch is a no-op with a single
+        # unit, so it is left off.
+        wrap_desc = "top-level (single unit, no auto_wrap_policy)"
+    else:
+        # PER-LAYER wrap: only for FULL_SHARD/HYBRID_SHARD, where params are
+        # re-AllGathered per unit and per-layer granularity is needed for memory.
+        # PRISM's table flags this path as the slow one on XPU; use only when
+        # HBM-constrained. Prefetch overlaps the many collectives here.
+        kwargs["auto_wrap_policy"] = partial(
+            transformer_auto_wrap_policy, transformer_layer_cls={Block}
+        )
+        from torch.distributed.fsdp import BackwardPrefetch
 
-    if os.environ.get("HSDP_BACKWARD_PREFETCH", "1") == "1":
-        kwargs["backward_prefetch"] = BackwardPrefetch.BACKWARD_PRE
-    if os.environ.get("HSDP_FORWARD_PREFETCH", "1") == "1":
-        kwargs["forward_prefetch"] = True
+        if os.environ.get("HSDP_BACKWARD_PREFETCH", "1") == "1":
+            kwargs["backward_prefetch"] = BackwardPrefetch.BACKWARD_PRE
+        if os.environ.get("HSDP_FORWARD_PREFETCH", "1") == "1":
+            kwargs["forward_prefetch"] = True
+        wrap_desc = "per-Block (transformer_auto_wrap_policy)"
 
     wrapped = FSDP(module, **kwargs)
     if not requires_grad:
         for p in wrapped.parameters():
             p.requires_grad = False
     if logger is not None:
-        logger.info(f"[HSDP] wrapped module: {label} (requires_grad={requires_grad})")
+        logger.info(
+            f"[HSDP] wrapped module: {label}; wrap={wrap_desc} "
+            f"(requires_grad={requires_grad})"
+        )
     return wrapped
 
 
