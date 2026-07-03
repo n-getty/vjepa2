@@ -502,8 +502,45 @@ def main(args, resume_preempt=False):
             eps=eps,
         )
 
+    # HSDP loads model weights into the RAW (unwrapped) modules FIRST, then wraps.
+    # Loading AFTER an FSDP wrap requires a FULL_STATE_DICT gather; with
+    # rank0_only=False that all-gathers the full 22GB to every one of 192 ranks
+    # with a redundant CPU copy per rank (torch warns of exactly this) — it wedged
+    # a 16n run for 40min with 0 iters. Loading pre-wrap: every rank reads the .pt
+    # from Lustre independently (as the DDP path effectively does), then FSDP
+    # shards the already-loaded params. No cross-rank gather. `start_epoch` is
+    # captured here for HSDP and the post-wrap load blocks below are skipped.
+    start_epoch = 0
+    _hsdp_loaded = False
     if dist_strategy == "hsdp":
         from app.vjepa_2_1.hsdp import build_hsdp_mesh, wrap_hsdp
+
+        # 1) bootstrap from a pretrained checkpoint (e.g. Meta ViT-G e40)
+        if p_file:
+            encoder, predictor, target_encoder = load_pretrained(
+                r_path=p_file,
+                encoder=encoder,
+                predictor=predictor,
+                target_encoder=target_encoder,
+                context_encoder_key=context_encoder_key,
+                target_encoder_key=target_encoder_key,
+                load_predictor=load_predictor,
+                load_encoder=True,
+            )
+        # 2) resume model weights + epoch from an in-progress run (optimizer state
+        #    is not restored under HSDP — opt=None; it is reinitialized below).
+        if load_model or os.path.exists(latest_path):
+            print("Loadind checkpoint from: ", load_path)
+            (encoder, predictor, target_encoder, _, _, start_epoch) = load_checkpoint(
+                r_path=load_path,
+                encoder=encoder,
+                predictor=predictor,
+                target_encoder=target_encoder,
+                opt=None,
+                scaler=None,
+                is_anneal=is_anneal and not resume_anneal,
+            )
+        _hsdp_loaded = True
 
         _hsdp_mesh, _hsdp_nodes, _hsdp_lws = build_hsdp_mesh(
             world_size, device_type=device.type, logger=logger
@@ -559,28 +596,18 @@ def main(args, resume_preempt=False):
         for p in target_encoder.parameters():
             p.requires_grad = False
 
-    if p_file:
-        # Under HSDP, .load_state_dict on the FSDP modules must run inside a
-        # FULL_STATE_DICT context so the full checkpoint broadcasts to shards.
-        if dist_strategy == "hsdp":
-            from app.vjepa_2_1.hsdp import full_state_dict_context_multi
-
-            _load_ctx = full_state_dict_context_multi(
-                [encoder, predictor, target_encoder]
-            )
-        else:
-            _load_ctx = contextlib.nullcontext()
-        with _load_ctx:
-            encoder, predictor, target_encoder = load_pretrained(
-                r_path=p_file,
-                encoder=encoder,
-                predictor=predictor,
-                target_encoder=target_encoder,
-                context_encoder_key=context_encoder_key,
-                target_encoder_key=target_encoder_key,
-                load_predictor=load_predictor,
-                load_encoder=True,
-            )
+    # DDP path: bootstrap from pretrained checkpoint (HSDP already loaded pre-wrap).
+    if p_file and not _hsdp_loaded:
+        encoder, predictor, target_encoder = load_pretrained(
+            r_path=p_file,
+            encoder=encoder,
+            predictor=predictor,
+            target_encoder=target_encoder,
+            context_encoder_key=context_encoder_key,
+            target_encoder_key=target_encoder_key,
+            load_predictor=load_predictor,
+            load_encoder=True,
+        )
 
     # -- momentum schedule
     momentum_scheduler = (
@@ -601,35 +628,26 @@ def main(args, resume_preempt=False):
         f"[{_lambda_start}, {_lambda_end}] iters (progressive)"
     )
 
-    start_epoch = 0
-    # -- load training checkpoint
-    print("Loadind checkpoint from: ", load_path)
+    # -- load training checkpoint (DDP path; HSDP already resumed pre-wrap above)
+    if not _hsdp_loaded and (load_model or os.path.exists(latest_path)):
+        print("Loadind checkpoint from: ", load_path)
+        (
+            encoder,
+            predictor,
+            target_encoder,
+            optimizer,
+            scaler,
+            start_epoch,
+        ) = load_checkpoint(
+            r_path=load_path,
+            encoder=encoder,
+            predictor=predictor,
+            target_encoder=target_encoder,
+            opt=optimizer,
+            scaler=scaler,
+            is_anneal=is_anneal and not resume_anneal,
+        )
     if load_model or os.path.exists(latest_path):
-        if dist_strategy == "hsdp":
-            from app.vjepa_2_1.hsdp import full_state_dict_context_multi
-
-            _ckpt_ctx = full_state_dict_context_multi(
-                [encoder, predictor, target_encoder]
-            )
-        else:
-            _ckpt_ctx = contextlib.nullcontext()
-        with _ckpt_ctx:
-            (
-                encoder,
-                predictor,
-                target_encoder,
-                optimizer,
-                scaler,
-                start_epoch,
-            ) = load_checkpoint(
-                r_path=load_path,
-                encoder=encoder,
-                predictor=predictor,
-                target_encoder=target_encoder,
-                opt=optimizer,
-                scaler=scaler,
-                is_anneal=is_anneal and not resume_anneal,
-            )
         if not is_anneal or resume_anneal:
             for _ in range(start_epoch * ipe):
                 scheduler.step()
