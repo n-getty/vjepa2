@@ -19,9 +19,9 @@ Root: `/flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/`
 
 All sources are resharded `.tar` WebDataset. The active ViT-g 384 mix
 (`configs/vitg16_surg_vid_webdataset_single4/vitg384_cleandata.yaml` for pretrain,
-`vitg384_cooldown_64f.yaml` for cooldown) uses **14 sources, all weight 1.0**, with
+`vitg384_cooldown_64f.yaml` for cooldown) uses **15 sources, all weight 1.0**, with
 `sampling_temperature: 0.5` (sqrt-size) and `min_clip_std: 1.0` (drops black/frozen clips).
-The bottom 4 rows were added this session and their configs point at them; ⏳ = segment+reshard
+The bottom 5 rows were added this session and their configs point at them; ⏳ = segment+reshard
 job still in flight (confirm a `metadata.json` exists in each dir before launching a run).
 
 | Source key | On disk | Shards | Modality / notes | In active ViT-g mix |
@@ -40,6 +40,7 @@ job still in flight (confirm a `metadata.json` exists in each dir before launchi
 | `multibypass140` | ⏳ | ⏳ | MultiBypass140: 140 lap gastric-bypass procedures, Bern+Strasbourg (2 centers) → 60s clips. | ✅ (⏳ segmenting) |
 | `gynsurg` | ⏳ | ⏳ | GynSurg action segments, gyn laparoscopy (**new sub-domain**), 1080p/30fps pre-cut clips (≥4s filter). Shares Vienna pool w/ `lapgyn6_events`. | ✅ (⏳ segmenting) |
 | `lapgyn6_events` | ⏳ | ⏳ | LapGyn6-Events segments, gyn laparoscopy, pre-cut event clips (≥4s; segments variant is 64f-capable). Shares Vienna pool w/ `gynsurg`, no dedup (different segment types). | ✅ (⏳ segmenting) |
+| `surgenet_lap` | done | 365 | SurgeNet **laparoscopic** YouTube set (4fps), 5,843 clips: raw procedure dirs re-segmented to 60s + `clips_1min` subset. Eval-gated at segment time (crop-aug ref, 0 leaks); 96.9% distinct from `lemon`. Owner-only. The first lap-SurgeNet in the corpus. | ✅ (resharded) |
 
 ### `small_surg` bundle members
 
@@ -87,7 +88,7 @@ intended for a future *targeted* image-branch cooldown to address spatial-task u
 - `dataset_type: WebDataset`, `batch_size: 2` per rank (pretrain) / `1` (cooldown 64f), `crop_size: 384`, `patch_size: 16`, `tubelet_size: 2`
 - `fps: 4`, `dataset_fpcs: 16` (pretrain) / `64` (cooldown) — cooldown lengthens the temporal window, fps stays 4.
 - `sampling_temperature: 0.5`, `min_clip_std: 1.0`
-- **14 sources** as of this session (was 10; +heichole, +multibypass140, +gynsurg, +lapgyn6_events).
+- **15 sources** as of this session (was 10; +heichole, +multibypass140, +gynsurg, +lapgyn6_events, +surgenet_lap).
 
 ---
 
