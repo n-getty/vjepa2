@@ -18,7 +18,9 @@
 #
 #PBS -N vjepa_reshard_u192
 #PBS -A ModCon
-#PBS -q debug
+# debug-scaling accepts 1-node jobs on Aurora and usually drains faster than
+# debug; use it to dodge debug backlog. (Either queue works for this 1n/1h job.)
+#PBS -q debug-scaling
 #PBS -l select=1
 #PBS -l walltime=01:00:00
 #PBS -l filesystems=home:flare
