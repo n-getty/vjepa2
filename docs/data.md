@@ -7,7 +7,7 @@ CPT of ViT-g, evaluated on surgical benchmarks.
 - **Pretraining corpus** lives at `/flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/`
   as WebDataset tar shards, mixed by per-source sqrt-size temperature sampling.
 - **Probe/eval data** lives under `/flare/ModCon/ngetty/surg_2_1_v*/` (cached features + CSV
-  manifests) and, for the CholecT50 triplet probe, on Polaris (`/eagle/...`).
+  manifests) and, for the `yt_robotic_chole` triplet probe, on Polaris (`/eagle/...`).
 
 Paths use the `/flare/...` mount (equivalent to `/lus/flare/projects/...`).
 
@@ -97,7 +97,8 @@ intended for a future *targeted* image-branch cooldown to address spatial-task u
 ## 2. Downstream probe / eval datasets
 
 Frozen-backbone probes. The two live surgical benchmarks are **SAR-RARP50** (action
-segmentation, on Aurora) and the **CholecT50 triplet** (tool/verb/target, on Polaris).
+segmentation, on Aurora) and the **`yt_robotic_chole` triplet** (tool/verb/target, on Polaris)
+— our own robotic scrape, **not** CholecT50 (see below).
 
 ### SAR-RARP50 — action segmentation (ASFormer)
 
@@ -117,12 +118,19 @@ features. Robotic (RARP = robot-assisted radical prostatectomy) — modality-mat
 - **Probe spec:** `num_classes: 8`, `frames_per_clip: 16`, `num_segments: 3` (ctx3), `sequence_labels: true`, weighted CE. ASFormer: 10 layers, 8 heads, 8 tokens/clip, 24 temporal tokens.
 - **Two-phase per checkpoint:** `*_export.yaml` (`export_cache: true`) precomputes frozen features once; `*_probe.yaml` trains the ASFormer head off the cache (~2 min/epoch full, cached).
 
-### CholecT50 triplet — tool / verb / target (Polaris)
+### yt_robotic_chole triplet — tool / verb / target (Polaris)
+
+**NOT CholecT50.** This is our own **`yt_robotic_chole`** benchmark — a YouTube ROBOTIC
+cholecystectomy scrape, internally labeled (from `globus/surgenet_triplets`); provenance
+verified in the CSV `clip_path`. It is **robotic** (modality-matched to our corpus), despite
+the 5 tool names (clipper/grasper/hook/irrigator/scissors) resembling Cholec. Do not conflate
+with the public CholecT50 dataset — distinct data, distinct modality.
 
 Joint multi-label recognition: Tool (5) + Verb (6) + Target (12); IVT = independent product
-of the three. Laparoscopic. Runs on **Polaris**, not Aurora.
+of the three. Runs on **Polaris**, not Aurora.
 
-- **Harness:** `/eagle/projects/ModCon/ngetty/triplet_probe/` (Polaris)
+- **Harness:** `/eagle/projects/ModCon/ngetty/triplet_probe/` (Polaris); CSVs + eval code
+  reference Leonardo's read-only trees so numbers stay comparable to his table.
 - **Configs:** `configs/joint_e19/` (our ViT-g e19), `configs/joint_surgenetxl/` (SurgeNetXL baseline)
 - **Dumps:** `runs/joint_*/dump_{mean,topk_mean}` (per-task npz probs)
 - **Metric:** per-task macro mAP + IVT product. Best pooling `topk_mean` (topk=8).
@@ -222,7 +230,7 @@ folder of ophthalmic (cataract) video sets: `cat-101` (=Cataract-101), `cat-21` 
 ## 4. IMAGE / frame datasets for the spatial branch (researched 2026-07-02)
 
 **Motivation:** our model underperforms on *spatial* / per-frame tasks (tool & anatomy recognition,
-phase-from-frame, the CholecT50 triplet). The `vjepa_2_1` image branch (§5) can mix single-frame
+phase-from-frame, the `yt_robotic_chole` triplet). The `vjepa_2_1` image branch (§5) can mix single-frame
 data with video, so surgical image sets are a direct lever on this weakness. Below is what the
 surgical-FM field actually pretrains on, filtered to what's new and high-value for us.
 
@@ -298,14 +306,14 @@ with its own loss lambda). Meta's own 2.1 recipe uses this — `configs/train_2_
 ImageNet-1K at `rank_ratio: 0.5`. **Our surgical configs omit `img_data` by choice**, so frames-only
 sets are *addable via config*, not blocked by code. Caveat: V-JEPA's learning signal is dominated by
 *temporal* masking, so frames only exercise the spatial half — prefer temporal **video** for corpus
-growth, and treat frames as a targeted lever (e.g. the per-frame CholecT50 triplet probe) rather than
+growth, and treat frames as a targeted lever (e.g. the per-frame `yt_robotic_chole` triplet probe) rather than
 bulk pretraining fuel. The `frames-only` tags below flag that trade-off, not un-usability.
 
 | Dataset | Videos | Images / Frames | Notes |
 |---|---|---|---|
 | Cholec80 | 80 | ~91K frames (1 fps) | ✅ have (`cholec80`) |
 | CholecTrack20 | 20 | 35K+ frames (1 fps) | |
-| CholecT50 | 50 | ~101K frames (1 fps) | ✅ have as triplet probe |
+| CholecT50 | 50 | ~101K frames (1 fps) | public triplet dataset — **not held, not our probe** (our triplet probe is the separate `yt_robotic_chole` robotic scrape) |
 | SurgPose | — | ~120K instances | frames-only |
 | CholecT45 | 45 | ~90K frames (1 fps) | |
 | PolypDB | — | 3,934 images | frames-only |
