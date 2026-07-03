@@ -85,6 +85,7 @@ export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
 unset XPU_USM_ALLOC_SO
 
 # -------- HSDP knobs (the only behavioral change vs the DDP wedge run) --------
+export VJEPA_NUM_WORKERS=0  # A/B: no dataloader fork under HSDP
 export VJEPA_DIST_STRATEGY=hsdp
 export LOCAL_WORLD_SIZE=12
 export FSDP_SHARDING=shard_grad_op   # _HYBRID_SHARD_ZERO2
