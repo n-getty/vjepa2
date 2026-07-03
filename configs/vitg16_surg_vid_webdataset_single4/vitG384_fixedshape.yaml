@@ -1,0 +1,287 @@
+# ViT-G @ 384 surgical CPT — FIXED-SHAPE MASK variant of vitG384_cleandata.yaml.
+# IDENTICAL to vitG384_cleandata.yaml EXCEPT the mask block adds num_keep_enc/
+# num_keep_pred to pin per-step kept-token counts (see the mask: section comment).
+# This is the second half of the 16n HSDP drift fix (first half = top-level FSDP
+# wrap in hsdp.py). A/B this against vitG384_cleandata.yaml to confirm the drift
+# flattens. Once verified, fold these fields into the production config.
+#
+# ViT-G @ 384 surgical CPT from the Meta V-JEPA 2.1 UNDISTILLED ViT-G (2B) checkpoint.
+#
+# This is the 2B sibling of vitg384_cleandata.yaml (1B). The 1B ViT-g CPT run
+# CONFIRMED the undistilled-backbone thesis (probe F1 monotonic-rising e4->e19,
+# beating the Meta-g anchor 72.33 and approaching the ViT-L peak 74.77). This
+# config tests whether the larger 2B backbone lifts that ceiling further.
+#
+# WHAT CHANGED vs vitg384_cleandata.yaml (the 1B config) — VERIFIED by building
+# both models through app.vjepa_2_1.utils.init_video_model + loading the .pt:
+#   - model_name         vit_giant_xformers -> vit_gigantic_xformers
+#       encoder:  embed 1408->1664, depth 40->48, heads 22->26 (head_dim=64 BOTH,
+#                 so RoPE geometry is unchanged), 1.01B -> 1.84B params.
+#       predictor: UNCHANGED source (pred_depth24/embed384/heads12). Its I/O dim
+#                 auto-inherits encoder.embed_dim (app/vjepa_2_1/utils.py:376), so
+#                 predictor_embed becomes 6656->1664->384 and predictor_proj
+#                 384->6656 automatically. 53M -> 57M params.
+#   - pretrain_checkpoint  vjepa2_1_vitg_384.pt -> vjepa2_1_vitG_384.pt  (22.8GB)
+#   - folder             new output dir for the 2B run.
+# NOTHING ELSE required. The checkpoint LOADS WITH 0 MISSING KEYS into both the
+# encoder and predictor (same 'module.backbone.*' key format, same encoder/
+# target_encoder top-level keys as the 1B .pt; the same handful of img-branch
+# 'unexpected' keys we already drop for the 1B). No new model factory, no loader
+# change, no launcher change — this is a pure config swap.
+#
+# MEMORY RISK — SMOKE-TEST ON 1 NODE BEFORE THE 16-NODE RUN.
+#   The 1B ran at ~32.9GB / 64GB (51%) at bs2 / fpcs16 / 384px on a PVC tile.
+#   The 2B has 1.83x encoder params. Static state grows hard (weights bf16
+#   2.0->3.7GB, grads 2.0->3.7GB, AdamW fp32 master+m+v 12->22GB => ~16->29GB
+#   static) and activations grow ~1.5-1.8x with width+depth. Naive estimate puts
+#   the 2B near 55-60GB — uncomfortably close to the 64GB tile ceiling and likely
+#   to OOM. bs=2 is the FLOOR (the weight_distance_loss / d_weights path crashes
+#   at bs=1 — CLAUDE.md), so if the smoke OOMs the ONLY lever is dataset_fpcs
+#   16 -> 8 (halves activation memory). Do NOT drop to bs=1. Run the smoke first
+#   and set dataset_fpcs accordingly before launching the 16n job.
+#
+# LR CAVEAT: lr 7.5e-5 / warmup 2 / 20ep is the recipe TUNED FOR THE 1B. A 1.83x
+#   larger model may prefer a slightly lower peak LR. WATCH the early loss trend
+#   on the first big run (as we did for the 1B); adjust only if it diverges.
+app: vjepa_2_1
+nodes: 16
+tasks_per_node: 12
+cpus_per_task: 16
+mem_per_gpu: 40G
+folder: /flare/ModCon/ngetty/checkpoints/surg_2_1_vitG384_cleandata/vitG384
+data:
+  num_clips: 10
+  dataset_type: WebDataset
+  # DATA LIST SYNCED TO THE 1B CONFIG (vitg384_cleandata.yaml) 2026-07-03. The 2B
+  # config previously carried the stale original 11-source list (pre-dating the
+  # eval-leak scrub, tiny-set bundling, and lap/LEMON expansion); it now uses the
+  # identical 15-source corpus so the 2B run trains on the same clean data as 1B.
+  datasets:
+  # small_surg = symlink bundle of the tiny surgical sets (crcd, endovis15, jigsaw,
+  # miccai_2017, miccai_endoseg, surgvisdom = 926 clips total). Merged so per-source
+  # temperature sampling sizes them by combined count instead of giving each tiny
+  # set its own seat (which oversampled endovis15's 8 clips 82x/epoch -> memorization).
+  # Bundled: worst-case per-clip oversample drops 82x -> ~8x, no data dropped.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/small_surg
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/kinetics400
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/sitl
+  # surgenet_robotic_clean = surgenet_robotic with 40 eval-leaked source videos
+  # dropped (318 clips, 3624->3306). The eval (yt_robotic_chole triplet) was
+  # carved from the same YouTube robotic-chole scrape; some surgenet_robotic
+  # clips were byte-for-byte eval frames (dup=1.0). Scrubbed for doubt-free
+  # future evals (crop-augmented pHash gate; see scripts/scrub_eval_leakage.py).
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_robotic_clean
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgtoolloc2022
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvu24_clean
+  # New video-native adds (segmented from raw full-procedure video this session):
+  # grasp = robotic prostatectomy (1988 clips, modality-matched to our evals),
+  # cholec80 = laparoscopic chole 25fps (2916 clips, domain-broadening). Weight 1
+  # like the other sources; sqrt-size temperature sampling handles their scale.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/grasp
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/cholec80
+  # sitl_2026 = Leo's newer re-segmentation of the SITL corpus (4144 clips, 60s
+  # @30fps/1080p, distinct v2_ keys). Added as its OWN source alongside the
+  # existing `sitl` (older segmentation) per user decision, weight 1. Owner-only
+  # perms on disk (protected data). Fills the 64f cooldown window like grasp/cholec80.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/sitl_2026
+  # lemon = LEMON/Surg-3M (arXiv 2503.19740): 4194 YouTube surgical videos
+  # segmented -> 53650 clips across 35 procedure types (2527 lap + 1667 robotic),
+  # the big procedure-diversity broadening. Already cleaned by LEMON's pipeline
+  # (static/out-of-body removed) so our black filter is a no-op here (0% dropped,
+  # like grasp/cholec80). pHash-DEDUPED vs eval + surgenet_robotic: dropped 3
+  # (1 eval-leak @12.5%, 2 train-dup) with 100% eval self-recall, so the triplet
+  # eval is protected from leakage. Weight 1 like every other source. Owner-only.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/lemon
+  # --- New video sources (segmented this session; see scripts/segment_videos_pbs.sh).
+  # NOTE: these dirs are produced by the seg+reshard jobs; confirm each has a
+  # metadata.json before launching a run (do NOT start against a half-resharded dir).
+  # heichole = 24 HD lap-chole full procedures, 3 centers (~22h -> 60s clips).
+  # multibypass140 = 140 lap gastric-bypass procedures, Bern+Strasbourg (2 centers).
+  # Both are raw full procedures cut to 60s; min_clip_std drops HeiChole's
+  # white-censored out-of-body spans (std~0) like it drops surgvu24 black clips.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/heichole
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/multibypass140
+  # gynsurg + lapgyn6_events = gynecologic laparoscopy (NEW sub-domain for us),
+  # pre-cut action/event segments kept as-is (>=4s filter applied at segment time).
+  # They share the Medical-Univ-Vienna ~600-video pool (105 shared case IDs) but
+  # extract different segment types; ingested as separate sources w/o pHash dedup
+  # per decision. sqrt-size temperature sampling down-weights the shared pool.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/gynsurg
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/lapgyn6_events
+  # surgenet_lap = SurgeNet laparoscopic YouTube set (Leo's scrape, 4fps), 5843
+  # clips: raw procedure dirs re-segmented to 60s (runts dropped) + the already-
+  # clean clips_1min subset, merged. EVAL-GATED at segment time (crop-aug ref, 0
+  # leaks; the 42 leaked raw clips + robotic_chole were dropped pre-ingest).
+  # 96.9% distinct from LEMON (different YouTube scrape). Black filter ~no-op
+  # (sampled pixel std >=32); runtime min_clip_std backstop stays on. Owner-only.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_lap
+  datasets_weights:
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  sampling_temperature: 0.5
+  # Degenerate (black/frozen) clip reject floor on the raw 0-255 per-pixel std.
+  # Drops surgvu24's ~19% byte-identical pure-black clips (the v3 data fix,
+  # carried forward). Set 0 to disable.
+  min_clip_std: 1.0
+  batch_size: 2
+  crop_size: 384
+  patch_size: 16
+  dataset_fpcs:
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  tubelet_size: 2
+  fps: 4
+  num_workers: 2
+  persistent_workers: true
+  pin_mem: true
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+loss:
+  loss_exp: 1.0
+  predict_all: true
+  shift_by_n: 0
+  weight_distance_loss: true
+# FIXED-SHAPE MASKS (num_keep_enc/num_keep_pred): pin the encoder/predictor kept-
+# token counts to an exact constant every step so activation tensor lengths — and
+# thus the caching-allocator virtual addresses — are identical across iterations.
+# This removes the per-step VA churn that makes Aurora CCL register a fresh L0 IPC
+# handle + OFI MR every iteration, the dominant driver of the 16n HSDP iter-time
+# drift that top-level FSDP wrapping alone did NOT fix (spike 8643247: still 54s).
+# Values chosen at the measured per-step medians over 500 collator steps (grid =
+# 8*24*24 = 4608 tokens), so ~half the steps truncate and ~half pad by a few
+# repeated indices (apply_masks is a pure gather -> duplicates are valid). The
+# random block shape/position is UNCHANGED; only the kept COUNT is fixed, preserving
+# masking diversity. See src/masks/multiseq_multiblock3d.py + docs/vitG_2B_HSDP_findings.md.
+mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 8
+  num_keep_enc: 1536
+  num_keep_pred: 2560
+  spatial_scale:
+  - 0.15
+  - 0.15
+  temporal_scale:
+  - 1.0
+  - 1.0
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 2
+  num_keep_enc: 768
+  num_keep_pred: 3584
+  spatial_scale:
+  - 0.7
+  - 0.7
+  temporal_scale:
+  - 1.0
+  - 1.0
+meta:
+  context_encoder_key: encoder
+  dtype: bfloat16
+  eval_freq: 1000000000
+  load_checkpoint: true
+  # Warm-start the predictor from Meta's trained ViT-G predictor (verified: loads
+  # with 0 missing keys into our pred_depth24/embed384 arch after the encoder
+  # embed_dim auto-scales it to 6656). Includes the predictor_proj_context head
+  # the context loss needs.
+  load_predictor: true
+  pretrain_checkpoint: /flare/ModCon/ngetty/checkpoints/vjepa2_1_vitG_384.pt
+  read_checkpoint: null
+  save_every_freq: 5
+  seed: 239
+  target_encoder_key: target_encoder
+  use_sdpa: true
+model:
+  has_cls_first: false
+  img_temporal_dim_size: 1
+  interpolate_rope: true
+  is_causal: false
+  # Context (dense-prediction) loss — the defining V-JEPA 2.1 feature. Meta's
+  # published ViT-G uses 0.5. The Lambda_LinearWarmupHold ramp is rescaled to our
+  # 10k-iter run (start 500, full by 1500 = Meta's 5%->10% proportions).
+  lambda_value_vid: 0.5
+  lambda_start_iter: 500
+  lambda_end_iter: 1500
+  modality_embedding: true
+  model_name: vit_gigantic_xformers
+  n_registers: 0
+  n_registers_predictor: 0
+  normalize_predictor: false
+  pred_depth: 24
+  pred_embed_dim: 384
+  pred_is_causal: false
+  pred_num_heads: 12
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_mask_tokens: true
+  use_rope: true
+  zero_init_mask_tokens: true
+optimization:
+  # IPE/EPOCHS RE-SLICED FOR THE 2B (vs the 1B's ipe500/epochs20). The 2B is
+  # slower per iter (~7.9s @1n smoke; est ~8s @16n), so ipe500 = ~67min > the 1h
+  # debug-chain walltime. We LOWER ipe but RAISE epochs to hold ipe*epochs
+  # constant, because BOTH the LR cosine length (T_max, train.py:487) AND the EMA
+  # momentum denominator (train.py:528) are computed from ipe*epochs*ipe_scale.
+  #   333 * 30 = 9990 ~= the 1B's 500 * 20 = 10000 total steps.
+  # => same total data/compute, same LR schedule, same EMA trajectory; the ONLY
+  # change is checkpoints land every ~44min (fits 1h) instead of ~67min.
+  # EMA is IPE-INVARIANT here anyway: ema=[0.99925,0.99925] is FLAT (start==end),
+  # so the per-step momentum is constant 0.99925 regardless of ipe/epochs; only
+  # the total step count matters, and that's held ~constant. (If EMA were a ramp
+  # this re-slice would still be correct because the denom tracks ipe*epochs.)
+  # warmup 2.0->3.0 epochs preserves ~1000 warmup STEPS (333*3=999 ~= 500*2=1000)
+  # since warmup is specified in epochs and epochs got shorter.
+  ema:
+  - 0.99925
+  - 0.99925
+  epochs: 30
+  final_lr: 1.0e-06
+  final_weight_decay: 0.04
+  ipe: 333
+  ipe_scale: 1.0
+  lr: 7.5e-05
+  start_lr: 1.0e-06
+  warmup: 3.0
+  weight_decay: 0.04
