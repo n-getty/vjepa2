@@ -71,19 +71,19 @@ On disk but not referenced by the active ViT-g configs:
 | `*_staging` (heichole/multibypass140/gynsurg/lapgyn6_events) | — | Per-source seg output; resharded into the final dirs above. |
 | `incoming_robotic/{cholecseg8k}` | 2.9G | CholecSeg8k — **kept, not packed** (Cholec80-frame redundancy; masks-only signal). Future segmentation-probe set. |
 
-### IMAGE sets — held for a targeted cooldown (not in the current video mix)
+### IMAGE sets — packed & ready, held for a targeted cooldown (not in the current video mix)
 
-Downloaded + packer-ready but **deliberately left out of the pretrain/cooldown configs for now**;
-intended for a future *targeted* image-branch cooldown to address spatial-task underperformance
-(see §4 and the draft `vitg384_cooldown_64f_imgbranch.yaml`). Packed as `<name>_img/` via
-`scripts/pack_images_pbs.sh`:
+✅ **Packed 2026-07-03** to `<name>_img/` via `scripts/pack_images_pbs.sh` (each has a
+`metadata.json`), but **deliberately left out of the pretrain/cooldown configs** — intended
+for a future *targeted* image-branch cooldown to address spatial-task underperformance
+(see §4 and the draft `vitg384_cooldown_64f_imgbranch.yaml`, which references these `_img` dirs).
 
-| Source | On disk (raw) | Content |
+| Source `_img` | Packed images | Content |
 |---|---|---|
-| `hyperkvasir` | 3.9G | 10.7K labeled GI-endoscopy images, 23 classes. |
-| `dsad` | 20.9G | Dresden anatomy: 13.2K images (masks filtered out at pack time). |
-| `esad` | 13G | ESAD robotic prostatectomy frames (YOLO labels skipped). |
-| `psi_ava` | 12.1G | PSI-AVA robotic prostatectomy keyframes (DETR features skipped). |
+| `hyperkvasir_img` | 21,324 | GI-endoscopy labeled images, 23 classes (train+valid+test splits). |
+| `dsad_img` | 29,250 | Dresden anatomy frames (`image*.png` only; masks filtered out at pack time). |
+| `esad_img` | 106,740 | ESAD robotic prostatectomy frames, train+val+test (YOLO `.txt` labels skipped). |
+| `psi_ava_img` | 147,236 | PSI-AVA robotic prostatectomy keyframes (`keyframes/CASE*/` only; DETR features skipped). |
 
 ### Loading params (active ViT-g 384)
 
@@ -156,9 +156,9 @@ FORM = email/Google-form approval · FRAMES-ONLY = no temporal video released ·
 
 | Dataset | Modality | Access | New temporal video | Host | Notes |
 |---|---|---|---|---|---|
-| **MultiBypass140** | Laparoscopic (gastric bypass) | **OPEN** (`wget` zip) | 140 videos, 2 centers | CAMMA S3 (`s3.unistra.fr`) | ✅ **downloaded** (365 GB) → segmenting `multibypass140/` + **in configs**. CC-BY-NC-SA. `github.com/CAMMA-public/MultiBypass140` |
+| **MultiBypass140** | Laparoscopic (gastric bypass) | **OPEN** (`wget` zip) | 140 videos, 2 centers | CAMMA S3 (`s3.unistra.fr`) | ✅ **downloaded** (365 GB) → resharded `multibypass140/` (13,090 clips) + **in configs**. CC-BY-NC-SA. `github.com/CAMMA-public/MultiBypass140` |
 | **UCL Rectal Cancer** | Laparoscopic (TME) | **OPEN** (CC-BY) | 75 MP4s, ~380h, 1080p/25fps | UCL RDR / figshare | **~765 GB** — HEAD one file before staging. figshare API gives direct URLs. DOI 10.5522/04/24769530 |
-| **HeiChole** | Lap cholecystectomy | **TEAM-JOIN** (Synapse) | 24 HD full videos (`Full/HD/`), ~22h, 3 centers | Synapse `syn18824884` | ✅ **downloaded** (108GB) → segmenting into `heichole/` + **in configs**. Access = join Team 3390210 (instant); Download-scoped PAT. HD only (`Full/` SD + `Skill/` are dupes/subclips). |
+| **HeiChole** | Lap cholecystectomy | **TEAM-JOIN** (Synapse) | 24 HD full videos (`Full/HD/`), ~22h, 3 centers | Synapse `syn18824884` | ✅ **downloaded** (108GB) → resharded `heichole/` (894 clips) + **in configs**. Access = join Team 3390210 (instant); Download-scoped PAT. HD only (`Full/` SD + `Skill/` are dupes/subclips). |
 | **AutoLaparo** | Laparoscopic (hysterectomy) | **FORM** (Google) | 21 videos, ~23h, 1080p/25fps | emailed link | On-domain, small. CC-BY-NC-SA. `autolaparo.github.io` |
 | **EndoMapper** | GI endoscopy | **REG-EULA** (Synapse) | ~96 procedures, >24h continuous | Synapse `syn26707219` | Off-domain (flexible scope) but true complete-procedure video. Best of the GI group. |
 
@@ -198,10 +198,10 @@ are pre-cut to 2–3s — fine for 16f, **too short for 64f cooldown**. Verified
 
 | Dataset | Content | Clip length | Usable for | Download | Size |
 |---|---|---|---|---|---|
-| **GynSurg** (action-segments) | 1080p/30fps video, 152 source vids → segments | segments (longer) | 16f ✅, 64f ⚠️ verify | ✅ **downloaded** (44.2GB) → segmenting `gynsurg/` + **in configs** | 47.5 GB |
+| **GynSurg** (action-segments) | 1080p/30fps video, 152 source vids → segments | segments (longer) | 16f ✅, 64f ⚠️ verify | ✅ **downloaded** (44.2GB) → resharded `gynsurg/` (3,053 clips) + **in configs** | 47.5 GB |
 | **GynSurg** (3sec) | 1080p/30fps, 3s clips | 3s | 16f only (12f@4fps) | `GynSurg_Action_3sec.zip` | 26.1 GB |
 | **GynSurg** (raw LHE 75 vids) | full HD procedures | full | 16f ✅ + 64f ✅ | **FORM-gated** (sign `LapGynLHE...UsageAgreementForm.pdf`) | — |
-| **LapGyn6-Events** (segments) | video, up to >1 min clips | 1s–>1min | 16f ✅ + **64f ✅** | ✅ **downloaded** (53.9GB) → segmenting `lapgyn6_events/` + **in configs** | 57.9 GB |
+| **LapGyn6-Events** (segments) | video, up to >1 min clips | 1s–>1min | 16f ✅ + **64f ✅** | ✅ **downloaded** (53.9GB) → resharded `lapgyn6_events/` (2,155 clips) + **in configs** | 57.9 GB |
 | **LapGyn6-Events** (recognition) | video, 2–3s clips | 2–3s | 16f only | `Event_Recognition_LapGyn_dataset.zip` | 40.6 GB |
 | **LapGyn6-Actions** | video clips (`.rar`, needs `unrar`) | likely 2–3s | 16f only (verify) | `.../LapGyn6-Actions/Dataset.rar` | 4.33 GB |
 | **SurgicalActions160** | 160 mp4, 427×240/25fps | 2–5s (avg 4.8s) | 16f (91% of clips); **tiny ~13min total** | `.../SurgicalActions160/downloads/SurgicalActions160.zip` | 44.8 MB |
@@ -218,12 +218,15 @@ folder of ophthalmic (cataract) video sets: `cat-101` (=Cataract-101), `cat-21` 
 
 ### Recommendation
 
-1. **MultiBypass140** first — open, direct, on-domain laparoscopic, no gating. Fastest win.
-2. **HeiChole** + **AutoLaparo** — pursue the Synapse registration / Google form in parallel; both add on-domain laparoscopic multi-center diversity for little data volume.
-3. **UCL Rectal Cancer** if you want bulk laparoscopic video and can absorb ~765 GB.
-4. Treat the GI/cataract sets (EndoMapper, Cataract-*, LDPolypVideo, Kvasir-Capsule) as optional *off-domain broadening* only — and remember `lemon_staging` (922 GB, already downloaded) is the higher-leverage unclaimed source before scraping any of these.
+**DONE this session (2026-07-03):** items 1, 2 (HeiChole), 6, plus surgenet_lap and lemon are all
+ingested and in the 15-source configs (see §1). Remaining below are still open.
+
+1. ✅ **MultiBypass140** — ingested (`multibypass140`, 13,090 clips).
+2. ✅ **HeiChole** ingested (`heichole`, 894). **AutoLaparo** — form submitted, still awaiting the emailed link (not yet acquired).
+3. **UCL Rectal Cancer** — still open, if you want bulk laparoscopic video and can absorb ~765 GB.
+4. Treat the GI/cataract sets (EndoMapper, Cataract-*, LDPolypVideo, Kvasir-Capsule) as optional *off-domain broadening* only. NOTE: `lemon` is no longer "unclaimed" — it's in the mix (53,637 clips); this was the higher-leverage source and it's now used.
 5. Before ingesting **M2CAI16** or **SurgBench**, run the pHash dedup gate against Cholec80 / existing corpus — both heavily overlap what we hold.
-6. **Gyn-laparoscopy** (currently absent from our corpus): **GynSurg segments** + **LapGyn6-Events segments** add a new sub-domain in temporal video at high resolution — pHash-dedup the shared Vienna pool first.
+6. ✅ **Gyn-laparoscopy** ingested — **GynSurg** (3,053) + **LapGyn6-Events** (2,155) are in the mix (new sub-domain). Ingested without pHash dedup per decision (shared Vienna pool, different segment types).
 
 ---
 
@@ -243,16 +246,16 @@ territory. Full table (frames = sampled count; ✅/⚠️ = our holdings):
 | Source | Procedure / modality | #Frames | Public | For us |
 |---|---|---|---|---|
 | Cholec80 | Lap cholecystectomy | 179,164 | Yes | ✅ have (video) |
-| HeiChole | Lap cholecystectomy | 53,427 | Yes (Synapse) | ⏳ downloading (video) |
+| HeiChole | Lap cholecystectomy | 53,427 | Yes (Synapse) | ✅ in mix (video, `heichole`) |
 | hSDB-Chole | Lap cholecystectomy | 18,064 | Yes | Cholec-like |
 | RAMIE-UMCU | RA esophagectomy | 377,287 | **No (private)** | — |
-| ESAD | RA prostatectomy | 47,282 | Yes | new (robotic) |
-| PSI-AVA | RA prostatectomy | 73,618 | Yes | new (robotic) |
+| ESAD | RA prostatectomy | 47,282 | Yes | ✅ packed (`esad_img`, image branch) |
+| PSI-AVA | RA prostatectomy | 73,618 | Yes | ✅ packed (`psi_ava_img`, image branch) |
 | RARP-AvL | RA prostatectomy | 261,516 | **No (private)** | — |
-| DSAD (Dresden) | RA rectal resection | 14,623 | Yes | **new, anatomy-labeled** |
+| DSAD (Dresden) | RA rectal resection | 14,623 | Yes | ✅ packed (`dsad_img`, anatomy-labeled) |
 | GLENDA | Gyn laparoscopy | 25,682 | Yes | frames (ITEC) |
 | LapGyn4 | Gyn laparoscopy | 59,616 | Yes | frames (ITEC) |
-| MultiBypass140 | Lap gastric bypass | 749,419 | Yes | ⏳ downloading (video) |
+| MultiBypass140 | Lap gastric bypass | 749,419 | Yes | ✅ in mix (video, `multibypass140`) |
 | hSDB-Gastric | RA gastrectomy | 35,576 | Yes | new (procedure) |
 | SurgToolLoc2022 | 11 RA porcine procedures | 741,516 | Yes | ✅ have (SurgVU/toolloc) |
 | YouTube (SurgeNet) | **23 procedures** | 2,074,234 | Yes (HF `TimJaspersTue/SurgeNetYoutube`) | broad, but frames-of-video |
@@ -266,14 +269,14 @@ and **FM-validated + openly downloadable**. Status as of 2026-07-02; landing in 
 
 | Rank | Dataset | Why | Access | Status |
 |---|---|---|---|---|
-| 1 | **HyperKvasir** | 10.6K labeled images, **23 GI finding classes**, native stills — biggest open per-frame-label diversity win; new modality | OPEN | ⏳ **downloading** via HF mirror `sahilur/hyper-kvasir-labeled-images` (simula.no host **unreachable from Aurora**, even via proxy; 99K *unlabeled* subset stuck behind simula — labeled 23-class part is the high-value one) |
-| 2 | **DSAD (Dresden)** | 13.2K images with **organ/anatomy segmentation** — most on-target for our *anatomy* gap; new procedure (rectal). CC-BY (only commercial-OK one). Note: real count 13,195 not 14,623 | OPEN (figshare `21702600`) | ✅ **already staged** (`dsad/DSAD.zip`, 20.9GB, Jul-1) |
-| — | **CholecSeg8k** | ⚠️ **NOT for pretraining** — images are Cholec80 frames (17 clips / 8,080 imgs, we already hold all Cholec80 as video) → zero new pixels for SSL. Its 13-class dense masks are the only new signal, which the image branch never consumes. **Kept on disk as a future segmentation-PROBE set only** | OPEN | ⏳ downloading HF `minwoosun/CholecSeg8k` (2.9GB), kept but **excluded from image pack** |
-| 4 | **ESAD + PSI-AVA** | RA prostatectomy frames — modality-matched to our robotic benchmarks; new procedure | Drive (gdown) | ESAD ✅ **already staged** (`esad/`, 13GB, Jul-1); PSI-AVA ⏳ (bare-IP host refused → gdown Drive fallback) |
-| 5 | **hSDB-Chole + hSDB-Gastric** | gastrectomy adds a procedure; chole reinforces | OPEN | hSDB-Gastric ✅ **already staged** (`hsdb_gastric/`, 9.6GB, Jul-1) |
-| 6 | **CaDIS** | cataract, 4,670 images, **36 seg classes** (dense instruments+anatomy) | REG (grand-challenge / CATARACTS) | not started (gated) |
-| — | Endoscapes | (already staged `endoscapes/`, 5.9GB, Jul-1) — CVS/anatomy laparoscopic | OPEN | ✅ staged |
-| — | SurgeNet YouTube frames | 23-procedure breadth, but frames-of-video (overlaps our video pipeline) | OPEN (HF) | not started |
+| 1 | **HyperKvasir** | 10.6K labeled images, **23 GI finding classes**, native stills — biggest open per-frame-label diversity win; new modality | OPEN | ✅ **packed** → `hyperkvasir_img` (21,324 imgs). Via HF mirror `sahilur/hyper-kvasir-labeled-images` (simula.no host unreachable from Aurora even via proxy; 99K *unlabeled* subset stuck behind simula — labeled 23-class part is the high-value one). |
+| 2 | **DSAD (Dresden)** | 13.2K images with **organ/anatomy segmentation** — most on-target for our *anatomy* gap; new procedure (rectal). CC-BY (only commercial-OK one). Note: real count 13,195 not 14,623 | OPEN (figshare `21702600`) | ✅ **packed** → `dsad_img` (29,250 imgs; masks filtered) |
+| — | **CholecSeg8k** | ⚠️ **NOT for pretraining** — images are Cholec80 frames (17 clips / 8,080 imgs, we already hold all Cholec80 as video) → zero new pixels for SSL. Its 13-class dense masks are the only new signal, which the image branch never consumes. **Kept on disk as a future segmentation-PROBE set only** | OPEN | ✅ downloaded HF `minwoosun/CholecSeg8k` (2.9GB), kept but **excluded from image pack** |
+| 4 | **ESAD + PSI-AVA** | RA prostatectomy frames — modality-matched to our robotic benchmarks; new procedure | Drive (gdown) | ✅ **packed** → `esad_img` (106,740) + `psi_ava_img` (147,236); PSI-AVA via `python3 -m gdown` (bare-IP host refused) |
+| 5 | **hSDB-Chole + hSDB-Gastric** | gastrectomy adds a procedure; chole reinforces | OPEN | hSDB-Gastric ✅ downloaded (`hsdb_gastric/`, 9.6GB) — **not packed** (not in the 4-set image branch) |
+| 6 | **CaDIS** | cataract, 4,670 images, **36 seg classes** (dense instruments+anatomy) | REG (grand-challenge / CATARACTS) | not acquired (gated) |
+| — | Endoscapes | CVS/anatomy laparoscopic | OPEN | downloaded (`endoscapes/`, 5.9GB) — **not packed** |
+| — | SurgeNet YouTube frames | 23-procedure breadth, but frames-of-video (overlaps our video pipeline) | OPEN (HF) | not acquired |
 
 **Note:** `data/incoming_robotic/` already held several of these from a Jul-1 session (dsad, esad,
 endoscapes, hsdb_gastric) — check there before re-downloading anything. gdown's CLI entrypoint is
@@ -345,13 +348,13 @@ bulk pretraining fuel. The `frames-only` tags below flag that trade-off, not un-
 | LapEx | 30 | N/A | |
 | Endoscapes | 201 | 11,090 frames (CVS201) | |
 | EgoSurgery-Phase | 20 | 1,350,000 (25 fps) | |
-| MultiBypass140 | 140 | N/A | |
+| MultiBypass140 | 140 | N/A | ✅ have (`multibypass140`, 13,090 clips) |
 | SurgBench | 225 / 25 | 53M frames | |
-| HeiChole | 33 | N/A | |
+| HeiChole | 33 | N/A | ✅ have (`heichole`, 894 clips) |
 | SurgPub-Video | ~3,000 | 25M annotated frames | |
 | M2CAI16 Workflow | 41 | N/A | |
 | SimuScope | — | synthetic dataset | |
 | SurgVU / SurgToolLoc | 280 | ~18M frames (60 fps) | ✅ have (`surgvu24_clean`, `surgtoolloc2022`) |
 | Syn-ISS | — | 3,000 simulated images | frames-only |
 | CRCD (Expanded) | 21 | 127,000 annotated frames | ✅ have (`crcd`, older cut) |
-| LEMON | 4,194 | 3.4M frames | staged (`lemon_staging`), not yet mixed |
+| LEMON | 4,194 | 3.4M frames | ✅ **in the active mix** as `lemon` (53,637 clips) — see §1 |
