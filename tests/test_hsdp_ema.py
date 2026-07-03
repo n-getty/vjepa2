@@ -92,7 +92,10 @@ def _worker(rank, world_size, dim, depth, heads, m, seed, ret):
         from functools import partial
 
         torch.manual_seed(seed)
-        encoder = _toy_encoder(dim, depth, heads)
+        # FSDP requires params on the accelerator BEFORE wrapping (the production
+        # trainer builds the model directly on device via init_video_model).
+        dev_t = torch.device(f"{dev}:{rank}" if dev != "cpu" else "cpu")
+        encoder = _toy_encoder(dim, depth, heads).to(dev_t)
         # Distinct initial weights for the target so the EMA actually moves it.
         target = copy.deepcopy(encoder)
         with torch.no_grad():
