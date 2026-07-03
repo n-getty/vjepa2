@@ -16,27 +16,67 @@ over `encoder.parameters()` / `target_encoder.parameters()`. Under FSDP with
 use_orig_params=True those iterators yield each rank's LOCAL SHARD. The update is
 only correct if encoder and target_encoder are wrapped with the SAME mesh + wrap
 policy so their shards align element-for-element. This test proves that by
-comparing the FSDP result (gathered to full) against an unsharded reference EMA
-computed on plain modules.
+comparing the FSDP result (gathered to full) against an unsharded reference EMA.
 
-Run (needs the torch 2.13 XPU venv or any torch with gloo):
-    python -m pytest tests/test_hsdp_ema.py -q
-It spawns 2 gloo/CPU ranks via torch.multiprocessing; no GPU required.
+HOW TO RUN — this is an MPI-NATIVE test (matches how the trainer actually inits
+CCL on Aurora). It does NOT use torch.multiprocessing.spawn (which hangs under the
+mpi CCL transport). Launch it with mpiexec on a compute node:
+
+    ZE_AFFINITY... is set per-rank from PALS_LOCAL_RANKID before torch import,
+    exactly like app/main_dist_aurora.py.
+
+    mpiexec --pmi=pmix -n 2 -ppn 2 --cpu-bind depth --depth 16 \
+        python tests/test_hsdp_ema.py
+
+With <2 ranks (e.g. plain `python tests/test_hsdp_ema.py` on a login node) it
+SKIPS cleanly. Under pytest it is skipped unless launched under MPI with an
+accelerator (pytest can't provide the MPI world), so CI treats it as a
+compute-node integration check driven by scripts/vitG384_hsdp_smoke.sh.
 """
 
-import copy
 import os
+import sys
 
-try:
-    import pytest
-except ImportError:  # allow running as a plain script on Aurora venvs w/o pytest
-    pytest = None
+# --- per-rank XPU pin BEFORE torch import (mirrors app/main_dist_aurora.py) ---
+for _v in ("PALS_LOCAL_RANKID", "PMI_LOCAL_RANK", "MPI_LOCALRANKID",
+           "OMPI_COMM_WORLD_LOCAL_RANK", "LOCAL_RANK"):
+    if _v in os.environ:
+        os.environ["ZE_AFFINITY_MASK"] = os.environ[_v]
+        break
+os.environ.setdefault("MP_SOCKET_DIR", "/tmp")
+
+import copy
+from functools import partial
+
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn as nn
 
 from src.models.utils.modules import Block
+
+
+def _pmi(kind, default):
+    # Aurora/PALS sets PMIX_RANK + PALS_RANKID but NOT PMI_SIZE/PMIX_SIZE; the
+    # only size var present is PALS_LOCAL_SIZE (ranks/node). This test is
+    # single-node (2 ranks) so PALS_LOCAL_SIZE == world size. (The production
+    # trainer's init_distributed handles the multi-node size separately.)
+    chains = {
+        "RANK": ("PMI_RANK", "PMIX_RANK", "OMPI_COMM_WORLD_RANK", "PALS_RANKID"),
+        "SIZE": ("PMI_SIZE", "PMIX_SIZE", "OMPI_COMM_WORLD_SIZE", "WORLD_SIZE",
+                 "PALS_LOCAL_SIZE"),
+    }[kind]
+    for k in chains:
+        if os.environ.get(k):
+            return int(os.environ[k])
+    return default
+
+
+def _accel():
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    return None
 
 
 def _toy_encoder(dim=32, depth=4, heads=4):
@@ -52,34 +92,32 @@ def _toy_encoder(dim=32, depth=4, heads=4):
 
 def _reference_ema(enc_full_sd, tgt_full_sd, m):
     """Unsharded reference: new_target = m*target + (1-m)*context, per tensor."""
-    out = {}
-    for k in tgt_full_sd:
-        out[k] = m * tgt_full_sd[k] + (1.0 - m) * enc_full_sd[k]
-    return out
+    return {k: m * tgt_full_sd[k] + (1.0 - m) * enc_full_sd[k] for k in tgt_full_sd}
 
 
-def _accel():
-    """Return ('xpu'|'cuda'|None). FSDP requires a real accelerator even with a
-    CPU mesh, so the test only runs where one exists (a compute node)."""
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        return "xpu"
-    if torch.cuda.is_available():
-        return "cuda"
-    return None
-
-
-def _worker(rank, world_size, dim, depth, heads, m, seed, ret):
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "29555"
-    os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
+def _run_mpi(dim=32, depth=4, heads=4, m=0.996, seed=1234):
     dev = _accel()
-    # gloo carries the tiny control/gather traffic fine; FSDP still requires the
-    # accelerator for its param storage. Pin one device per rank.
+    if dev is None:
+        print("SKIP: no XPU/CUDA accelerator (run on a compute node under mpiexec)")
+        return None
+    rank = _pmi("RANK", 0)
+    world_size = _pmi("SIZE", 1)
+    if world_size < 2:
+        print(f"SKIP: need >=2 MPI ranks, got world_size={world_size} "
+              "(launch with `mpiexec -n 2 python tests/test_hsdp_ema.py`)")
+        return None
+
     if dev == "xpu":
-        torch.xpu.set_device(rank % torch.xpu.device_count())
-    elif dev == "cuda":
-        torch.cuda.set_device(rank % torch.cuda.device_count())
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        torch.xpu.set_device(0)  # ZE_AFFINITY_MASK already pinned one tile
+        backend = "xccl" if dist.is_xccl_available() else "gloo"
+    else:
+        torch.cuda.set_device(0)
+        backend = "nccl"
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29577")
+    dist.init_process_group(backend, rank=rank, world_size=world_size)
+
+    result = None
     try:
         from torch.distributed.device_mesh import init_device_mesh
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -89,31 +127,23 @@ def _worker(rank, world_size, dim, depth, heads, m, seed, ret):
             StateDictType,
         )
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-        from functools import partial
 
         torch.manual_seed(seed)
-        # FSDP requires params on the accelerator BEFORE wrapping (the production
-        # trainer builds the model directly on device via init_video_model).
-        dev_t = torch.device(f"{dev}:{rank}" if dev != "cpu" else "cpu")
+        dev_t = torch.device(f"{dev}:0")
         encoder = _toy_encoder(dim, depth, heads).to(dev_t)
-        # Distinct initial weights for the target so the EMA actually moves it.
         target = copy.deepcopy(encoder)
         with torch.no_grad():
             for p in target.parameters():
                 p.add_(torch.randn_like(p) * 0.1)
 
-        # Reference (computed identically on every rank from the pre-wrap fulls).
+        # Reference computed identically on every rank from the pre-wrap fulls.
         enc_ref = {k: v.clone() for k, v in encoder.state_dict().items()}
         tgt_ref = {k: v.clone() for k, v in target.state_dict().items()}
         expected = _reference_ema(enc_ref, tgt_ref, m)
 
-        # 1D mesh (pure shard) is enough to prove shard-aligned EMA — what we're
-        # validating is that the _foreach EMA acts on aligned local shards, which
-        # is governed by the SHARD axis alone. Production uses the 2D (replicate,
-        # shard) mesh with _HYBRID_SHARD_ZERO2, but hybrid strategies REQUIRE a
-        # 2D mesh; here we use plain SHARD_GRAD_OP on the 1D mesh, which shards
-        # params/grads identically along the shard axis (same shard boundaries
-        # the EMA must respect). init_device_mesh with a single dim + no name.
+        # 1D mesh + plain SHARD_GRAD_OP: validates EMA over aligned shards (the
+        # shard axis is what the _foreach EMA runs over). Hybrid strategies need
+        # a 2D mesh; production build_hsdp_mesh supplies that. Here 1D suffices.
         mesh = init_device_mesh(dev, (world_size,))
         wrap_policy = partial(
             transformer_auto_wrap_policy, transformer_layer_cls={Block}
@@ -139,69 +169,53 @@ def _worker(rank, world_size, dim, depth, heads, m, seed, ret):
             torch._foreach_mul_(params_k, m)
             torch._foreach_add_(params_k, params_q, alpha=1 - m)
 
-        # Gather the updated target to full and compare on rank 0.
         cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         with FSDP.state_dict_type(ftgt, StateDictType.FULL_STATE_DICT, cfg):
             got_full = ftgt.state_dict()
 
         if rank == 0:
-            max_err = 0.0
-            missing = []
+            max_err, missing = 0.0, []
             for k, exp in expected.items():
-                # strip any FSDP/module prefixes to match reference keys
-                cand = None
-                for gk, gv in got_full.items():
-                    if gk.endswith(k):
-                        cand = gv
-                        break
+                cand = next((gv for gk, gv in got_full.items() if gk.endswith(k)), None)
                 if cand is None:
                     missing.append(k)
                     continue
-                max_err = max(max_err, (cand.float() - exp.float()).abs().max().item())
-            ret["max_err"] = max_err
-            ret["missing"] = missing
-            ret["n"] = len(expected)
+                # FULL_STATE_DICT with offload_to_cpu returns CPU tensors; the
+                # reference `expected` is on the accelerator. Compare on CPU.
+                max_err = max(
+                    max_err,
+                    (cand.float().cpu() - exp.float().cpu()).abs().max().item(),
+                )
+            assert missing == [], f"target keys missing after gather: {missing}"
+            assert len(expected) > 0, "no parameters compared"
+            assert max_err < 1e-5, (
+                f"HSDP EMA diverged from unsharded reference: max_err={max_err:.2e}. "
+                "encoder/target shards are misaligned or the EMA is a no-op."
+            )
+            result = max_err
     finally:
+        dist.barrier()
         dist.destroy_process_group()
+    return result
 
 
-def _run():
-    if _accel() is None:
-        print("SKIP: no XPU/CUDA accelerator (FSDP requires one; run on a compute node)")
-        return None
-    world_size = 2
-    m = 0.996
-    mgr = mp.Manager()
-    ret = mgr.dict()
-    mp.spawn(
-        _worker,
-        args=(world_size, 32, 4, 4, m, 1234, ret),
-        nprocs=world_size,
-        join=True,
-    )
-    assert ret.get("missing") == [], f"target keys missing after gather: {ret.get('missing')}"
-    assert ret.get("n", 0) > 0, "no parameters compared"
-    # bf16-free CPU path: expect near-exact agreement.
-    assert ret["max_err"] < 1e-5, (
-        f"HSDP EMA diverged from unsharded reference: max_err={ret['max_err']:.2e}. "
-        "This means encoder/target shards are misaligned or the EMA is a no-op."
-    )
-    return ret["max_err"]
-
-
-if pytest is not None:
+# pytest entry: only meaningful when already launched under MPI with an
+# accelerator; otherwise skip (pytest can't spawn the MPI world itself).
+try:
+    import pytest
 
     @pytest.mark.skipif(
-        _accel() is None
-        or not hasattr(torch.distributed, "is_gloo_available")
-        or not torch.distributed.is_gloo_available(),
-        reason="FSDP requires an XPU/CUDA accelerator + gloo (run on a compute node)",
+        _accel() is None or _pmi("SIZE", 1) < 2,
+        reason="run via `mpiexec -n 2 python tests/test_hsdp_ema.py` on a compute node",
     )
     def test_hsdp_ema_matches_unsharded_reference():
-        _run()
+        _run_mpi()
+except ImportError:
+    pass
 
 
 if __name__ == "__main__":
-    err = _run()
+    err = _run_mpi()
     if err is not None:
         print(f"PASS: HSDP EMA matches unsharded reference (max_err={err:.2e})")
+        sys.exit(0)
