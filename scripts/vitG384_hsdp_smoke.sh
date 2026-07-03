@@ -91,7 +91,11 @@ echo "HSDP smoke: WORLD_SIZE=$WORLD_SIZE LOCAL_WORLD_SIZE=$LOCAL_WORLD_SIZE FSDP
 # Must launch under mpiexec so CCL's mpi transport has its launcher; the test
 # pins ZE_AFFINITY_MASK per rank from PALS_LOCAL_RANKID before torch import.
 echo "=== CHECK 1: tests/test_hsdp_ema.py (mpiexec -n 2) ==="
-mpiexec --pmi=pmix -n 2 -ppn 2 --cpu-bind depth --depth 16 \
+# The EMA test is a 2-rank job; its _pmi("SIZE") chain reads WORLD_SIZE BEFORE
+# PALS_LOCAL_SIZE, so the training-stage WORLD_SIZE=12 above would make it try to
+# rendezvous 12 clients with only 2 launched (job 8643248 hung 1801s, 2/12
+# joined). Unset WORLD_SIZE for this launch so it falls back to PALS_LOCAL_SIZE=2.
+env -u WORLD_SIZE mpiexec --pmi=pmix -n 2 -ppn 2 --cpu-bind depth --depth 16 \
     python tests/test_hsdp_ema.py 2>&1 | grep -viE "UserWarning|warnings.warn|FutureWarning" | tail -8
 echo "=== CHECK 1 done ==="
 
