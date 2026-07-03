@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 import os
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
@@ -146,6 +147,20 @@ def main(args, resume_preempt=False):
     dataset_fpcs = cfgs_data.get("dataset_fpcs")
     max_num_frames = max(dataset_fpcs)
     batch_size = cfgs_data.get("batch_size")
+    # Gradient accumulation (VJEPA_GRAD_ACCUM, default 1 = unchanged). Splits the
+    # per-rank batch into `grad_accum` microbatches processed sequentially, with
+    # DDP gradient sync deferred to the final microbatch (no_sync on the rest) so
+    # the optimizer still sees the full-batch gradient in ONE allreduce per step.
+    # On Aurora XPU this lowers the per-microbatch activation peak, buying back L0
+    # headroom so CCL's ~10-30 MiB/step external-memory growth (the ViT-G 2B
+    # backward-wedge; see docs/vitG_2B_spike_investigation.md) has room to breathe.
+    # LR/wd/EMA/momentum still step ONCE per optimizer step, so schedules are
+    # unchanged. Validated below to divide batch_size and keep micro-bs >= 1.
+    grad_accum = int(os.environ.get("VJEPA_GRAD_ACCUM", "1"))
+    # Distributed strategy: "ddp" (default, unchanged) or "hsdp" (FSDP1
+    # HYBRID_SHARD; shards params/grads/optimizer intra-node to buy back L0
+    # headroom on Aurora and remove the 2B backward wedge). See app/vjepa_2_1/hsdp.py.
+    dist_strategy = os.environ.get("VJEPA_DIST_STRATEGY", "ddp").lower()
     tubelet_size = cfgs_data.get("tubelet_size")
     fps = cfgs_data.get("fps")
     crop_size = cfgs_data.get("crop_size", 224)
@@ -455,73 +470,117 @@ def main(args, resume_preempt=False):
 
     # zizi
 
-    # -- init optimizer and scheduler
-    optimizer, scaler, scheduler, wd_scheduler = init_opt(
-        is_anneal=is_anneal,
-        encoder=encoder,
-        predictor=predictor,
-        use_radamw=use_radamw,
-        wd=wd,
-        final_wd=final_wd,
-        start_lr=start_lr,
-        ref_lr=lr,
-        final_lr=final_lr,
-        iterations_per_epoch=ipe,
-        warmup=warmup,
-        num_epochs=num_epochs,
-        ipe_scale=ipe_scale,
-        mixed_precision=mixed_precision,
-        dtype=dtype,
-        device=device,
-        betas=betas,
-        eps=eps,
-    )
-    # Allow tuning DDP gradient bucket size via env. Default 25MB; larger
-    # buckets reduce collective count, helpful on Aurora xccl where backward
-    # appears to be AllReduce-dominated.
-    _bucket_mb = int(os.environ.get("VJEPA_DDP_BUCKET_MB", "25"))
-    encoder = DistributedDataParallel(
-        encoder, static_graph=True, bucket_cap_mb=_bucket_mb,
-    )
-    # CLAUDE.md flagged predictor static_graph=True as crashing on Polaris.
-    # On Aurora this may behave differently — VJEPA_PRED_STATIC=1 opts in.
-    _pred_static = os.environ.get("VJEPA_PRED_STATIC") == "1"
-    predictor = DistributedDataParallel(
-        predictor,
-        static_graph=_pred_static,
-        find_unused_parameters=not _pred_static,
-        bucket_cap_mb=_bucket_mb,
-    )
-    # Optional bf16 gradient-compression comm hook (VJEPA_BF16_COMM=1). Casts
-    # gradients to bf16 before the AllReduce and back to fp32 after — halves the
-    # collective payload, which is the dominant cost in the AllReduce-bound
-    # backward on Aurora xccl (esp. for ViT-g's ~3.3x params). Off by default so
-    # baseline runs are bit-for-bit unchanged; enable only after a loss-curve
-    # sanity check. Params are already bf16-autocast in compute, so the extra
-    # precision loss is on the reduced gradients only.
-    if os.environ.get("VJEPA_BF16_COMM") == "1":
-        from torch.distributed.algorithms.ddp_comm_hooks import (
-            default_hooks as _ddp_hooks,
-        )
-        _pg = None  # default process group
-        encoder.register_comm_hook(_pg, _ddp_hooks.bf16_compress_hook)
-        predictor.register_comm_hook(_pg, _ddp_hooks.bf16_compress_hook)
-        logger.info("DDP bf16_compress_hook registered (encoder+predictor)")
-    target_encoder = DistributedDataParallel(target_encoder)
-    for p in target_encoder.parameters():
-        p.requires_grad = False
+    # -- distributed wrap + optimizer.
+    # Two strategies, selected by VJEPA_DIST_STRATEGY (default "ddp" = unchanged):
+    #   ddp  : build the optimizer on the RAW modules, THEN DDP-wrap (the original
+    #          order; DDP keeps the same Parameter objects so this is equivalent
+    #          and preserved byte-for-byte).
+    #   hsdp : FSDP1 HYBRID_SHARD wrap FIRST, then build the optimizer on the
+    #          wrapped modules. With use_orig_params=True the optimizer must see
+    #          the FSDP-managed params, so ordering is reversed. See app/vjepa_2_1/
+    #          hsdp.py for why (2B L0-headroom starvation under DDP on Aurora).
 
-    if p_file:
-        encoder, predictor, target_encoder = load_pretrained(
-            r_path=p_file,
+    def _make_opt():
+        return init_opt(
+            is_anneal=is_anneal,
             encoder=encoder,
             predictor=predictor,
-            target_encoder=target_encoder,
-            context_encoder_key=context_encoder_key,
-            target_encoder_key=target_encoder_key,
-            load_predictor=load_predictor,
-            load_encoder=True,
+            use_radamw=use_radamw,
+            wd=wd,
+            final_wd=final_wd,
+            start_lr=start_lr,
+            ref_lr=lr,
+            final_lr=final_lr,
+            iterations_per_epoch=ipe,
+            warmup=warmup,
+            num_epochs=num_epochs,
+            ipe_scale=ipe_scale,
+            mixed_precision=mixed_precision,
+            dtype=dtype,
+            device=device,
+            betas=betas,
+            eps=eps,
         )
+
+    if dist_strategy == "hsdp":
+        from app.vjepa_2_1.hsdp import build_hsdp_mesh, wrap_hsdp
+
+        _hsdp_mesh, _hsdp_nodes, _hsdp_lws = build_hsdp_mesh(
+            world_size, device_type=device.type, logger=logger
+        )
+        # target_encoder MUST use the SAME mesh + policy so EMA _foreach ops act
+        # on aligned shards (verified by tests/test_hsdp_ema.py).
+        encoder = wrap_hsdp(
+            encoder, _hsdp_mesh, requires_grad=True, logger=logger
+        )
+        predictor = wrap_hsdp(
+            predictor, _hsdp_mesh, requires_grad=True, logger=logger
+        )
+        target_encoder = wrap_hsdp(
+            target_encoder, _hsdp_mesh, requires_grad=False, logger=logger
+        )
+        # Build optimizer AFTER wrapping (use_orig_params=True).
+        optimizer, scaler, scheduler, wd_scheduler = _make_opt()
+    else:
+        # -- init optimizer and scheduler (on raw modules, as upstream) --
+        optimizer, scaler, scheduler, wd_scheduler = _make_opt()
+        # Allow tuning DDP gradient bucket size via env. Default 25MB; larger
+        # buckets reduce collective count, helpful on Aurora xccl where backward
+        # appears to be AllReduce-dominated.
+        _bucket_mb = int(os.environ.get("VJEPA_DDP_BUCKET_MB", "25"))
+        encoder = DistributedDataParallel(
+            encoder, static_graph=True, bucket_cap_mb=_bucket_mb,
+        )
+        # CLAUDE.md flagged predictor static_graph=True as crashing on Polaris.
+        # On Aurora this may behave differently — VJEPA_PRED_STATIC=1 opts in.
+        _pred_static = os.environ.get("VJEPA_PRED_STATIC") == "1"
+        predictor = DistributedDataParallel(
+            predictor,
+            static_graph=_pred_static,
+            find_unused_parameters=not _pred_static,
+            bucket_cap_mb=_bucket_mb,
+        )
+        # Optional bf16 gradient-compression comm hook (VJEPA_BF16_COMM=1). Casts
+        # gradients to bf16 before the AllReduce and back to fp32 after — halves the
+        # collective payload, which is the dominant cost in the AllReduce-bound
+        # backward on Aurora xccl (esp. for ViT-g's ~3.3x params). Off by default so
+        # baseline runs are bit-for-bit unchanged; enable only after a loss-curve
+        # sanity check. Params are already bf16-autocast in compute, so the extra
+        # precision loss is on the reduced gradients only.
+        if os.environ.get("VJEPA_BF16_COMM") == "1":
+            from torch.distributed.algorithms.ddp_comm_hooks import (
+                default_hooks as _ddp_hooks,
+            )
+            _pg = None  # default process group
+            encoder.register_comm_hook(_pg, _ddp_hooks.bf16_compress_hook)
+            predictor.register_comm_hook(_pg, _ddp_hooks.bf16_compress_hook)
+            logger.info("DDP bf16_compress_hook registered (encoder+predictor)")
+        target_encoder = DistributedDataParallel(target_encoder)
+        for p in target_encoder.parameters():
+            p.requires_grad = False
+
+    if p_file:
+        # Under HSDP, .load_state_dict on the FSDP modules must run inside a
+        # FULL_STATE_DICT context so the full checkpoint broadcasts to shards.
+        if dist_strategy == "hsdp":
+            from app.vjepa_2_1.hsdp import full_state_dict_context_multi
+
+            _load_ctx = full_state_dict_context_multi(
+                [encoder, predictor, target_encoder]
+            )
+        else:
+            _load_ctx = contextlib.nullcontext()
+        with _load_ctx:
+            encoder, predictor, target_encoder = load_pretrained(
+                r_path=p_file,
+                encoder=encoder,
+                predictor=predictor,
+                target_encoder=target_encoder,
+                context_encoder_key=context_encoder_key,
+                target_encoder_key=target_encoder_key,
+                load_predictor=load_predictor,
+                load_encoder=True,
+            )
 
     # -- momentum schedule
     momentum_scheduler = (
@@ -546,22 +605,31 @@ def main(args, resume_preempt=False):
     # -- load training checkpoint
     print("Loadind checkpoint from: ", load_path)
     if load_model or os.path.exists(latest_path):
-        (
-            encoder,
-            predictor,
-            target_encoder,
-            optimizer,
-            scaler,
-            start_epoch,
-        ) = load_checkpoint(
-            r_path=load_path,
-            encoder=encoder,
-            predictor=predictor,
-            target_encoder=target_encoder,
-            opt=optimizer,
-            scaler=scaler,
-            is_anneal=is_anneal and not resume_anneal,
-        )
+        if dist_strategy == "hsdp":
+            from app.vjepa_2_1.hsdp import full_state_dict_context_multi
+
+            _ckpt_ctx = full_state_dict_context_multi(
+                [encoder, predictor, target_encoder]
+            )
+        else:
+            _ckpt_ctx = contextlib.nullcontext()
+        with _ckpt_ctx:
+            (
+                encoder,
+                predictor,
+                target_encoder,
+                optimizer,
+                scaler,
+                start_epoch,
+            ) = load_checkpoint(
+                r_path=load_path,
+                encoder=encoder,
+                predictor=predictor,
+                target_encoder=target_encoder,
+                opt=optimizer,
+                scaler=scaler,
+                is_anneal=is_anneal and not resume_anneal,
+            )
         if not is_anneal or resume_anneal:
             for _ in range(start_epoch * ipe):
                 scheduler.step()
@@ -570,6 +638,45 @@ def main(args, resume_preempt=False):
                 mask_collator.step()
 
     def save_checkpoint(epoch, path):
+        if dist_strategy == "hsdp":
+            # FULL_STATE_DICT is a COLLECTIVE: every rank must enter the context
+            # and call .state_dict() (rank0 receives the full dict, others empty).
+            # Only rank0 writes. Model + EMA target round-trip fully and remain
+            # DDP-compatible / topology-independent. Optimizer (Adam m/v) is NOT
+            # saved on the HSDP path — the shared optimizer spans two FSDP roots
+            # so a correct sharded optim_state_dict is deferred; resume reinits
+            # the optimizer (load_checkpoint already tolerates this). Acceptable
+            # because HSDP has no weight-sync -> no external-memory growth ->
+            # runs complete without frequent restarts. KNOWN LIMITATION.
+            from app.vjepa_2_1.hsdp import full_state_dict_context
+
+            with full_state_dict_context(encoder):
+                enc_sd = encoder.state_dict()
+            with full_state_dict_context(predictor):
+                pred_sd = predictor.state_dict()
+            with full_state_dict_context(target_encoder):
+                tgt_sd = target_encoder.state_dict()
+            if rank != 0:
+                return
+            save_dict = {
+                "encoder": enc_sd,
+                "predictor": pred_sd,
+                "opt": None,  # see note above
+                "scaler": None if scaler is None else scaler.state_dict(),
+                "target_encoder": tgt_sd,
+                "epoch": epoch,
+                "loss": loss_meter.avg,
+                "batch_size": batch_size,
+                "world_size": world_size,
+                "lr": lr,
+                "dist_strategy": "hsdp",
+            }
+            try:
+                torch.save(save_dict, path)
+            except Exception as e:
+                logger.info(f"Encountered exception when saving checkpoint: {e}")
+            return
+
         if rank != 0:
             return
         save_dict = {
@@ -608,6 +715,24 @@ def main(args, resume_preempt=False):
     if sync_gc:
         gc.disable()
         gc.collect()
+
+    # -- validate grad accumulation config (fail loud, never silently wrong)
+    if grad_accum > 1:
+        if batch_size % grad_accum != 0:
+            raise ValueError(
+                f"VJEPA_GRAD_ACCUM={grad_accum} must divide per-rank batch_size="
+                f"{batch_size}"
+            )
+        if loss_reg_std_mult is not None:
+            raise ValueError(
+                "VJEPA_GRAD_ACCUM>1 is not supported together with loss "
+                "regulation (loss_reg_std_mult); the per-step skip logic is not "
+                "threaded through microbatches. Disable one."
+            )
+        logger.info(
+            f"Gradient accumulation ON: grad_accum={grad_accum}, "
+            f"per-rank batch={batch_size} -> micro-batch={batch_size // grad_accum}"
+        )
 
     trailing_losses = []
     step_count = 0
@@ -704,7 +829,7 @@ def main(args, resume_preempt=False):
                                 new_h.append(F.layer_norm(hi, (hi.size(-1),)))
                         return new_h
 
-                def forward_context(clips, embed_dim=embed_dim_encoder):
+                def forward_context(clips, masks_enc, masks_pred, embed_dim=embed_dim_encoder):
                     modality = "video"
                     if img_temporal_dim_size is not None:
                         if clips[0].shape[2] == img_temporal_dim_size:
@@ -768,79 +893,130 @@ def main(args, resume_preempt=False):
                             loss /= n
                             return loss
 
-                # Step 1. Forward — device-agnostic autocast so XPU/CUDA both
-                # take the bf16 path. torch.cuda.amp.autocast silently disables
-                # autocast when CUDA is absent (we measured this on Aurora),
-                # which falls back to fp32 and tanks throughput.
-                with torch.amp.autocast(device_type=device.type, dtype=dtype,
-                                        enabled=mixed_precision):
-                    h = forward_target(clips)
-                    phase_timer.mark("fwd_target_done")
-                    z_pred, z_context = forward_context(clips)
-                    loss = 0
-                    loss_pred = loss_fn(
-                        z_pred, h, masks_pred, cls_loss=has_cls_first, d_weights=None
-                    )
-                    loss += loss_pred
-
-                    # Context loss
-                    loss_context = torch.zeros((), device=loss_pred.device)
-                    lambda_value_step = 0.0
-                    if predict_all:
-                        distance_weights = compute_mask_distance(
-                            masks_pred, masks_enc, grid_size, offset_context_loss
+                # Step 1. Forward for one (micro)batch — device-agnostic autocast
+                # so XPU/CUDA both take the bf16 path. torch.cuda.amp.autocast
+                # silently disables autocast when CUDA is absent (measured on
+                # Aurora), falling back to fp32 and tanking throughput.
+                def _forward_losses(clips_mb, menc_mb, mpred_mb):
+                    with torch.amp.autocast(device_type=device.type, dtype=dtype,
+                                            enabled=mixed_precision):
+                        h = forward_target(clips_mb)
+                        z_pred, z_context = forward_context(
+                            clips_mb, menc_mb, mpred_mb
                         )
-                        if weight_distance_loss:
-                            d_weights = distance_weights
-                        else:
-                            d_weights = None
-                        loss_context = loss_fn(
-                            z_context, h, masks_enc, cls_loss=False, d_weights=d_weights
+                        loss_pred = loss_fn(
+                            z_pred, h, mpred_mb, cls_loss=has_cls_first, d_weights=None
                         )
-                        if lambda_progressive:
-                            lambda_value_step = lambda_sched.value(epoch * ipe + itr)
-                        else:
-                            lambda_value_step = lambda_value
-                        loss += loss_context * lambda_value_step
+                        loss = loss_pred
+                        loss_context = torch.zeros((), device=loss_pred.device)
+                        lambda_value_step = 0.0
+                        if predict_all:
+                            distance_weights = compute_mask_distance(
+                                mpred_mb, menc_mb, grid_size, offset_context_loss
+                            )
+                            d_weights = (
+                                distance_weights if weight_distance_loss else None
+                            )
+                            loss_context = loss_fn(
+                                z_context, h, menc_mb, cls_loss=False,
+                                d_weights=d_weights,
+                            )
+                            if lambda_progressive:
+                                lambda_value_step = lambda_sched.value(
+                                    epoch * ipe + itr
+                                )
+                            else:
+                                lambda_value_step = lambda_value
+                            loss = loss + loss_context * lambda_value_step
+                    return loss, loss_pred, loss_context, lambda_value_step
 
-                phase_timer.mark("fwd_context_done")
-
-                # Step 2. Backward & step
+                # Step 2. Backward & step.
                 run_step = True
-                if loss_reg_std_mult is not None:
-                    meanval = np.mean(trailing_losses)
-                    stdval = np.std(trailing_losses)
-                    max_bound = meanval + loss_reg_std_mult * stdval
-                    if (
-                        loss > max_bound
-                        and epoch > loss_reg_min_epoch
-                        and len(trailing_losses)
-                        > int(0.5 * loss_reg_num_tracking_steps)
-                    ):
-                        run_step = False
-                        loss.backward()
-                        logger.info(
-                            f"Loss {loss} is above bound {meanval} + {loss_reg_std_mult} * {stdval}. Skipping step."
+                if grad_accum <= 1:
+                    # -- single-batch path (default; behavior unchanged) --
+                    loss, loss_pred, loss_context, lambda_value_step = _forward_losses(
+                        clips, masks_enc, masks_pred
+                    )
+                    phase_timer.mark("fwd_target_done")
+                    phase_timer.mark("fwd_context_done")
+                    if loss_reg_std_mult is not None:
+                        meanval = np.mean(trailing_losses)
+                        stdval = np.std(trailing_losses)
+                        max_bound = meanval + loss_reg_std_mult * stdval
+                        if (
+                            loss > max_bound
+                            and epoch > loss_reg_min_epoch
+                            and len(trailing_losses)
+                            > int(0.5 * loss_reg_num_tracking_steps)
+                        ):
+                            run_step = False
+                            loss.backward()
+                            logger.info(
+                                f"Loss {loss} is above bound {meanval} + {loss_reg_std_mult} * {stdval}. Skipping step."
+                            )
+                    if run_step:
+                        # Branch on the scaler's presence, not on mixed_precision:
+                        # scaler is None for bf16 (no loss scaling) and non-None
+                        # only for fp16. Using `mixed_precision` would call
+                        # scaler.scale() on None under bf16.
+                        if scaler is not None:
+                            scaler.scale(loss).backward()
+                            scaler.unscale_(optimizer)
+                        else:
+                            loss.backward()
+                    phase_timer.mark("backward_done")
+                    loss = float(loss)
+                    loss_pred = float(loss_pred)
+                    loss_context = float(loss_context)
+                else:
+                    # -- gradient-accumulation path (VJEPA_GRAD_ACCUM>1) --
+                    # Slice each fpc slot's batch dim into grad_accum microbatches;
+                    # defer DDP gradient sync (no_sync) until the final microbatch
+                    # so the optimizer sees the full-batch gradient in ONE allreduce.
+                    # Loss is divided by grad_accum so the summed gradient equals the
+                    # full-batch mean gradient (bit-equivalent to bs=batch_size up to
+                    # microbatch-boundary numerics). Timing note: fwd-* marks reflect
+                    # microbatch 0; backward-ms covers all microbatches' fwd+bwd.
+                    def _accum_no_sync():
+                        es = contextlib.ExitStack()
+                        es.enter_context(encoder.no_sync())
+                        es.enter_context(predictor.no_sync())
+                        return es
+
+                    mb = batch_size // grad_accum
+                    loss_sum = loss_pred_sum = loss_context_sum = 0.0
+                    lambda_value_step = 0.0
+                    for j in range(grad_accum):
+                        sl = slice(j * mb, (j + 1) * mb)
+                        clips_mb = [c[sl] for c in clips]
+                        menc_mb = [[m[sl] for m in mm] for mm in masks_enc]
+                        mpred_mb = [[m[sl] for m in mm] for mm in masks_pred]
+                        l, lp, lc, lvs = _forward_losses(clips_mb, menc_mb, mpred_mb)
+                        lambda_value_step = lvs
+                        if j == 0:
+                            phase_timer.mark("fwd_target_done")
+                            phase_timer.mark("fwd_context_done")
+                        l = l / grad_accum
+                        is_last = j == grad_accum - 1
+                        sync_ctx = (
+                            contextlib.nullcontext() if is_last else _accum_no_sync()
                         )
+                        with sync_ctx:
+                            l.backward()
+                        loss_sum += float(l) * grad_accum  # undo /grad_accum for report
+                        loss_pred_sum += float(lp)
+                        loss_context_sum += float(lc)
+                    phase_timer.mark("backward_done")
+                    loss = loss_sum / grad_accum
+                    loss_pred = loss_pred_sum / grad_accum
+                    loss_context = loss_context_sum / grad_accum
 
                 if run_step:
-                    # Branch on the scaler's presence, not on mixed_precision:
-                    # the scaler is now None for bf16 (no loss scaling needed)
-                    # and only non-None for fp16. Using `mixed_precision` here
-                    # would call scaler.scale() on None under bf16.
-                    if scaler is not None:
-                        scaler.scale(loss).backward()
-                        scaler.unscale_(optimizer)
-                    else:
-                        loss.backward()
-                    phase_timer.mark("backward_done")
                     if scaler is not None:
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         optimizer.step()
-                else:
-                    phase_timer.mark("backward_done")
                 optimizer.zero_grad()
                 phase_timer.mark("opt_step_done")
 

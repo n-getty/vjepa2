@@ -71,7 +71,14 @@ def compute_mask_distance(masks_pred, masks_enc, grid_size, offset_context_loss)
                     dmin = dmin * (1.0 / coeff)
                 dmin = dmin**0.5  # We want that it decreases less agressive
                 enc_distances.append(dmin)
-            enc_distances = torch.stack(enc_distances, dim=-1).squeeze()  # (BS, N_enc)
+            # dmin from dist.min(dim=-1) is (BS, 1); stacking over enc tokens
+            # gives (BS, 1, N_enc). squeeze(1) drops ONLY the middle size-1 dim.
+            # The bare .squeeze() used here previously also collapsed the batch
+            # dim when BS==1, producing (N_enc,) and crashing the downstream
+            # d_weights path at d_ij.unsqueeze(2) (the documented bs>=2 landmine).
+            # squeeze(1) is identical for bs>=2 and makes micro-bs=1 (grad accum)
+            # legal on the weight_distance_loss path.
+            enc_distances = torch.stack(enc_distances, dim=-1).squeeze(1)  # (BS, N_enc)
             row_distances.append(enc_distances)
         distances.append(row_distances)
     return distances

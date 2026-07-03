@@ -242,11 +242,17 @@ def load_checkpoint(
             f"loaded pretrained target encoder from epoch {epoch} with msg: {msg}"
         )
 
-    try:
-        opt.load_state_dict(checkpoint["opt"])
-    except ValueError:
-        print("[warn] Optimizer groups mismatch; reinitializing optimizer.")
-    if scaler is not None:
+    # checkpoint["opt"] is None for HSDP checkpoints (sharded optimizer state is
+    # not saved; optimizer is reinitialized on resume — see save_checkpoint note
+    # in train.py). Skip the load cleanly in that case.
+    if checkpoint.get("opt") is None:
+        print("[warn] No optimizer state in checkpoint (HSDP or fresh); keeping current optimizer.")
+    else:
+        try:
+            opt.load_state_dict(checkpoint["opt"])
+        except ValueError:
+            print("[warn] Optimizer groups mismatch; reinitializing optimizer.")
+    if scaler is not None and checkpoint.get("scaler") is not None:
         scaler.load_state_dict(checkpoint["scaler"])
     logger.info(f"loaded optimizers from epoch {epoch}")
     logger.info(f"read-path: {r_path}")
