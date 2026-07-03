@@ -104,8 +104,41 @@ mpiexec -n 16 -ppn 1 --cpu-bind none \
         --num-nodes 16 --local-world-size 12 --workers 8
 echo "--- staging complete ---"
 
+# ---- STALL WATCHDOG: fast-fail if no iters get logged ----
+# A silent load/collective hang (e.g. job 8642347: 40min, 0 iters) must NOT idle
+# 16 nodes to walltime. This background watchdog kills the training mpiexec if the
+# per-rank CSV (log_r0.csv) does not gain rows within FIRST_ITER_DEADLINE of launch,
+# or stalls (no new rows) for STALL_DEADLINE thereafter.
+CSV_WATCH="$CKPT_DIR/log_r0.csv"   # folder key == $CKPT_DIR (set in the patch above)
+FIRST_ITER_DEADLINE=600   # 10 min: staging+wrap+load+first iter must land by here
+STALL_DEADLINE=300        # 5 min with no new row after training starts = wedged
+(
+    start=$(date +%s); last_rows=-1; last_change=$start
+    while true; do
+        sleep 30
+        # stop watching once the trainer mpiexec is gone
+        pgrep -f "app.main_dist_aurora" >/dev/null 2>&1 || exit 0
+        now=$(date +%s)
+        rows=0; [ -f "$CSV_WATCH" ] && rows=$(($(wc -l < "$CSV_WATCH" 2>/dev/null || echo 1)-1))
+        if [ "$rows" -gt 0 ]; then
+            if [ "$rows" -ne "$last_rows" ]; then last_rows=$rows; last_change=$now; fi
+            if [ $((now-last_change)) -gt $STALL_DEADLINE ]; then
+                echo "WATCHDOG: STALL — no new iters for ${STALL_DEADLINE}s at row $rows. Killing." >&2
+                pkill -9 -f "app.main_dist_aurora"; exit 1
+            fi
+        else
+            if [ $((now-start)) -gt $FIRST_ITER_DEADLINE ]; then
+                echo "WATCHDOG: NO FIRST ITER within ${FIRST_ITER_DEADLINE}s (load/collective hang). Killing." >&2
+                pkill -9 -f "app.main_dist_aurora"; exit 1
+            fi
+        fi
+    done
+) &
+WATCHDOG_PID=$!
+
 mpiexec --pmi=pmix -n 192 -ppn 12 --cpu-bind depth --depth 16 \
     python -m app.main_dist_aurora --train_mode \
         --fname $PARAMS --params_path $PARAMS \
         --local_data_root $LOCAL_DATA_ROOT
+kill $WATCHDOG_PID 2>/dev/null
 echo "JOB END: $(date)"
