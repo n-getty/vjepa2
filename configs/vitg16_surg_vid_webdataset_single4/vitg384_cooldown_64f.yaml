@@ -38,7 +38,22 @@ data:
   # pHash-deduped vs eval+surgenet_robotic (3 dropped, 100% eval self-recall).
   # Weight 1. ~60s clips fill the 64f window natively. Owner-only on disk.
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/lemon
+  # --- New video sources (segmented this session; see scripts/segment_videos_pbs.sh).
+  # Confirm each dir has a metadata.json before launching (don't run against a
+  # half-resharded dir). heichole/multibypass140 = lap full-procedures cut to 60s
+  # (fill the 64f window). gynsurg/lapgyn6_events = gyn-laparoscopy pre-cut segments
+  # (NEW sub-domain); the *segments* variants were chosen precisely because they
+  # include clips long enough for the 64f@4fps window (>=16s), unlike the 3s
+  # action-recognition variants. Shared Vienna pool, no dedup, per decision.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/heichole
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/multibypass140
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/gynsurg
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/lapgyn6_events
   datasets_weights:
+  - 1
+  - 1
+  - 1
+  - 1
   - 1
   - 1
   - 1
@@ -55,6 +70,10 @@ data:
   crop_size: 384
   patch_size: 16
   dataset_fpcs:
+  - 64
+  - 64
+  - 64
+  - 64
   - 64
   - 64
   - 64

@@ -19,8 +19,10 @@ Root: `/flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/`
 
 All sources are resharded `.tar` WebDataset. The active ViT-g 384 mix
 (`configs/vitg16_surg_vid_webdataset_single4/vitg384_cleandata.yaml` for pretrain,
-`vitg384_cooldown_64f.yaml` for cooldown) uses **9 sources, all weight 1.0**, with
+`vitg384_cooldown_64f.yaml` for cooldown) uses **14 sources, all weight 1.0**, with
 `sampling_temperature: 0.5` (sqrt-size) and `min_clip_std: 1.0` (drops black/frozen clips).
+The bottom 4 rows were added this session and their configs point at them; ⏳ = segment+reshard
+job still in flight (confirm a `metadata.json` exists in each dir before launching a run).
 
 | Source key | On disk | Shards | Modality / notes | In active ViT-g mix |
 |---|---|---|---|---|
@@ -31,8 +33,13 @@ All sources are resharded `.tar` WebDataset. The active ViT-g 384 mix
 | `grasp` | 133G | 124 | GraSP robotic prostatectomy, 1,988 clips @ 60s. Video-native segmentation; modality-matched to our evals. | ✅ |
 | `sitl` | 90G | 600 | Original SITL segmentation (kept alongside `sitl_2026` per decision). | ✅ |
 | `cholec80` | 70G | 182 | Cholec80 laparoscopic cholecystectomy 25fps, 2,916 clips. Domain-broadening (laparoscopic). | ✅ |
-| `surgenet_robotic` | 23G | 500 | SurgeNet robotic subset. | ✅ |
+| `surgenet_robotic_clean` | 23G | 500 | SurgeNet robotic subset, minus 40 eval-leaked source videos (318 clips dropped) — eval-scrub. | ✅ |
+| `lemon` | ~900G | — | LEMON / Surg-3M: 4,194 YouTube surgical videos → 53,650 clips, 35 procedures (2,527 lap + 1,667 robotic). pHash-deduped vs eval + surgenet_robotic. Owner-only. | ✅ |
 | `small_surg` | (symlinks) | — | Symlink bundle of the 6 tiny sets below (926 clips total). Bundled so temperature sampling sizes them by combined count instead of oversampling each individually. | ✅ |
+| `heichole` | ⏳ | ⏳ | HeiChole: 24 HD lap-chole full procedures, 3 centers (~22h → 60s clips). White-censored out-of-body spans dropped by `min_clip_std`. | ✅ (⏳ segmenting) |
+| `multibypass140` | ⏳ | ⏳ | MultiBypass140: 140 lap gastric-bypass procedures, Bern+Strasbourg (2 centers) → 60s clips. | ✅ (⏳ segmenting) |
+| `gynsurg` | ⏳ | ⏳ | GynSurg action segments, gyn laparoscopy (**new sub-domain**), 1080p/30fps pre-cut clips (≥4s filter). Shares Vienna pool w/ `lapgyn6_events`. | ✅ (⏳ segmenting) |
+| `lapgyn6_events` | ⏳ | ⏳ | LapGyn6-Events segments, gyn laparoscopy, pre-cut event clips (≥4s; segments variant is 64f-capable). Shares Vienna pool w/ `gynsurg`, no dedup (different segment types). | ✅ (⏳ segmenting) |
 
 ### `small_surg` bundle members
 
@@ -55,16 +62,32 @@ On disk but not referenced by the active ViT-g configs:
 
 | Dir | On disk | Status |
 |---|---|---|
-| `lemon_staging` | 922G | LEMON / Surg-3M (4,194 YouTube surgical videos → 3.4M frames). pHash-dedup ingest built; staging only, not yet in the mix. |
 | `surgvu24` | 325G | Pre-filter SurgVU-24 (superseded by `surgvu24_clean`). |
 | `grasp_staging`, `grasp_clean` | — | Intermediate GraSP segmentation stages. |
 | `cholec80_staging`, `cholec80_clean` | — | Intermediate Cholec80 segmentation stages. |
+| `*_staging` (heichole/multibypass140/gynsurg/lapgyn6_events) | — | Per-source seg output; resharded into the final dirs above. |
+| `incoming_robotic/{cholecseg8k}` | 2.9G | CholecSeg8k — **kept, not packed** (Cholec80-frame redundancy; masks-only signal). Future segmentation-probe set. |
+
+### IMAGE sets — held for a targeted cooldown (not in the current video mix)
+
+Downloaded + packer-ready but **deliberately left out of the pretrain/cooldown configs for now**;
+intended for a future *targeted* image-branch cooldown to address spatial-task underperformance
+(see §4 and the draft `vitg384_cooldown_64f_imgbranch.yaml`). Packed as `<name>_img/` via
+`scripts/pack_images_pbs.sh`:
+
+| Source | On disk (raw) | Content |
+|---|---|---|
+| `hyperkvasir` | 3.9G | 10.7K labeled GI-endoscopy images, 23 classes. |
+| `dsad` | 20.9G | Dresden anatomy: 13.2K images (masks filtered out at pack time). |
+| `esad` | 13G | ESAD robotic prostatectomy frames (YOLO labels skipped). |
+| `psi_ava` | 12.1G | PSI-AVA robotic prostatectomy keyframes (DETR features skipped). |
 
 ### Loading params (active ViT-g 384)
 
-- `dataset_type: WebDataset`, `batch_size: 2` per rank, `crop_size: 384`, `patch_size: 16`, `tubelet_size: 2`
+- `dataset_type: WebDataset`, `batch_size: 2` per rank (pretrain) / `1` (cooldown 64f), `crop_size: 384`, `patch_size: 16`, `tubelet_size: 2`
 - `fps: 4`, `dataset_fpcs: 16` (pretrain) / `64` (cooldown) — cooldown lengthens the temporal window, fps stays 4.
 - `sampling_temperature: 0.5`, `min_clip_std: 1.0`
+- **14 sources** as of this session (was 10; +heichole, +multibypass140, +gynsurg, +lapgyn6_events).
 
 ---
 
@@ -122,9 +145,9 @@ FORM = email/Google-form approval · FRAMES-ONLY = no temporal video released ·
 
 | Dataset | Modality | Access | New temporal video | Host | Notes |
 |---|---|---|---|---|---|
-| **MultiBypass140** | Laparoscopic (gastric bypass) | **OPEN** (`wget` zip) | 140 videos, 2 centers | CAMMA S3 (`s3.unistra.fr`) | ✅ **downloaded** (365 GB, 6 zips verified) → `data/incoming_robotic/multibypass140/`. CC-BY-NC-SA. `github.com/CAMMA-public/MultiBypass140` |
+| **MultiBypass140** | Laparoscopic (gastric bypass) | **OPEN** (`wget` zip) | 140 videos, 2 centers | CAMMA S3 (`s3.unistra.fr`) | ✅ **downloaded** (365 GB) → segmenting `multibypass140/` + **in configs**. CC-BY-NC-SA. `github.com/CAMMA-public/MultiBypass140` |
 | **UCL Rectal Cancer** | Laparoscopic (TME) | **OPEN** (CC-BY) | 75 MP4s, ~380h, 1080p/25fps | UCL RDR / figshare | **~765 GB** — HEAD one file before staging. figshare API gives direct URLs. DOI 10.5522/04/24769530 |
-| **HeiChole** | Lap cholecystectomy | **TEAM-JOIN** (Synapse) | 24 HD full videos (`Full/HD/`), ~22h, 3 centers | Synapse `syn18824884` | ⏳ **downloading** → `data/incoming_robotic/heichole/full_hd/`. Access = join Team 3390210 (instant, "agree to cite paper"); needs a Download-scoped PAT. `Full/` SD + `Skill/` clips are dupes/subclips — HD only. Multi-center, no known overlap. |
+| **HeiChole** | Lap cholecystectomy | **TEAM-JOIN** (Synapse) | 24 HD full videos (`Full/HD/`), ~22h, 3 centers | Synapse `syn18824884` | ✅ **downloaded** (108GB) → segmenting into `heichole/` + **in configs**. Access = join Team 3390210 (instant); Download-scoped PAT. HD only (`Full/` SD + `Skill/` are dupes/subclips). |
 | **AutoLaparo** | Laparoscopic (hysterectomy) | **FORM** (Google) | 21 videos, ~23h, 1080p/25fps | emailed link | On-domain, small. CC-BY-NC-SA. `autolaparo.github.io` |
 | **EndoMapper** | GI endoscopy | **REG-EULA** (Synapse) | ~96 procedures, >24h continuous | Synapse `syn26707219` | Off-domain (flexible scope) but true complete-procedure video. Best of the GI group. |
 
@@ -164,10 +187,10 @@ are pre-cut to 2–3s — fine for 16f, **too short for 64f cooldown**. Verified
 
 | Dataset | Content | Clip length | Usable for | Download | Size |
 |---|---|---|---|---|---|
-| **GynSurg** (action-segments) | 1080p/30fps video, 152 source vids → segments | segments (longer) | 16f ✅, 64f ⚠️ verify | ✅ **downloaded** (44.2GB) `gynsurg/GynSurg_Action_Segments.zip` | 47.5 GB |
+| **GynSurg** (action-segments) | 1080p/30fps video, 152 source vids → segments | segments (longer) | 16f ✅, 64f ⚠️ verify | ✅ **downloaded** (44.2GB) → segmenting `gynsurg/` + **in configs** | 47.5 GB |
 | **GynSurg** (3sec) | 1080p/30fps, 3s clips | 3s | 16f only (12f@4fps) | `GynSurg_Action_3sec.zip` | 26.1 GB |
 | **GynSurg** (raw LHE 75 vids) | full HD procedures | full | 16f ✅ + 64f ✅ | **FORM-gated** (sign `LapGynLHE...UsageAgreementForm.pdf`) | — |
-| **LapGyn6-Events** (segments) | video, up to >1 min clips | 1s–>1min | 16f ✅ + **64f ✅** | ✅ **downloaded** (53.9GB) `lapgyn6_events/Event_Segments_LapGyn_dataset.zip` | 57.9 GB |
+| **LapGyn6-Events** (segments) | video, up to >1 min clips | 1s–>1min | 16f ✅ + **64f ✅** | ✅ **downloaded** (53.9GB) → segmenting `lapgyn6_events/` + **in configs** | 57.9 GB |
 | **LapGyn6-Events** (recognition) | video, 2–3s clips | 2–3s | 16f only | `Event_Recognition_LapGyn_dataset.zip` | 40.6 GB |
 | **LapGyn6-Actions** | video clips (`.rar`, needs `unrar`) | likely 2–3s | 16f only (verify) | `.../LapGyn6-Actions/Dataset.rar` | 4.33 GB |
 | **SurgicalActions160** | 160 mp4, 427×240/25fps | 2–5s (avg 4.8s) | 16f (91% of clips); **tiny ~13min total** | `.../SurgicalActions160/downloads/SurgicalActions160.zip` | 44.8 MB |

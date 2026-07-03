@@ -82,7 +82,27 @@ data:
   # (1 eval-leak @12.5%, 2 train-dup) with 100% eval self-recall, so the triplet
   # eval is protected from leakage. Weight 1 like every other source. Owner-only.
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/lemon
+  # --- New video sources (segmented this session; see scripts/segment_videos_pbs.sh).
+  # NOTE: these dirs are produced by the seg+reshard jobs; confirm each has a
+  # metadata.json before launching a run (do NOT start against a half-resharded dir).
+  # heichole = 24 HD lap-chole full procedures, 3 centers (~22h -> 60s clips).
+  # multibypass140 = 140 lap gastric-bypass procedures, Bern+Strasbourg (2 centers).
+  # Both are raw full procedures cut to 60s; min_clip_std drops HeiChole's
+  # white-censored out-of-body spans (std~0) like it drops surgvu24 black clips.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/heichole
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/multibypass140
+  # gynsurg + lapgyn6_events = gynecologic laparoscopy (NEW sub-domain for us),
+  # pre-cut action/event segments kept as-is (>=4s filter applied at segment time).
+  # They share the Medical-Univ-Vienna ~600-video pool (105 shared case IDs) but
+  # extract different segment types; ingested as separate sources w/o pHash dedup
+  # per decision. sqrt-size temperature sampling down-weights the shared pool.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/gynsurg
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/lapgyn6_events
   datasets_weights:
+  - 1
+  - 1
+  - 1
+  - 1
   - 1
   - 1
   - 1
@@ -102,6 +122,10 @@ data:
   crop_size: 384
   patch_size: 16
   dataset_fpcs:
+  - 16
+  - 16
+  - 16
+  - 16
   - 16
   - 16
   - 16
