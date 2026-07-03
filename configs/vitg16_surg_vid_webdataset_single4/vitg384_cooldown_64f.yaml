@@ -39,12 +39,17 @@ data:
   # Weight 1. ~60s clips fill the 64f window natively. Owner-only on disk.
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/lemon
   # --- New video sources (segmented this session; see scripts/segment_videos_pbs.sh).
-  # Confirm each dir has a metadata.json before launching (don't run against a
-  # half-resharded dir). heichole/multibypass140 = lap full-procedures cut to 60s
-  # (fill the 64f window). gynsurg/lapgyn6_events = gyn-laparoscopy pre-cut segments
-  # (NEW sub-domain); the *segments* variants were chosen precisely because they
-  # include clips long enough for the 64f@4fps window (>=16s), unlike the 3s
-  # action-recognition variants. Shared Vienna pool, no dedup, per decision.
+  # All 15 dirs verified present + decode-clean (metadata==disk shards, sidecars OK).
+  # heichole/multibypass140 = lap full-procedures cut to 60s (fill the 64f window).
+  # gynsurg/lapgyn6_events = gyn-laparoscopy pre-cut segments (NEW sub-domain),
+  # shared Vienna pool, no dedup per decision.
+  # CAVEAT (64f): the *segments* variants are the LONGER cut, but still short-heavy
+  # for a 64-frame@4fps window (needs >=16s): measured medians gynsurg 13.6s /
+  # lapgyn6_events 11.9s, only ~45%/~37% of clips reach >=16s. This does NOT crash
+  # — loadvideo_decord pads short clips by repeating the last frame
+  # (filter_short_videos=False), same benign padding as kinetics400@64f. Net: ~half
+  # the gyn clips give weaker temporal signal here; kept for domain diversity. In
+  # the 16f PRETRAIN config they're fully fine (16f@4fps needs only 4s; 100% clear).
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/heichole
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/multibypass140
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/gynsurg

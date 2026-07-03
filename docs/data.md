@@ -21,8 +21,10 @@ All sources are resharded `.tar` WebDataset. The active ViT-g 384 mix
 (`configs/vitg16_surg_vid_webdataset_single4/vitg384_cleandata.yaml` for pretrain,
 `vitg384_cooldown_64f.yaml` for cooldown) uses **15 sources, all weight 1.0**, with
 `sampling_temperature: 0.5` (sqrt-size) and `min_clip_std: 1.0` (drops black/frozen clips).
-The bottom 5 rows were added this session and their configs point at them; ⏳ = segment+reshard
-job still in flight (confirm a `metadata.json` exists in each dir before launching a run).
+The bottom 5 rows were added this session. **All 15 verified 2026-07-03**: metadata present,
+`shard_count` == disk tar count, sampled clips decode with json/cls sidecars — launch-ready.
+(To re-verify before a run, the check compares each config source's `metadata.json` shard_urls
+against disk and decodes a sample.)
 
 | Source key | On disk | Shards | Modality / notes | In active ViT-g mix |
 |---|---|---|---|---|
@@ -36,11 +38,11 @@ job still in flight (confirm a `metadata.json` exists in each dir before launchi
 | `surgenet_robotic_clean` | 23G | 500 | SurgeNet robotic subset, minus 40 eval-leaked source videos (318 clips dropped) — eval-scrub. | ✅ |
 | `lemon` | ~900G | — | LEMON / Surg-3M: 4,194 YouTube surgical videos → 53,650 clips, 35 procedures (2,527 lap + 1,667 robotic). pHash-deduped vs eval + surgenet_robotic. Owner-only. | ✅ |
 | `small_surg` | (symlinks) | — | Symlink bundle of the 6 tiny sets below (926 clips total). Bundled so temperature sampling sizes them by combined count instead of oversampling each individually. | ✅ |
-| `heichole` | ⏳ | ⏳ | HeiChole: 24 HD lap-chole full procedures, 3 centers (~22h → 60s clips). White-censored out-of-body spans dropped by `min_clip_std`. | ✅ (⏳ segmenting) |
-| `multibypass140` | ⏳ | ⏳ | MultiBypass140: 140 lap gastric-bypass procedures, Bern+Strasbourg (2 centers) → 60s clips. | ✅ (⏳ segmenting) |
-| `gynsurg` | ⏳ | ⏳ | GynSurg action segments, gyn laparoscopy (**new sub-domain**), 1080p/30fps pre-cut clips (≥4s filter). Shares Vienna pool w/ `lapgyn6_events`. | ✅ (⏳ segmenting) |
-| `lapgyn6_events` | ⏳ | ⏳ | LapGyn6-Events segments, gyn laparoscopy, pre-cut event clips (≥4s; segments variant is 64f-capable). Shares Vienna pool w/ `gynsurg`, no dedup (different segment types). | ✅ (⏳ segmenting) |
-| `surgenet_lap` | done | 365 | SurgeNet **laparoscopic** YouTube set (4fps), 5,843 clips: raw procedure dirs re-segmented to 60s + `clips_1min` subset. Eval-gated at segment time (crop-aug ref, 0 leaks); 96.9% distinct from `lemon`. Owner-only. The first lap-SurgeNet in the corpus. | ✅ (resharded) |
+| `heichole` | ✅ | 55 | HeiChole: 24 HD lap-chole full procedures, 3 centers → **894 clips** @ 60s/1080p/25fps. White-censored out-of-body spans dropped by `min_clip_std`. | ✅ |
+| `multibypass140` | ✅ | 818 | MultiBypass140: 140 lap gastric-bypass procedures, Bern+Strasbourg (2 centers) → **13,090 clips** @ 60s. | ✅ |
+| `gynsurg` | ✅ | 190 | GynSurg action segments, gyn laparoscopy (**new sub-domain**), 1080p/30fps pre-cut clips (≥4s filter) → **3,053 clips**. Shares Vienna pool w/ `lapgyn6_events`. ⚠️ median 13.6s → only ~45% fill the 64f cooldown window (rest padded; see cooldown note). | ✅ |
+| `lapgyn6_events` | ✅ | 134 | LapGyn6-Events segments, gyn laparoscopy → **2,155 clips**. Shares Vienna pool w/ `gynsurg`, no dedup (different segment types). ⚠️ median 11.9s → only ~37% fill 64f (rest padded). | ✅ |
+| `surgenet_lap` | ✅ | 365 | SurgeNet **laparoscopic** YouTube set (4fps), **5,843 clips**: raw procedure dirs re-segmented to 60s + `clips_1min` subset. Eval-gated at segment time (crop-aug ref, 0 leaks); 96.9% distinct from `lemon`. Owner-only. The first lap-SurgeNet in the corpus. | ✅ |
 
 ### `small_surg` bundle members
 
