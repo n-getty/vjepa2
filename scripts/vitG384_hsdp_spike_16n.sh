@@ -60,17 +60,22 @@ python -c "import torch; print('torch', torch.__version__)" 2>&1 | grep -viE "Us
 
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 export MPICH_GPU_SUPPORT_ENABLED=1
-export CCL_PROCESS_LAUNCHER=pmix
-export CCL_ATL_TRANSPORT=mpi
-export CCL_KVS_MODE=mpi
-export CCL_KVS_USE_MPI_RANKS=1
-export CCL_CONFIGURATION=cpu_gpu_dpcpp
-export CCL_KVS_CONNECTION_TIMEOUT=600
+# HSDP TRANSPORT FIX (validated 2n, job 8643134: 60 iters clean vs pmix/mpi hang):
+# FSDP's rapid intra/inter-node subgroup collectives DEADLOCK under the pmix/mpi
+# ATL transport (a single bare all_reduce passes, but sustained FSDP load hangs at
+# iter 0). PRISM's launcher=none + ofi transport handles it. NOTE: with
+# launcher=none the training mpiexec must NOT pass --pmi=pmix.
+export CCL_PROCESS_LAUNCHER=none
+export CCL_ATL_TRANSPORT=ofi
+export CCL_KVS_IFACE=hsn0
 export CCL_OP_SYNC=1
 export CCL_WORKER_COUNT=1
 export CCL_ALLREDUCE=ring
 export CCL_CHUNK_SIZE=16777216
 export FI_PROVIDER=cxi
+export FI_CXI_RX_MATCH_MODE=hybrid
+export FI_CXI_OFLOW_BUF_SIZE=8388608
+export FI_CXI_DEFAULT_CQ_SIZE=131072
 export PYTHONFAULTHANDLER=1
 export TMPDIR=/tmp
 export OMP_NUM_THREADS=16
@@ -136,7 +141,7 @@ STALL_DEADLINE=300        # 5 min with no new row after training starts = wedged
 ) &
 WATCHDOG_PID=$!
 
-mpiexec --pmi=pmix -n 192 -ppn 12 --cpu-bind depth --depth 16 \
+mpiexec -n 192 -ppn 12 --cpu-bind depth --depth 16 \
     python -m app.main_dist_aurora --train_mode \
         --fname $PARAMS --params_path $PARAMS \
         --local_data_root $LOCAL_DATA_ROOT
