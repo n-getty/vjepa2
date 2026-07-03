@@ -147,7 +147,14 @@ def wrap_hsdp(module, mesh, *, requires_grad=True, logger=None):
         sharding_strategy=sharding,
         device_mesh=mesh,
         use_orig_params=True,
-        sync_module_states=True,
+        # NB: sync_module_states=True HANGS at FSDP construction on Aurora
+        # xccl (its rank-0 broadcast never completes; isolated on a held node
+        # 2026-07-03 — bare/device_id wrap in ~0.2s, sync_module_states hangs
+        # >900s). We don't need it: the encoder loads a full checkpoint under
+        # FULL_STATE_DICT (every rank applies identical weights) and
+        # target_encoder is a deepcopy of encoder before wrap, so all ranks
+        # already start from identical module states. PRISM's validated wrap
+        # also omits it.
         limit_all_gathers=True,
     )
     # Prefetch overlap (default on; per-unit wrapping makes them effective).
