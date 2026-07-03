@@ -104,18 +104,20 @@ def _worker(rank, world_size, dim, depth, heads, m, seed, ret):
         tgt_ref = {k: v.clone() for k, v in target.state_dict().items()}
         expected = _reference_ema(enc_ref, tgt_ref, m)
 
-        # 1D mesh (pure shard) is enough to prove shard-aligned EMA; production
-        # uses the 2D (replicate, shard) mesh but the intra-node shard axis is
-        # what the _foreach EMA runs over.
-        mesh = init_device_mesh(dev, (world_size,), mesh_dim_names=("shard",))
+        # 1D mesh (pure shard) is enough to prove shard-aligned EMA — what we're
+        # validating is that the _foreach EMA acts on aligned local shards, which
+        # is governed by the SHARD axis alone. Production uses the 2D (replicate,
+        # shard) mesh with _HYBRID_SHARD_ZERO2, but hybrid strategies REQUIRE a
+        # 2D mesh; here we use plain SHARD_GRAD_OP on the 1D mesh, which shards
+        # params/grads identically along the shard axis (same shard boundaries
+        # the EMA must respect). init_device_mesh with a single dim + no name.
+        mesh = init_device_mesh(dev, (world_size,))
         wrap_policy = partial(
             transformer_auto_wrap_policy, transformer_layer_cls={Block}
         )
         common = dict(
             auto_wrap_policy=wrap_policy,
-            sharding_strategy=ShardingStrategy._HYBRID_SHARD_ZERO2
-            if hasattr(ShardingStrategy, "_HYBRID_SHARD_ZERO2")
-            else ShardingStrategy.SHARD_GRAD_OP,
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
             device_mesh=mesh,
             use_orig_params=True,
             sync_module_states=False,  # keep our distinct init on each module
