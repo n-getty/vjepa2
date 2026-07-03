@@ -98,7 +98,15 @@ data:
   # per decision. sqrt-size temperature sampling down-weights the shared pool.
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/gynsurg
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/lapgyn6_events
+  # surgenet_lap = SurgeNet laparoscopic YouTube set (Leo's scrape, 4fps), 5843
+  # clips: raw procedure dirs re-segmented to 60s (runts dropped) + the already-
+  # clean clips_1min subset, merged. EVAL-GATED at segment time (crop-aug ref, 0
+  # leaks; the 42 leaked raw clips + robotic_chole were dropped pre-ingest).
+  # 96.9% distinct from LEMON (different YouTube scrape). Black filter ~no-op
+  # (sampled pixel std >=32); runtime min_clip_std backstop stays on. Owner-only.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_lap
   datasets_weights:
+  - 1
   - 1
   - 1
   - 1
@@ -122,6 +130,7 @@ data:
   crop_size: 384
   patch_size: 16
   dataset_fpcs:
+  - 16
   - 16
   - 16
   - 16
