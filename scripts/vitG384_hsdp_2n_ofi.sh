@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #PBS -N vitG_hsdp2ofi
 #PBS -A ModCon
-#PBS -q debug
+#PBS -q debug-scaling
 #PBS -l select=2
 #PBS -l walltime=00:30:00
 #PBS -l filesystems=home:flare

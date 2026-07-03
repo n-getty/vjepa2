@@ -87,9 +87,12 @@ export MASTER_PORT=29500
 export WORLD_SIZE=12
 echo "HSDP smoke: WORLD_SIZE=$WORLD_SIZE LOCAL_WORLD_SIZE=$LOCAL_WORLD_SIZE FSDP_SHARDING=$FSDP_SHARDING"
 
-# ===== CHECK 1: EMA-over-sharded-params unit test (2 ranks, gloo+XPU) =====
-echo "=== CHECK 1: tests/test_hsdp_ema.py ==="
-python tests/test_hsdp_ema.py 2>&1 | grep -viE "UserWarning|warnings.warn|FutureWarning" | tail -6
+# ===== CHECK 1: EMA-over-sharded-params unit test (MPI-native, 2 ranks, xccl) =====
+# Must launch under mpiexec so CCL's mpi transport has its launcher; the test
+# pins ZE_AFFINITY_MASK per rank from PALS_LOCAL_RANKID before torch import.
+echo "=== CHECK 1: tests/test_hsdp_ema.py (mpiexec -n 2) ==="
+mpiexec --pmi=pmix -n 2 -ppn 2 --cpu-bind depth --depth 16 \
+    python tests/test_hsdp_ema.py 2>&1 | grep -viE "UserWarning|warnings.warn|FutureWarning" | tail -8
 echo "=== CHECK 1 done ==="
 
 # ===== CHECK 2: 1-node HSDP training smoke on the real 2B =====
