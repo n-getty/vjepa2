@@ -1,0 +1,135 @@
+# 1-NODE SMOKE of the 2B ViT-G @ 384 config. Purpose: measure peak GPU memory at
+# the REAL bs2 / fpcs16 / 384px on a single 64GB PVC tile (the OPEN RISK for the
+# 2B swap — see memory vitG-2b-swap), confirm the checkpoint loads on-device with
+# 0 missing keys, and get a steady-state iter time. NOT a training run.
+#
+# Identical to vitG384_cleandata.yaml EXCEPT: short run (epochs 1, ipe 40), no
+# checkpoint saving (save_every_freq huge), eval off, and a throwaway folder.
+# Everything that drives memory (model_name, batch_size, crop_size, dataset_fpcs,
+# masks, use_activation_checkpointing, bf16) is byte-identical to the real config.
+app: vjepa_2_1
+nodes: 1
+tasks_per_node: 12
+cpus_per_task: 16
+mem_per_gpu: 40G
+folder: /flare/ModCon/ngetty/checkpoints/SMOKE_vitG384/smoke
+data:
+  num_clips: 10
+  dataset_type: WebDataset
+  # SMOKE ONLY: 3 small datasets with >=32 shards each (~4GB total) so per-node
+  # staging stays sharded and fits /tmp. Dataset CONTENT is irrelevant to the
+  # memory measurement (peak mem is set by model/batch/crop/fpcs). The real
+  # vitG384_cleandata.yaml uses all 11 datasets; the 16-node run stages 1/16 of
+  # each per node, so its per-node footprint is small — the /tmp overflow here is
+  # a 1-node artifact, not a real-config problem.
+  datasets:
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/crcd
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/jigsaw
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgvisdom
+  datasets_weights:
+  - 1
+  - 1
+  - 1
+  sampling_temperature: 0.5
+  min_clip_std: 1.0
+  batch_size: 2
+  crop_size: 384
+  patch_size: 16
+  dataset_fpcs:
+  - 16
+  - 16
+  - 16
+  tubelet_size: 2
+  fps: 4
+  num_workers: 2
+  persistent_workers: true
+  pin_mem: true
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+loss:
+  loss_exp: 1.0
+  predict_all: true
+  shift_by_n: 0
+  weight_distance_loss: true
+mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 8
+  spatial_scale:
+  - 0.15
+  - 0.15
+  temporal_scale:
+  - 1.0
+  - 1.0
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 2
+  spatial_scale:
+  - 0.7
+  - 0.7
+  temporal_scale:
+  - 1.0
+  - 1.0
+meta:
+  context_encoder_key: encoder
+  dtype: bfloat16
+  eval_freq: 1000000000
+  load_checkpoint: true
+  load_predictor: true
+  pretrain_checkpoint: /flare/ModCon/ngetty/checkpoints/vjepa2_1_vitG_384.pt
+  read_checkpoint: null
+  save_every_freq: 1000000000
+  seed: 239
+  target_encoder_key: target_encoder
+  use_sdpa: true
+model:
+  has_cls_first: false
+  img_temporal_dim_size: 1
+  interpolate_rope: true
+  is_causal: false
+  lambda_value_vid: 0.5
+  lambda_start_iter: 500
+  lambda_end_iter: 1500
+  modality_embedding: true
+  model_name: vit_gigantic_xformers
+  n_registers: 0
+  n_registers_predictor: 0
+  normalize_predictor: false
+  pred_depth: 24
+  pred_embed_dim: 384
+  pred_is_causal: false
+  pred_num_heads: 12
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_mask_tokens: true
+  use_rope: true
+  zero_init_mask_tokens: true
+optimization:
+  ema:
+  - 0.99925
+  - 0.99925
+  epochs: 1
+  final_lr: 1.0e-06
+  final_weight_decay: 0.04
+  ipe: 40
+  ipe_scale: 1.0
+  lr: 7.5e-05
+  start_lr: 1.0e-06
+  warmup: 2.0
+  weight_decay: 0.04
