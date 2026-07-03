@@ -13,7 +13,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 nn_=ws//lws; mesh=init_device_mesh("xpu",(nn_,lws),mesh_dim_names=("replicate","shard")); log("mesh built")
-m=nn.Sequential(*[Block(dim=1664,num_heads=26,use_rope=True,use_sdpa=True) for _ in range(4)]).to("xpu:0")
+m=nn.Sequential(*[Block(dim=1664,num_heads=26,use_rope=False,use_sdpa=False) for _ in range(4)]).to("xpu:0")
 mp=MixedPrecision(param_dtype=torch.bfloat16,reduce_dtype=torch.bfloat16,buffer_dtype=torch.bfloat16)
 wp=partial(transformer_auto_wrap_policy,transformer_layer_cls={Block})
 f=FSDP(m,auto_wrap_policy=wp,mixed_precision=mp,sharding_strategy=ShardingStrategy._HYBRID_SHARD_ZERO2,device_mesh=mesh,use_orig_params=True,limit_all_gathers=True)
