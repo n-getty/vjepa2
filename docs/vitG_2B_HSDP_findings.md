@@ -88,7 +88,62 @@ and the production `scripts/vitG384_capacity.sh`.
 
 ---
 
-## 4. ROOT CAUSE OF THE DRIFT (RESOLVED by review, 2026-07-03): per-layer FSDP wrapping
+## 4. ROOT CAUSE OF THE DRIFT: TWO VA-churn sources (both fixed, verifying 16n)
+
+**Empirical result (2026-07-03, post-review).** The reviewer proposed two causes.
+Both are real; the first is necessary-but-not-sufficient, the second is dominant.
+
+**Cause 1 — per-layer FSDP wrapping (fixed; verified engaged; NOT sufficient alone).**
+`transformer_auto_wrap_policy({Block})` made the 2B ~72 FSDP units → ~72 inter-node
+collective triples/step. Fixed in `hsdp.py`: `shard_grad_op` now wraps **top-level**
+(one unit, no auto_wrap_policy), mirroring PRISM `distributed.py:458` and torchtune
+`CLAUDE.md:15`. **16n spike 8643247 confirmed top-level wrap engaged (all 6 modules
+"no auto_wrap_policy") but STILL DRIFTED** — windowed iter-time
+19.5→9.5→16.3→35.2→13.0→10.7→16.6→27.0→**54.0**s over 177 iters. So the collective
+count was one churn source, not the only one.
+
+**Cause 2 — variable mask keep-lengths (fixed; the dominant driver).**
+V-JEPA's mask collator draws a new block size/position **every step**
+(`multiseq_multiblock3d.py:__call__`), and `max_keep: null` in every vitg384 config,
+so the kept-token counts vary step-to-step. **Measured directly** by driving the real
+collator 300 steps at 384px/fpc16/bs2 (grid 8×24×24 = 4608 tokens):
+
+| mask cfg | ENC len range | ENC distinct/300 | PRED len range | PRED distinct/300 |
+|----------|---------------|------------------|-----------------|--------------------|
+| 0 | 952–2288 | **122** | 1752–3368 | **124** |
+| 1 | 96–1344 | **55** | 3128–4224 | **42** |
+
+Nearly every step produces a new tensor length → the caching allocator hands out a
+new VA → CCL registers a fresh L0 IPC handle + OFI MR that iteration → external
+memory grows outside torch's pool (max_memory_allocated stays flat at 22 GB), and the
+collective progressively stalls. This is exactly torchtune `allocator_strategy.md:29-30`
+("Stable L0 VAs … No L0 VA change → no stale IPC handles") and the mechanism PRISM
+removes with `BucketedMultiWebDatasetWrapper` (fixed seq buckets) and torchtune with
+its bucketing allocator. Their bounded ~10 MiB/100-step figure is the *fixed-shape*
+regime; V-JEPA was in the *churning* regime.
+
+**Fix (additive, opt-in, default = bit-for-bit unchanged).** `multiseq_multiblock3d.py`
+gains `num_keep_enc`/`num_keep_pred` per mask cfg: pin the enc/pred kept counts to an
+exact constant every step (truncate longer draws, pad shorter by repeating indices;
+`apply_masks` is a pure gather so duplicate indices are valid). Verified: with the
+fields set, keep-lengths collapse to **exactly one value each** over 300 steps (from
+40–124); with them unset, the path is unchanged (39 distinct/50 steps). Values chosen
+at the measured medians (cfg0 enc 1536/pred 2560; cfg1 enc 768/pred 3584). Config
+`vitG384_fixedshape.yaml`; A/B spike `vitG384_hsdp_fixedshape_16n.sh` (job 8643289).
+
+**Status:** top-level wrap committed & confirmed-engaged; fixed-shape masks committed
+& collator-verified; 16n A/B spike running to confirm the wall-clock drift flattens
+past 120 iters. Only after that PASS does the production `capacity` job launch.
+
+**Also fixed in passing:** HSDP resume derefed `None` when a checkpoint contained opt
+state (opt is built post-wrap, passed as `None` to `load_checkpoint`). Now guarded on
+the local opt object. And the 1n smoke's EMA test hung because it inherited
+`WORLD_SIZE=12` from the training stage while launched `-n 2`; fixed with `env -u
+WORLD_SIZE`. EMA correctness re-confirmed PASS under **both** wrap modes (max_err 2.98e-08).
+
+---
+
+## 4a. (HISTORICAL) first review pass — per-layer FSDP wrapping only
 
 **Verdict:** the §4-below drift was driven by **per-layer FSDP wrapping** —
 `transformer_auto_wrap_policy({Block})` in `hsdp.py`. On ViT-G 2B that is
