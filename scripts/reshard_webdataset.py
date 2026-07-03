@@ -40,7 +40,13 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 
-SAMPLE_KEY_RE = re.compile(r"^(?P<key>.+?)\.(?P<ext>[^.]+)$")
+# Split a member name at the FIRST dot, matching WebDataset's group-by-key
+# semantics (base_plus_ext). This is required for image samples whose media
+# member is ``<key>.image.jpg`` (two dots): a last-dot split would key the JPEG
+# as ``<key>.image`` while its ``.json``/``.cls`` key as ``<key>``, scattering
+# the triple across shards. Single-dot video members (``<key>.mp4``) are
+# unaffected — first- and last-dot splits agree for them.
+SAMPLE_KEY_RE = re.compile(r"^(?P<key>[^.]+)\.(?P<ext>.+)$")
 SOURCE_VIDEO_RE = re.compile(r"^(?P<prefix>.+?)__(?P<source>.+)_clip_(?P<clip>\d+)$")
 
 

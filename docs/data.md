@@ -73,17 +73,26 @@ On disk but not referenced by the active ViT-g configs:
 
 ### IMAGE sets — packed & ready, held for a targeted cooldown (not in the current video mix)
 
-✅ **Packed 2026-07-03** to `<name>_img/` via `scripts/pack_images_pbs.sh` (each has a
-`metadata.json`), but **deliberately left out of the pretrain/cooldown configs** — intended
-for a future *targeted* image-branch cooldown to address spatial-task underperformance
-(see §4 and the draft `vitg384_cooldown_64f_imgbranch.yaml`, which references these `_img` dirs).
+✅ **Packed 2026-07-03, re-resharded 2026-07-03** to `<name>_img/` via
+`scripts/pack_images_pbs.sh` (each has a `metadata.json`), but **deliberately left out of the
+pretrain/cooldown configs** — intended for a future *targeted* image-branch cooldown to
+address spatial-task underperformance (see §4 and the draft
+`vitg384_cooldown_64f_imgbranch.yaml`, which references these `_img` dirs).
+
+> **Fixed 2026-07-03:** the first reshard used a *last-dot* key split, which for the two-dot
+> image member `<key>.image.jpg` keyed the JPEG as `<key>.image` while its `.json`/`.cls`
+> keyed as `<key>` — scattering each triple across shards so WebDataset (which groups on the
+> *first* dot) saw ~2 complete samples per 1000. `reshard_webdataset.py` now splits on the
+> first dot; all four dirs re-resharded and verified 100 % complete triples end-to-end through
+> the loader. The earlier "packed images" counts were the doubled artifact of that bug; the
+> real distinct-sample counts are below.
 
 | Source `_img` | Packed images | Content |
 |---|---|---|
-| `hyperkvasir_img` | 21,324 | GI-endoscopy labeled images, 23 classes (train+valid+test splits). |
-| `dsad_img` | 29,250 | Dresden anatomy frames (`image*.png` only; masks filtered out at pack time). |
-| `esad_img` | 106,740 | ESAD robotic prostatectomy frames, train+val+test (YOLO `.txt` labels skipped). |
-| `psi_ava_img` | 147,236 | PSI-AVA robotic prostatectomy keyframes (`keyframes/CASE*/` only; DETR features skipped). |
+| `hyperkvasir_img` | 10,662 | GI-endoscopy labeled images, 23 classes (train+valid+test splits). |
+| `dsad_img` | 14,625 | Dresden anatomy frames (`image*.png` only; masks filtered out at pack time). |
+| `esad_img` | 53,370 | ESAD robotic prostatectomy frames, train+val+test (YOLO `.txt` labels skipped). |
+| `psi_ava_img` | 73,618 | PSI-AVA robotic prostatectomy keyframes (`keyframes/CASE*/` only; DETR features skipped). |
 
 ### Loading params (active ViT-g 384)
 
@@ -269,10 +278,10 @@ and **FM-validated + openly downloadable**. Status as of 2026-07-02; landing in 
 
 | Rank | Dataset | Why | Access | Status |
 |---|---|---|---|---|
-| 1 | **HyperKvasir** | 10.6K labeled images, **23 GI finding classes**, native stills — biggest open per-frame-label diversity win; new modality | OPEN | ✅ **packed** → `hyperkvasir_img` (21,324 imgs). Via HF mirror `sahilur/hyper-kvasir-labeled-images` (simula.no host unreachable from Aurora even via proxy; 99K *unlabeled* subset stuck behind simula — labeled 23-class part is the high-value one). |
-| 2 | **DSAD (Dresden)** | 13.2K images with **organ/anatomy segmentation** — most on-target for our *anatomy* gap; new procedure (rectal). CC-BY (only commercial-OK one). Note: real count 13,195 not 14,623 | OPEN (figshare `21702600`) | ✅ **packed** → `dsad_img` (29,250 imgs; masks filtered) |
+| 1 | **HyperKvasir** | 10.6K labeled images, **23 GI finding classes**, native stills — biggest open per-frame-label diversity win; new modality | OPEN | ✅ **packed** → `hyperkvasir_img` (10,662 imgs). Via HF mirror `sahilur/hyper-kvasir-labeled-images` (simula.no host unreachable from Aurora even via proxy; 99K *unlabeled* subset stuck behind simula — labeled 23-class part is the high-value one). |
+| 2 | **DSAD (Dresden)** | 13.2K images with **organ/anatomy segmentation** — most on-target for our *anatomy* gap; new procedure (rectal). CC-BY (only commercial-OK one). | OPEN (figshare `21702600`) | ✅ **packed** → `dsad_img` (14,625 imgs; masks filtered) |
 | — | **CholecSeg8k** | ⚠️ **NOT for pretraining** — images are Cholec80 frames (17 clips / 8,080 imgs, we already hold all Cholec80 as video) → zero new pixels for SSL. Its 13-class dense masks are the only new signal, which the image branch never consumes. **Kept on disk as a future segmentation-PROBE set only** | OPEN | ✅ downloaded HF `minwoosun/CholecSeg8k` (2.9GB), kept but **excluded from image pack** |
-| 4 | **ESAD + PSI-AVA** | RA prostatectomy frames — modality-matched to our robotic benchmarks; new procedure | Drive (gdown) | ✅ **packed** → `esad_img` (106,740) + `psi_ava_img` (147,236); PSI-AVA via `python3 -m gdown` (bare-IP host refused) |
+| 4 | **ESAD + PSI-AVA** | RA prostatectomy frames — modality-matched to our robotic benchmarks; new procedure | Drive (gdown) | ✅ **packed** → `esad_img` (53,370) + `psi_ava_img` (73,618); PSI-AVA via `python3 -m gdown` (bare-IP host refused) |
 | 5 | **hSDB-Chole + hSDB-Gastric** | gastrectomy adds a procedure; chole reinforces | OPEN | hSDB-Gastric ✅ downloaded (`hsdb_gastric/`, 9.6GB) — **not packed** (not in the 4-set image branch) |
 | 6 | **CaDIS** | cataract, 4,670 images, **36 seg classes** (dense instruments+anatomy) | REG (grand-challenge / CATARACTS) | not acquired (gated) |
 | — | Endoscapes | CVS/anatomy laparoscopic | OPEN | downloaded (`endoscapes/`, 5.9GB) — **not packed** |
