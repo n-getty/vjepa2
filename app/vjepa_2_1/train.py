@@ -168,6 +168,14 @@ def main(args, resume_preempt=False):
     grid_size = crop_size // patch_size
     pin_mem = cfgs_data.get("pin_mem", False)
     num_workers = cfgs_data.get("num_workers", 1)
+    # Env override for the dataloader worker count. Needed for the HSDP path:
+    # init_device_mesh creates inter-node xccl subgroup PGs, and forking
+    # persistent DataLoader workers AFTER that can inherit broken xccl state and
+    # deadlock on the first batch read (PRISM documents this failure mode). Set
+    # VJEPA_NUM_WORKERS=0 to fork no workers on the HSDP path. Default: config.
+    _nw_override = os.environ.get("VJEPA_NUM_WORKERS")
+    if _nw_override is not None:
+        num_workers = int(_nw_override)
 
     # -- IMG DATA
     cfgs_img_data = args.get("img_data")
