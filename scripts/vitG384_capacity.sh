@@ -17,7 +17,7 @@
 #PBS -j oe
 #PBS -o /flare/ModCon/ngetty/logs/
 
-set -eo pipefail
+set -o pipefail  # NOT set -e: module load/venv activate can return nonzero
 ROOT=/lus/flare/projects/ModCon/ngetty/vjepa2
 BASE_CFG=$ROOT/configs/vitg16_surg_vid_webdataset_single4/vitG384_cleandata.yaml
 RUNTIME_CFG=$ROOT/.runtime_configs/n16g12_weak/configs/vitg16_surg_vid_webdataset_single4/vitG384_cleandata.yaml
@@ -64,20 +64,28 @@ echo "$PBS_JOBID" > "$LOCK"
 trap 'rm -f "$LOCK"' EXIT
 
 cd $ROOT
+# HSDP requires torch 2.13 (native FSDP1 + xccl). Load frameworks FIRST, then the
+# pt213 venv on top (module gives oneCCL/MPI, venv gives torch 2.13).
 module load frameworks
+export PYTHONNOUSERSITE=1
+source /flare/ModCon/ngetty/venvs/torchtune-pt213-xpu/bin/activate
+export PYTHONPATH=$ROOT:$PYTHONPATH
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 export MPICH_GPU_SUPPORT_ENABLED=1
-export CCL_PROCESS_LAUNCHER=pmix
-export CCL_ATL_TRANSPORT=mpi
-export CCL_KVS_MODE=mpi
-export CCL_KVS_USE_MPI_RANKS=1
-export CCL_CONFIGURATION=cpu_gpu_dpcpp
-export CCL_KVS_CONNECTION_TIMEOUT=600
+# HSDP TRANSPORT (validated: launcher=none + ofi; pmix/mpi DEADLOCKS FSDP subgroup
+# collectives at iter0 — 2n A/B job 8643134 ofi=60 clean iters vs mpi=hang, 16n
+# confirmed job 8643156). With launcher=none the train mpiexec drops --pmi=pmix.
+export CCL_PROCESS_LAUNCHER=none
+export CCL_ATL_TRANSPORT=ofi
+export CCL_KVS_IFACE=hsn0
 export CCL_OP_SYNC=1
 export CCL_WORKER_COUNT=1
 export CCL_ALLREDUCE=ring
 export CCL_CHUNK_SIZE=16777216
 export FI_PROVIDER=cxi
+export FI_CXI_RX_MATCH_MODE=hybrid
+export FI_CXI_OFLOW_BUF_SIZE=8388608
+export FI_CXI_DEFAULT_CQ_SIZE=131072
 export PYTHONFAULTHANDLER=1
 export TMPDIR=/tmp
 export OMP_NUM_THREADS=16
@@ -85,9 +93,16 @@ export http_proxy="http://proxy.alcf.anl.gov:3128"
 export https_proxy="http://proxy.alcf.anl.gov:3128"
 export ftp_proxy="http://proxy.alcf.anl.gov:3128"
 export WDS_LOCAL_SLICING=1
-# --- ViT-g optimizations (validated 2026-06-26: -32% iter-time, no loss cost) ---
-export VJEPA_BF16_COMM=1
-export VJEPA_DDP_BUCKET_MB=50
+# --- HSDP: shard params/grads/opt across the 12 tiles (57.6GB DDP -> ~22GB/tile),
+# removing the DDP L0-headroom wedge. bf16 comm hook + DDP bucket are DDP-only and
+# not used under HSDP (FSDP MixedPrecision handles reduce dtype). ---
+export VJEPA_DIST_STRATEGY=hsdp
+export LOCAL_WORLD_SIZE=12
+export FSDP_SHARDING=shard_grad_op   # _HYBRID_SHARD_ZERO2
+# allocator/MR stacking insurance (torchtune-validated)
+export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.95
+export FI_MR_CACHE_MONITOR=disabled
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
 # NOTE: capacity job runs CONTINUOUSLY — do NOT set VJEPA_EXIT_AFTER_CKPT (that's
 # only for the 1h debug-scaling chain slices).
 if [[ -f "${PBS_NODEFILE:-}" ]]; then
@@ -99,7 +114,7 @@ export MASTER_ADDR
 export MASTER_PORT=29500
 export WORLD_SIZE=192
 echo "MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT WORLD_SIZE=$WORLD_SIZE"
-echo "OPT ENVS: VJEPA_BF16_COMM=$VJEPA_BF16_COMM VJEPA_DDP_BUCKET_MB=$VJEPA_DDP_BUCKET_MB"
+echo "HSDP ENVS: VJEPA_DIST_STRATEGY=$VJEPA_DIST_STRATEGY FSDP_SHARDING=$FSDP_SHARDING transport=none/ofi"
 
 export LOCAL_DATA_ROOT=/tmp/vjepa_data/${PBS_JOBID%%.*}
 echo "--- staging shards to $LOCAL_DATA_ROOT (per-node disjoint) ---"
@@ -110,7 +125,7 @@ mpiexec -n 16 -ppn 1 --cpu-bind none \
         --num-nodes 16 --local-world-size 12 --workers 8
 echo "--- staging complete ---"
 
-mpiexec --pmi=pmix -n 192 -ppn 12 --cpu-bind depth --depth 16 \
+mpiexec -n 192 -ppn 12 --cpu-bind depth --depth 16 \
     python -m app.main_dist_aurora --train_mode \
         --fname $PARAMS --params_path $PARAMS \
         --local_data_root $LOCAL_DATA_ROOT
