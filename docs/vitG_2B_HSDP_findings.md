@@ -378,6 +378,62 @@ WORLD_SIZE`. EMA correctness re-confirmed PASS under **both** wrap modes (max_er
 
 ---
 
+## 4d. FOURTH-REVIEW CORRECTION (2026-07-04): the two "insurance" env flags ARE the accumulator
+
+**The reframe.** §4c framed the fork as "static-buffer fix vs accepted fabric tax" and
+queued a free-L0 gate to decide. A fourth review caught a step upstream of that fork: the
+gate script itself sets **two env flags that force CCL into accumulation mode**, and PRISM's
+production launcher (`tools/launch_aurora_web.py`) sets **neither**:
+
+```
+CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536   # never evict IPC handles
+FI_MR_CACHE_MONITOR=disabled                     # never invalidate fabric MR cache
+```
+
+Both were added by *me*, preemptively, "to avoid `banned:1` eviction crashes" — textbook
+fix-a-bug-you-haven't-observed. `65536`=never-evict + MR-monitor-off is **by construction**
+an accumulate-forever cache. The signature §4c attributed to a possible new external-memory
+class — **cohort-wide spike + recover + a creeping floor** — is *exactly* what a never-evict
+cache does when it periodically rebuilds/compacts under pressure: every rank does identical
+collective volume per step under HSDP, so all 192 hit the same cache threshold at the same
+iter (deterministic → cohort-wide, not one straggler), pay a synchronized rebuild, recover.
+PRISM has run Qwen3-0.6B HSDP+ZERO2 at 20N for hundreds of steps **without** either flag.
+
+This does not contradict §4c — the spike really is cohort-wide, and reserved-flat really
+does *not* rule out external growth. It identifies the *source* of that external growth as a
+knob we set, not a fabric mystery. It also explains why §4a's own reasoning ("with
+`CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536` handles pile up") pointed at the flag while
+we kept the flag set.
+
+**Two upstream verifications done while acting on this (both PASS — neither is the bug):**
+- **Timing is not a sync-scoping artifact.** `PhaseTimer` (`src/utils/logging.py:72-88`)
+  enqueues XPU events on the default stream in program order and syncs once in `to_dict()`;
+  in-stream ordering means leftover forward async ops complete before the `backward_start`
+  event fires, so `backward-ms` is the true device backward, not forward spillover.
+- **Input tensor shape is constant.** `vitG384_fixedshape.yaml` has `dataset_fpcs` = 15×`16`,
+  `batch_size:2`, `crop_size:384`, `tubelet:2`, `fps:4` → every clip is `(2,3,16,384,384)`
+  and masks are pinned. No residual video-shape VA churn beyond the masks already fixed.
+
+**Corrected order of operations (supersedes §4c's "run the free-L0 gate first"):**
+1. **Env-diff test — the single decisive run.** `unset CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD`
+   and `unset FI_MR_CACHE_MONITOR`; keep fixed-shape masks + top-level wrap; change *nothing*
+   else; ipe200. This run *also* carries the free-L0 probe, so it resolves §4c's fork
+   simultaneously — strictly more informative than the flags-on gate. If the drift/floor
+   flatten → the flags were the accumulator (predicted). If `banned:1` returns → we now hunt
+   the true shape/allocator interaction with default-eviction telemetry instead of masking it.
+2. **If #1 still spikes:** add PRISM's production config `VJEPA_GRAD_ACCUM=2` +
+   `FSDP_NO_SYNC_ACCUM` (halves inter-node AllReduce frequency; this is the OLMo-3 7B E2E
+   production setting, **not** a band-aid). `d_weights` `squeeze(1)` bs≥2 fix already landed.
+3. **Only if #1+#2 still spike:** *then* read free-L0 across the spike → creeps down ⇒
+   static/persistent CCL buffer; flat ⇒ accepted congestion tax (`scaling_study.md:180`).
+
+**Do NOT** swap the caching allocator, add socket-aware CPU-binding, restart-checkpoint, or
+disable SDPA — all either ruled out (§4c) or research-grade changes for what is most likely a
+two-line env deletion. **Do NOT** launch the 12h capacity job until #1 (and #2 if needed) come
+back flat over 200+ iters.
+
+---
+
 ## 4a. (HISTORICAL) first review pass — per-layer FSDP wrapping only
 
 **Verdict:** the §4-below drift was driven by **per-layer FSDP wrapping** —
@@ -500,15 +556,19 @@ masks — the dominant one). They converted a fatal monotonic runaway into a run
 escalating, backward-collective inflation with a creeping floor* (§4c) — NOT a one-rank
 straggler and NOT the PyTorch pool (both ruled out by data).
 
-**The single measurement that decides the fix** (instrumented & committed, run next):
-does **free-L0 creep down as the backward floor creeps up**?
-- **Yes** → external CCL/OFI registration accumulation on the inter-node AllReduce → fix is a
-  **static/persistent collective buffer** (torchtune `static_xccl_buffer_weight_sync.md`).
-- **No (free-L0 flat)** → **fabric contention**, an accepted throughput tax (PRISM
-  `scaling_study.md:180`) → **`grad_accum` is the correct mitigation**, not a band-aid.
+**The single decisive run (§4d): the env-diff test.** Before the free-L0 fork can even be
+read cleanly, remove the two accumulate-mode flags we added ourselves
+(`CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD`, `FI_MR_CACHE_MONITOR`) — PRISM's production
+launcher sets neither and runs HSDP at 20N stably. Keep fixed-shape masks + top-level wrap,
+change nothing else, ipe200. The run still carries the free-L0 probe, so it *also* answers:
+- **floor/drift flatten** → the flags were the accumulator (predicted) → launch-capable.
+- **still spikes, free-L0 creeps down** → real external CCL/OFI accumulation → static/persistent
+  collective buffer (torchtune `static_xccl_buffer_weight_sync.md`).
+- **still spikes, free-L0 flat** → fabric contention, accepted tax (`scaling_study.md:180`) →
+  add `VJEPA_GRAD_ACCUM=2` (PRISM production, not a band-aid).
 
-Run to execute: `scripts/vitG384_hsdp_fixedshape_16n.sh` (now emits `l0-free-mib`/`l0-ext-mib`
-per rank per iter), analyze with `scripts/analyze_straggler.py <run_folder>`.
+Run to execute: `scripts/vitG384_hsdp_fixedshape_16n.sh` with the two flags unset (now emits
+`l0-free-mib`/`l0-ext-mib` per rank per iter), analyze with `scripts/analyze_straggler.py <run_folder>`.
 
 Full blow-by-blow: memory `vitG-2b-allreduce-spikes.md`. Key repro scripts:
 `scripts/vitG384_hsdp_fixedshape_16n.sh` (16n gate + free-L0 probe),

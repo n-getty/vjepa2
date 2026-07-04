@@ -88,8 +88,16 @@ export ftp_proxy="http://proxy.alcf.anl.gov:3128"
 export WDS_LOCAL_SLICING=1
 # allocator/MR stacking insurance (cheap; torchtune-validated)
 export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.95
-export FI_MR_CACHE_MONITOR=disabled
-export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
+# ENV-DIFF TEST (§4d): the two flags below force CCL into ACCUMULATION mode
+# (never-evict IPC handles + no MR-cache invalidation). We added them preemptively
+# "to avoid banned:1 crashes" — but PRISM's production launcher sets NEITHER and runs
+# HSDP+ZERO2 at 20N stably. The cohort-wide spike + creeping-floor signature is exactly
+# what a never-evict cache does when it periodically compacts under pressure. Decisive
+# test: run WITHOUT them (keep fixed-shape masks + top-level wrap, change nothing else).
+# If the drift flattens, the flags were the accumulator. If banned:1 returns, hunt the
+# real shape/allocator interaction with default-eviction telemetry instead of masking it.
+unset FI_MR_CACHE_MONITOR
+unset CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD
 unset XPU_USM_ALLOC_SO
 
 # -------- HSDP knobs (the only behavioral change vs the DDP wedge run) --------
