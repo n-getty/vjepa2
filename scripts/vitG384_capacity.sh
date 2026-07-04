@@ -213,13 +213,15 @@ echo "resubmit-guard: start_ep=$START_EP cur_ep=$CUR_EP consecutive_noprogress=$
 if (( CUR_EP >= NUM_EPOCHS )); then
   echo "campaign complete (epoch $CUR_EP >= $NUM_EPOCHS) — no resubmit."
   release_lock
-elif (( FAILS >= 10 )); then
-  # Raised 4->10: the observed failures are TRANSIENT/environmental (identical proven
-  # config reached 74 iters; 4 crashes 02:35-07:06 on different nodes = Aurora DataLoader
-  # worker-startup flakiness, not deterministic). Each failed attempt dies in ~5min (cheap),
-  # so ~10 gives ~1h of retry coverage to ride out a bad window rather than giving up on a
-  # transient. If 10 consecutive fail, it IS likely deterministic/persistent — needs a human.
-  echo "STORM GUARD: $FAILS consecutive no-progress runs — STOPPING resubmit. Likely persistent; needs a human."
+elif (( FAILS >= 40 )); then
+  # Raised 10->40: the shm-unmap startup crashes are STOCHASTIC (~30-40% of starts are clean:
+  # env-diff 74it, 8643570 93it, 8643746 72it all reached training), NOT deterministic — but
+  # they persisted 8+h across many nodes (an ALCF-side condition, not fixable by our config).
+  # Each failed attempt is cheap (~5min), so 40 = several hours of retries to eventually CATCH
+  # a clean start and bank the first checkpoint (after which guard resets to 0 on progress and
+  # the run is durable). 40 consecutive with ZERO clean starts => genuine persistent fabric
+  # outage => ALCF ticket. This is the right bias for an unattended overnight run vs giving up.
+  echo "STORM GUARD: $FAILS consecutive no-progress runs — STOPPING. Persistent infra; ALCF ticket + manual resubmit."
   release_lock
 else
   QUEUED=$(qstat -u "$USER" 2>/dev/null | grep -c "vitG_cap")
