@@ -382,17 +382,21 @@ WORLD_SIZE`. EMA correctness re-confirmed PASS under **both** wrap modes (max_er
 
 **The reframe.** §4c framed the fork as "static-buffer fix vs accepted fabric tax" and
 queued a free-L0 gate to decide. A fourth review caught a step upstream of that fork: the
-gate script itself sets **two env flags that force CCL into accumulation mode**, and PRISM's
-production launcher (`tools/launch_aurora_web.py`) sets **neither**:
+gate script itself sets **three env flags that PRISM's production launcher
+(`tools/launch_aurora_web.py`) is grep-clean of** — yet PRISM runs HSDP+ZERO2 at 20N stably:
 
 ```
-CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536   # never evict IPC handles
+CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536   # never evict IPC handles  (accumulate mode)
 FI_MR_CACHE_MONITOR=disabled                     # never invalidate fabric MR cache
+PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.95   # GC-threshold, also added by us
 ```
 
-Both were added by *me*, preemptively, "to avoid `banned:1` eviction crashes" — textbook
-fix-a-bug-you-haven't-observed. `65536`=never-evict + MR-monitor-off is **by construction**
-an accumulate-forever cache. The signature §4c attributed to a possible new external-memory
+All three were added by *me*, preemptively, "to avoid `banned:1` eviction crashes" —
+textbook fix-a-bug-you-haven't-observed. `65536`=never-evict + MR-monitor-off is **by
+construction** an accumulate-forever cache. **All three must be dropped on the env-diff run**:
+if only the two cache flags were unset and the run flattened, we couldn't tell whether it was
+the cache flags or the GC threshold without a second run — dropping all three makes a flat
+result unambiguous in one job. The signature §4c attributed to a possible new external-memory
 class — **cohort-wide spike + recover + a creeping floor** — is *exactly* what a never-evict
 cache does when it periodically rebuilds/compacts under pressure: every rank does identical
 collective volume per step under HSDP, so all 192 hit the same cache threshold at the same
@@ -414,17 +418,25 @@ we kept the flag set.
   `batch_size:2`, `crop_size:384`, `tubelet:2`, `fps:4` → every clip is `(2,3,16,384,384)`
   and masks are pinned. No residual video-shape VA churn beyond the masks already fixed.
 
-**Corrected order of operations (supersedes §4c's "run the free-L0 gate first"):**
-1. **Env-diff test — the single decisive run.** `unset CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD`
-   and `unset FI_MR_CACHE_MONITOR`; keep fixed-shape masks + top-level wrap; change *nothing*
-   else; ipe200. This run *also* carries the free-L0 probe, so it resolves §4c's fork
+**Corrected order of operations (supersedes §4c's "run the free-L0 gate first").** Sequenced
+as separate jobs so each result has full attribution — combining them = one job with ambiguous
+results and a smoke-verification gap:
+1. **Env-diff test — the single decisive run.** `unset` **all three** flags above; keep
+   fixed-shape masks + top-level wrap; change *nothing* else; ipe200. No dependency on any
+   unverified fix. This run *also* carries the free-L0 probe, so it resolves §4c's fork
    simultaneously — strictly more informative than the flags-on gate. If the drift/floor
-   flatten → the flags were the accumulator (predicted). If `banned:1` returns → we now hunt
-   the true shape/allocator interaction with default-eviction telemetry instead of masking it.
-2. **If #1 still spikes:** add PRISM's production config `VJEPA_GRAD_ACCUM=2` +
-   `FSDP_NO_SYNC_ACCUM` (halves inter-node AllReduce frequency; this is the OLMo-3 7B E2E
-   production setting, **not** a band-aid). `d_weights` `squeeze(1)` bs≥2 fix already landed.
-3. **Only if #1+#2 still spike:** *then* read free-L0 across the spike → creeps down ⇒
+   flatten → the flags were the accumulator (predicted) → **close out, launch-capable**. If
+   `banned:1` returns → hunt the true shape/allocator interaction with default telemetry
+   instead of masking it.
+2. **squeeze-fix smoke (1n) — gate before ga=2.** ga=2 at bs=2 → micro-bs=1, which trips the
+   `weight_distance_loss` bs≥2 landmine. The `squeeze(1)` fix in
+   `src/models/utils/modules.py` is claimed to handle it but is **not yet smoke-verified**.
+   Verify on 1 node before ga=2 touches a 16n run.
+3. **If #1 still spikes:** apply PRISM's production config **exactly** — `FSDP_NO_SYNC_ACCUM=1`
+   + `gradient_accumulation_steps=2` (our `VJEPA_GRAD_ACCUM=2`), not a variant. Halves
+   inter-node AllReduce frequency; this is the OLMo-3 7B E2E production setting, **not** a
+   band-aid. Depends on #2 passing.
+4. **Only if #1+#3 still spike:** *then* read free-L0 across the spike → creeps down ⇒
    static/persistent CCL buffer; flat ⇒ accepted congestion tax (`scaling_study.md:180`).
 
 **Do NOT** swap the caching allocator, add socket-aware CPU-binding, restart-checkpoint, or
@@ -557,17 +569,21 @@ escalating, backward-collective inflation with a creeping floor* (§4c) — NOT 
 straggler and NOT the PyTorch pool (both ruled out by data).
 
 **The single decisive run (§4d): the env-diff test.** Before the free-L0 fork can even be
-read cleanly, remove the two accumulate-mode flags we added ourselves
-(`CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD`, `FI_MR_CACHE_MONITOR`) — PRISM's production
-launcher sets neither and runs HSDP at 20N stably. Keep fixed-shape masks + top-level wrap,
-change nothing else, ipe200. The run still carries the free-L0 probe, so it *also* answers:
-- **floor/drift flatten** → the flags were the accumulator (predicted) → launch-capable.
+read cleanly, remove **all three** "insurance" flags we added ourselves
+(`CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD`, `FI_MR_CACHE_MONITOR`, `PYTORCH_ALLOC_CONF`) —
+PRISM's production launcher is grep-clean of all three and runs HSDP at 20N stably. Dropping
+all three (not just the two cache flags) makes a flat result unambiguous in one job. Keep
+fixed-shape masks + top-level wrap, change nothing else, ipe200. The run carries the free-L0
+probe, so it *also* answers:
+- **floor/drift flatten** → the flags were the accumulator (predicted) → **close out, launch-capable**.
 - **still spikes, free-L0 creeps down** → real external CCL/OFI accumulation → static/persistent
   collective buffer (torchtune `static_xccl_buffer_weight_sync.md`).
 - **still spikes, free-L0 flat** → fabric contention, accepted tax (`scaling_study.md:180`) →
-  add `VJEPA_GRAD_ACCUM=2` (PRISM production, not a band-aid).
+  apply PRISM's exact production config `FSDP_NO_SYNC_ACCUM=1` + `gradient_accumulation_steps=2`,
+  **after** the 1n `squeeze(1)` smoke gate (ga=2 → micro-bs=1 trips the `weight_distance_loss`
+  bs≥2 landmine). Sequenced as 3 jobs = full attribution + verified fix; combined = 1 ambiguous job.
 
-Run to execute: `scripts/vitG384_hsdp_fixedshape_16n.sh` with the two flags unset (now emits
+Run to execute: `scripts/vitG384_hsdp_fixedshape_16n.sh` (all three flags now unset; emits
 `l0-free-mib`/`l0-ext-mib` per rank per iter), analyze with `scripts/analyze_straggler.py <run_folder>`.
 
 Full blow-by-blow: memory `vitG-2b-allreduce-spikes.md`. Key repro scripts:
