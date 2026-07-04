@@ -7,6 +7,33 @@ written to be reviewed by a fresh agent, so hypotheses are labelled as such.
 
 ---
 
+## FINAL VERDICT (2026-07-04): fabric contention is the intrinsic 16n tax — accept it, make training survive it
+
+Both fabric levers are now **exhausted by experiment**:
+- **CCL_WORKER_COUNT=4** (8643434): failed (loader-fill hang; orthogonal, demoted).
+- **TRUE_ACCUM=2** (8643462): **did NOT fix it** — wedged at 40 iters with a terminal 543 s stall
+  → watchdog kill (vs env-diff's 74 iters at ga=1). Memory stayed perfect (l0-free 10.7 GiB flat),
+  so true-accum is *correct and affordable* — it just doesn't cure the fabric stalls, because the
+  §4g host-side collective stalls are intrinsic to CCL/OFI at this 16n scale, not a function of
+  collective count or worker threads. This is exactly PRISM's documented, accepted congestion tax
+  (`scaling_study.md:180`).
+
+**The reframe that matters:** the spikes are a **throughput** problem, NOT **correctness** — loss
+was sane in every run (0.33→0.31, no NaN), memory healthy, HSDP working. The model WILL converge;
+it's just slower with occasional multi-minute recoverable stalls. So the goal is no longer "fix the
+fabric" — it is **make the training run survive the stalls unattended**:
+1. **Recipe = proven plain base** (`VJEPA_TRUE_ACCUM=1`, fixedshape, workers=1) — the validated
+   74-iter config. Do NOT ship the unvalidated 2× batch/true-accum into a long run when it gave no
+   benefit; keep the recipe we trust.
+2. **Checkpoint cadence is already fine:** `CHECKPOINT_FREQ=1` = every epoch; an epoch ≈ 2.1 h clean
+   (~4 h with stalls), so a 12 h run checkpoints 3-5× and auto-resumes from `latest.pth.tar`
+   (train.py:375, verified). A crash loses ≤ ~1 epoch. Mid-epoch checkpointing = untested code,
+   NOT worth the risk tonight.
+3. **The only real gap = no auto-resubmit** if a stall hangs the job past the watchdog. Fix with a
+   self-healing wrapper (resubmit-on-death) around the capacity job.
+
+---
+
 ## OVERNIGHT PLAN (2026-07-04, live) — decision tree to a stable launch
 
 Two levers now exist for the §4g fabric/host-stall residual, both PRISM-informed:
