@@ -31,6 +31,14 @@ PARAMS=$CKPT_DIR/params-pretrain.yaml
 LOCK=$CKPT_DIR/.training.lock
 mkdir -p $CKPT_DIR /flare/ModCon/ngetty/logs
 
+# KILL-SWITCH: if this sentinel exists, do NOT run (and thus do not resubmit). Lets us stop
+# the self-healing chain from launching any NEW 12h job while keeping the current one running.
+# Any successor 8644288 might qsub will hit this and exit in seconds (no 12h consumed).
+if [[ -f "$CKPT_DIR/.no_relaunch" ]]; then
+  echo "JOB START: $(date) PBS_JOBID=$PBS_JOBID — .no_relaunch sentinel present, EXITING (no new 12h job)."
+  exit 0
+fi
+
 echo "JOB START: $(date) PBS_JOBID=$PBS_JOBID"
 
 if [[ ! -f "$PARAMS" ]]; then
