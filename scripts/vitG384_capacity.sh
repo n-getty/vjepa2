@@ -39,6 +39,22 @@ if [[ ! -f "$PARAMS" ]]; then
     $BASE_CFG --root $ROOT --num-gpus 12 --num-nodes 16 --weak-scale > /dev/null
   cp $RUNTIME_CFG $PARAMS
 fi
+# CRITICAL (fixed 2026-07-04 07:40): force the trainer's output `folder` to EQUAL $CKPT_DIR.
+# The runtime cfg's folder was the OLD cleandata dir, so training wrote CSVs+checkpoints there
+# while the watchdog / auto-resume / storm-guard all watched $CKPT_DIR — they never saw progress,
+# so the watchdog KILLED HEALTHY TRAINING JOBS at the 1200s "no first iter" deadline (8643547
+# was at iter 60+, loss 0.33, when killed). Patch folder so all four agree. Idempotent.
+$PY - "$PARAMS" "$CKPT_DIR" <<'PY'
+import sys, yaml
+p, folder = sys.argv[1], sys.argv[2]
+d = yaml.safe_load(open(p))
+if d.get("folder") != folder:
+    print(f"PATCHING folder: {d.get('folder')} -> {folder}")
+    d["folder"] = folder
+    yaml.safe_dump(d, open(p, "w"), sort_keys=False)
+else:
+    print(f"folder already correct: {folder}")
+PY
 
 NUM_EPOCHS=$($PY -c "import yaml; print(yaml.safe_load(open('$PARAMS'))['optimization']['epochs'])")
 CURRENT_EPOCH=0
