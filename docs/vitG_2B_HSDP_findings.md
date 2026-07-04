@@ -291,14 +291,84 @@ FALSIFIED, and the pluggable-allocator swap is NOT needed.**
   timer-overflow *waiting at the barrier*, and it's a **different rank each spike**. That is
   collective *contention/jitter*, not a symmetric memory problem.
 
-**Revised conclusion.** The 16n drift had **two** real, fixed causes (top-level wrap +
-fixed-shape masks), which together converted a fatal monotonic runaway into a **stable run
-with a healthy ~7–11 s baseline** plus **occasional recoverable stragglers**. There is NO
-third memory cause. The remaining straggler tax is a throughput issue, not a stability one —
-the run will not crash. It is addressed by the collective-level levers (grad-accum to halve
-AR frequency; unset `ZE_AFFINITY_MASK` to stop host-fallback collectives), applied and
-A/B'd next. This is a launch-capable state (with those levers to improve throughput), not a
-blocker. **The pluggable allocator and checkpoint-restart are both OFF the table.**
+**Revised conclusion (SUPERSEDED — see §4c below).** ~~Two causes, one-rank straggler
+residual, no third memory cause, launch-capable.~~ This was wrong on the residual: it read
+the spike from rank0's max only. The cross-rank distribution (§4c) shows the spike is
+**cohort-wide**, and `reserved`-flat does **not** rule out CCL/OFI external growth.
+
+---
+
+## 4c. THIRD-REVIEW CORRECTION (2026-07-04): the residual is COHORT-WIDE, not one-rank
+
+**What was wrong.** §4b concluded "one-rank collective straggler, different rank each
+spike." That came from reading only `log_r0.csv`'s **max**. Computing the cross-rank
+distribution from **all 192 per-rank CSVs** (`scripts/analyze_straggler.py`) shows the
+opposite — at every spike, `min << p50 ≈ p90 ≈ max`:
+
+| itr | min_bwd | p50_bwd | p90_bwd | max_bwd | class |
+|-----|---------|---------|---------|---------|-------|
+| 40  | 13.9 | 16.3 | 16.4 | 16.4 | cohort |
+| 50  | 12.5 | 14.2 | 14.3 | 14.4 | cohort |
+| 61  | 7.8  | 46.6 | 47.1 | 48.0 | cohort |
+| 63  | 3.8  | 101.8| 102.2| 104.3 | cohort |
+| 72  | 16.7 | 22.5 | 23.0 | 23.6 | cohort |
+
+At iter 63 the **median** rank spent 102 s in backward — ~all 192 ranks inflated together,
+not one. A one-rank straggler would show `min ≈ p50 ≈ p90` with only `max` jumping; the data
+is the reverse. `analyze_straggler.py` classifies **0 of 73 iters as "1RANK", all spikes as
+"COHORT".** This means **CPU-binding cannot root-fix it** (it targets per-rank NUMA jitter),
+and neither can `ZE_AFFINITY_MASK` or `grad_accum` in any root sense. The socket-aware
+binding I was about to implement is aimed at the wrong mechanism — dropped.
+
+**Two tells point at external CCL/OFI accumulation, NOT "done":**
+1. **The backward floor creeps up:** `min` backward rises from ~2.0–2.3 s (iters 1–8) to
+   4–16 s (iters 40–72). A flat floor with isolated max-spikes = jitter; a **rising floor +
+   synchronized cohort spikes escalating over time** = external-resource accumulation — the
+   same class as `ccl_external_memory_growth_32b.md`, slower and not yet fatal in 73 iters.
+2. **`reserved`-flat does NOT rule this out.** The §4b measurement (reserved dead-flat
+   45.8 GiB) correctly killed the *PyTorch-pool segment-growth* hypothesis, but CCL/OFI
+   external growth lives in the **L0 driver free pool**, which is invisible to `reserved` by
+   definition (that is the entire point of the torchtune 32B report). So "reserved flat →
+   no third cause" was an over-claim. The residual is plausibly a slower version of the
+   known external-memory accumulation, now on the **inter-node replicate-dim AllReduce**
+   (CXI/OFI path) rather than the intra-node XeLink path — and note our one env mitigation,
+   `CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD`, governs **XeLink IPC**, not the inter-node
+   CXI path the spike lives on.
+
+**Compute is confirmed NOT the cause:** fwd-target/fwd-context are flat ~1.7–2.5 s across all
+ranks every iter, so PRISM's seq-length-variance straggler root cause is genuinely eliminated
+by the fixed-shape masks. The residual is a **synchronized, escalating, backward-collective
+inflation with a creeping floor**.
+
+### The decisive next measurement (instrumented, committed — run BEFORE any lever)
+
+Reasoning from stdout maxes is what produced two wrong diagnoses. The next 16n run carries
+two probes so the mechanism is read directly, not inferred:
+1. **free-L0 per rank per iter** — `torch.xpu.mem_get_info()` free bytes, and the torchtune
+   MEMPROBE metric `external = l0_used − torch_alloc` (memory held by CCL/L0 outside
+   PyTorch's pool). Logged to CSV (`l0-free-mib`, `l0-ext-mib`) and stdout (`l0free`,
+   `l0ext`). Committed in `app/vjepa_2_1/train.py`.
+2. **cross-rank per-phase distribution** — `scripts/analyze_straggler.py` reads all 192 CSVs
+   and prints the min/p50/p90/max backward spread + floor/free-L0 trend + a COHORT/1RANK/flat
+   classifier per iter. Committed.
+
+**The clean fork this single run resolves:**
+- **free-L0 creeps DOWN as the backward floor creeps UP** → external CCL/OFI registration
+  accumulation on the inter-node AllReduce → the real fix is a **static/persistent collective
+  buffer** (torchtune `static_xccl_buffer_weight_sync.md`: a fixed VA for the collective so no
+  new OFI MR is ever registered), NOT CPU-binding/grad_accum/allocator-swap.
+- **free-L0 FLAT while timing spikes cohort-wide** → pure **fabric contention** (inter-job
+  CXI congestion), which PRISM (`data.md:540–700`, `scaling_study.md:180`) investigated over
+  ~8 jobs and accepted as a throughput tax ("AllReduce latency itself is only 24.7 ms/step —
+  NOT the bottleneck"). In that case **`grad_accum` (fewer, larger ARs) is the acknowledged-
+  correct mitigation, not a band-aid**, and occasional recoverable cohort spikes at 16n are
+  documented expected behavior — "perfectly flat at 16n" is likely not a reachable target.
+
+**Status: NOT launching anything until this measurement returns.** Two churn sources remain
+fixed (wrap, per-step masks); they converted a fatal runaway into a run that survives 73+
+iters. Whether the residual needs the static-buffer fix or is an accepted fabric tax is
+decided by free-L0, not by another guess. Pluggable allocator and checkpoint-restart remain
+off the table. Socket-aware CPU-binding is dropped (wrong mechanism for a cohort-wide spike).
 
 **Also fixed in passing:** HSDP resume derefed `None` when a checkpoint contained opt
 state (opt is built post-wrap, passed as `None` to `load_checkpoint`). Now guarded on
@@ -422,12 +492,25 @@ NOT yet confirmed for our case:
 - Grad-accum (`VJEPA_GRAD_ACCUM`) + `d_weights` `squeeze(1)` bs≥2 fix committed (secondary lever).
 - No long run launched — blocked on resolving the §4 drift.
 
-## 6. The one question for review
-**What is PRISM/torchtune's actual production mechanism that keeps CCL/L0 external memory
-bounded over long multi-node HSDP+SDPA training runs (no weight-sync)?** Once identified,
-apply it, re-run the 16n spike to confirm flat iter-time past ~120 iters, then launch
-`vitG384_capacity.sh`.
+## 6. Current open question (updated 2026-07-04)
+
+Two structural churn sources are **fixed & verified** (top-level FSDP wrap; fixed-shape
+masks — the dominant one). They converted a fatal monotonic runaway into a run that survives
+73+ iters with a healthy ~7–11 s baseline. The **remaining** residual is a *cohort-wide,
+escalating, backward-collective inflation with a creeping floor* (§4c) — NOT a one-rank
+straggler and NOT the PyTorch pool (both ruled out by data).
+
+**The single measurement that decides the fix** (instrumented & committed, run next):
+does **free-L0 creep down as the backward floor creeps up**?
+- **Yes** → external CCL/OFI registration accumulation on the inter-node AllReduce → fix is a
+  **static/persistent collective buffer** (torchtune `static_xccl_buffer_weight_sync.md`).
+- **No (free-L0 flat)** → **fabric contention**, an accepted throughput tax (PRISM
+  `scaling_study.md:180`) → **`grad_accum` is the correct mitigation**, not a band-aid.
+
+Run to execute: `scripts/vitG384_hsdp_fixedshape_16n.sh` (now emits `l0-free-mib`/`l0-ext-mib`
+per rank per iter), analyze with `scripts/analyze_straggler.py <run_folder>`.
 
 Full blow-by-blow: memory `vitG-2b-allreduce-spikes.md`. Key repro scripts:
-`scripts/vitG384_hsdp_2n_ofi.sh` (2n clean repro), `scripts/collective_probe.py`,
-`scripts/vitG384_hsdp_spike_16n.sh`.
+`scripts/vitG384_hsdp_fixedshape_16n.sh` (16n gate + free-L0 probe),
+`scripts/analyze_straggler.py` (cross-rank distribution + free-L0 trend),
+`scripts/vitG384_hsdp_2n_ofi.sh` (2n clean repro), `scripts/collective_probe.py`.
