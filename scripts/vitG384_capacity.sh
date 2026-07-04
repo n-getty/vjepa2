@@ -19,10 +19,14 @@
 
 set -o pipefail  # NOT set -e: module load/venv activate can return nonzero
 ROOT=/lus/flare/projects/ModCon/ngetty/vjepa2
-BASE_CFG=$ROOT/configs/vitg16_surg_vid_webdataset_single4/vitG384_cleandata.yaml
-RUNTIME_CFG=$ROOT/.runtime_configs/n16g12_weak/configs/vitg16_surg_vid_webdataset_single4/vitG384_cleandata.yaml
+# FIXED-SHAPE config (§4f fix): cleandata reintroduces per-step mask VA churn (churn
+# source #2). fixedshape.yaml is IDENTICAL to cleandata EXCEPT it pins num_keep_enc/pred,
+# so it keeps the exact training schedule (epochs/ipe/LR) but removes the churn. This is
+# the measured env-diff baseline — do NOT revert to cleandata for a real run.
+BASE_CFG=$ROOT/configs/vitg16_surg_vid_webdataset_single4/vitG384_fixedshape.yaml
+RUNTIME_CFG=$ROOT/.runtime_configs/n16g12_weak/configs/vitg16_surg_vid_webdataset_single4/vitG384_fixedshape.yaml
 PY=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python
-CKPT_DIR=/flare/ModCon/ngetty/checkpoints/surg_2_1_vitG384_cleandata/vitG384_n16g12_weak
+CKPT_DIR=/flare/ModCon/ngetty/checkpoints/surg_2_1_vitG384_fixedshape/vitG384_n16g12_weak
 PARAMS=$CKPT_DIR/params-pretrain.yaml
 LOCK=$CKPT_DIR/.training.lock
 mkdir -p $CKPT_DIR /flare/ModCon/ngetty/logs
@@ -79,7 +83,11 @@ export CCL_PROCESS_LAUNCHER=none
 export CCL_ATL_TRANSPORT=ofi
 export CCL_KVS_IFACE=hsn0
 export CCL_OP_SYNC=1
-export CCL_WORKER_COUNT=1
+# CCL_WORKER_COUNT=4 (§4g): matches PRISM production. The env-diff run showed
+# intermittent multi-minute HOST-SIDE collective stalls (iter-ms 365s w/ gpu-ms 21s)
+# — a single progress-engine worker (=1) is a plausible cause; PRISM uses 4 (8 -> EINVAL).
+# Under test in job 8643434; this launcher adopts the value pending that A/B's confirmation.
+export CCL_WORKER_COUNT=4
 export CCL_ALLREDUCE=ring
 export CCL_CHUNK_SIZE=16777216
 export FI_PROVIDER=cxi
@@ -99,10 +107,13 @@ export WDS_LOCAL_SLICING=1
 export VJEPA_DIST_STRATEGY=hsdp
 export LOCAL_WORLD_SIZE=12
 export FSDP_SHARDING=shard_grad_op   # _HYBRID_SHARD_ZERO2
-# allocator/MR stacking insurance (torchtune-validated)
-export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.95
-export FI_MR_CACHE_MONITOR=disabled
-export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
+# §4f/§4e: the three "insurance" flags below were FALSIFIED by the env-diff run
+# (8643398) — they were not the accumulator, memory is flat with/without them, and
+# PRISM's production launcher is grep-clean of all three. Keeping them means NOT
+# matching the measured baseline. They are UNSET here (not exported).
+unset PYTORCH_ALLOC_CONF
+unset FI_MR_CACHE_MONITOR
+unset CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD
 # NOTE: capacity job runs CONTINUOUSLY — do NOT set VJEPA_EXIT_AFTER_CKPT (that's
 # only for the 1h debug-scaling chain slices).
 if [[ -f "${PBS_NODEFILE:-}" ]]; then
