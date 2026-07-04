@@ -7,6 +7,42 @@ written to be reviewed by a fresh agent, so hypotheses are labelled as such.
 
 ---
 
+## OVERNIGHT PLAN (2026-07-04, live) — decision tree to a stable launch
+
+Two levers now exist for the §4g fabric/host-stall residual, both PRISM-informed:
+- **CCL_WORKER_COUNT=1→4** (zero code change; more progress-engine threads for the host-side
+  collective drain that §4g pinned). Under test: **job 8643434** (16n, ga=1, ipe200).
+- **VJEPA_TRUE_ACCUM=2** (real accumulation across 2 loader batches → 1 collective/step instead
+  of 2; §4f). Implemented in `train.py`. 1n memory smoke: **job 8643448**. 16n stacked run
+  (workers4 + true_accum2): `scripts/vitG384_hsdp_trueaccum_16n.sh` (ready, not launched).
+
+**Gating decision tree (in priority order — cheapest healthy option wins):**
+1. **8643434 (workers=4) flattens the spikes** (no host-stall, backward cohort-flat over ipe200)
+   → cheapest win, NO recipe change. Launch training with workers=4 only.
+2. **workers=4 helps but residual remains AND 8643448 smoke PASSES** (l0-free>5GiB, loss sane)
+   → launch `vitG384_hsdp_trueaccum_16n.sh` (stacks both). If it flattens → launch training with
+   workers=4 + true_accum=2.
+3. **neither fully flattens** → the recoverable spikes are the 16n tax; the **self-resubmitting
+   1h chain** (`vitG384_chain_debugscaling.sh`) is the robust vehicle — each slice is walltime-
+   bounded so a host-side hang just ends the slice and the successor resumes from latest.pth.tar.
+
+**Launch vehicle:** `capacity` queue IS available tonight (22 running). Two options:
+- `scripts/vitG384_capacity.sh` — single 12h job. FIXED tonight (fixedshape cfg, flags unset,
+  workers=4). Auto-resumes from latest.pth.tar (verified train.py:375 — non-anneal path resumes
+  unconditionally if the ckpt exists). BUT no watchdog/auto-resubmit → a multi-hour host hang
+  idles the allocation to walltime.
+- `scripts/vitG384_chain_debugscaling.sh` — self-resubmitting 1h slices, EXIT_AFTER_CKPT. Robust
+  to hangs by construction. STILL HAS config drift (cleandata + workers=1) — must get the same
+  fix before use as a real vehicle.
+
+**Recipe decisions (unattended-safe, see memory `true-accum-lr-decision`):** LR unchanged at
+7.5e-5 even though true_accum doubles effective batch — a less-noisy gradient at fixed LR is
+*more* conservative per-sample, and LR-hotness is this model's demonstrated collapse mode. Never-
+diverge >> squeeze-throughput for an unattended launch. `no_sync` ON diverges from PRISM's 7B
+(they were memory-bound; our 2B fits the ~4GB bf16 full grad in ~15GB free L0 — fabric-bound).
+
+---
+
 ## 1. The original problem (SOLVED): DDP L0-headroom starvation
 
 **Symptom:** 2B under DDP at 16n — per-rank `backward-ms` climbs monotonically
