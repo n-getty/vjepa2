@@ -553,6 +553,52 @@ NOT yet confirmed for our case:
 
 ---
 
+## 4e. ENV-DIFF VERDICT (2026-07-04, job 8643398): flags NOT the accumulator → fabric contention
+
+The env-diff run (all three insurance flags **unset**, fixed-shape masks + top-level wrap,
+ipe200) settled every branch of the §4c/§4d fork in a single job. It ran 74 iters, then a
+terminal spike stalled >720 s and the watchdog killed it. Analyzed across all 192 CSVs
+(`analyze_straggler.py`); backward figures below are **seconds**:
+
+| metric | value | reading |
+|--------|-------|---------|
+| span classification | 24/74 iters COHORT (min<<p50≈p90≈max) | cohort-wide, as §4c |
+| p50 backward trend | 10.3 s (i0-9) → 30.1 s (i70-79), peaks 57/68/83 s | escalating |
+| **l0-free** | 15240 → 15235 MiB (**−5 MiB / 74 it**) | **FLAT** |
+| **l0-ext** | 43695 → 43699 MiB (**+4 MiB / 74 it**) | **FLAT (noise)** |
+| banned:1 / shm-crash | 0 | clean (prior crash was a transient node) |
+
+**Three conclusions, each from data not inference:**
+1. **The flag hypothesis (§4d) is FALSIFIED.** With all three flags removed the run still
+   spikes cohort-wide and still escalates. The never-evict IPC cache / MR-monitor were not
+   the accumulator. Removing them changed nothing — which is exactly what the env-diff was
+   designed to reveal, and why running it first (before any lever) was correct.
+2. **The static-buffer branch (§4c "yes" arm) is RULED OUT.** `l0-free` and `l0-ext` are dead
+   flat (±5 MiB over 74 iters) with ~15 GB of headroom — there is **no external CCL/OFI
+   registration growth**. `static_xccl_buffer_weight_sync` would treat an absent disease.
+   (HSDP itself is confirmed working: 15 GB free vs the 90%-full DDP tile.)
+3. **Per our pre-registered decision tree** (span=COHORT + l0-free FLAT + l0-ext FLAT):
+   → **fabric contention** — PRISM's accepted congestion tax (`scaling_study.md:180`) →
+   **`grad_accum` is the legitimate mitigation, not a band-aid.**
+
+**One honest caveat.** A *monotonically escalating* p50 (10→30 s) is a slightly stronger
+signal than pure stationary contention would give — it hints the fabric got busier over the
+02:42→02:5x window (inter-job dragonfly load, which varies run-to-run). But it is definitively
+**not** the memory-accumulation class, and the fix is selected by the memory reading, not the
+timing shape. grad_accum (halving inter-node AllReduce frequency) is the correct lever whether
+the contention is stationary or rising.
+
+**Next (pre-registered §4d order of operations, step 2 then 3):**
+- **Step 2 — 1n squeeze-fix smoke gate.** The `squeeze(1)` fix is present
+  (`app/vjepa_2_1/models/utils/masks_dist.py:81`, documented against the bs≥2 `d_ij` landmine)
+  and the ga>1 guard (`train.py:761`) blocks only `loss_reg_std_mult`, which our config does
+  NOT set — so ga=2 is not hard-blocked. Verify ga=2 @ bs=2 → micro-bs=1 runs end-to-end on
+  1 node before it touches 16n.
+- **Step 3 — 16n with `VJEPA_GRAD_ACCUM=2` + `FSDP_NO_SYNC_ACCUM=1`** (PRISM's exact OLMo-3 7B
+  production config). PASS = the cohort spikes flatten / iter-time stops escalating over ipe200.
+
+---
+
 ## 5. Current state of the tree (branch `aurora`)
 - HSDP code (`hsdp.py`, trainer branch, EMA test) committed & 1n-verified.
 - OFI transport applied to `scripts/vitG384_hsdp_spike_16n.sh` and
@@ -585,6 +631,11 @@ probe, so it *also* answers:
 
 Run to execute: `scripts/vitG384_hsdp_fixedshape_16n.sh` (all three flags now unset; emits
 `l0-free-mib`/`l0-ext-mib` per rank per iter), analyze with `scripts/analyze_straggler.py <run_folder>`.
+
+**RESOLVED (2026-07-04, job 8643398 — see §4e).** l0-free and l0-ext are both dead flat
+(±5 MiB / 74 iters); the flags were NOT the accumulator and there is NO external-memory
+accumulation. Verdict = **fabric contention** → the remaining lever is `grad_accum`.
+Next: 1n squeeze-fix smoke, then 16n `VJEPA_GRAD_ACCUM=2` + `FSDP_NO_SYNC_ACCUM=1`.
 
 Full blow-by-blow: memory `vitG-2b-allreduce-spikes.md`. Key repro scripts:
 `scripts/vitG384_hsdp_fixedshape_16n.sh` (16n gate + free-L0 probe),
