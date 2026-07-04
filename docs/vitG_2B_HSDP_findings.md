@@ -597,6 +597,71 @@ the contention is stationary or rising.
 - **Step 3 — 16n with `VJEPA_GRAD_ACCUM=2` + `FSDP_NO_SYNC_ACCUM=1`** (PRISM's exact OLMo-3 7B
   production config). PASS = the cohort spikes flatten / iter-time stops escalating over ipe200.
 
+> **⚠️ Steps 2–3 above are SUPERSEDED by §4f. The grad_accum lever as implemented does NOT
+> reduce inter-node AllReduce frequency — see below before acting on it.**
+
+---
+
+## 4f. FIFTH-REVIEW CORRECTION (2026-07-04): `VJEPA_GRAD_ACCUM=2` is microbatching, not accumulation
+
+A fifth review challenged the §4e/§4d claim that `VJEPA_GRAD_ACCUM=2` "halves inter-node
+AllReduce frequency." **Validated against the code — the claim is FALSE as implemented, and the
+1n smoke did not prove otherwise.** Job 8643428 (the 16n grad_accum run) was **killed while
+still queued** — no compute wasted — because it tested a lever that by construction cannot
+address fabric contention.
+
+**What the code actually does** (`app/vjepa_2_1/train.py:785-828`, `:1021-1040`):
+- The training loop does exactly **one `next(loader)` per `itr`** (`:792`).
+- The ga>1 path **slices that single loader batch** into `grad_accum` microbatches
+  (`mb = batch_size // grad_accum`; `sl = slice(j*mb, (j+1)*mb)`), runs `no_sync()` on all but
+  the last, and syncs once.
+- Under HSDP the inter-node collective is one reduce-scatter/all-reduce over the **model
+  gradient**, whose size and per-optimizer-step count are **independent of batch size**. Slicing
+  bs=2 into 2×bs=1 leaves collective size, count, and frequency per optimizer step **identical
+  to the ga=1 baseline**. Effective batch stays 2.
+
+So this is **microbatching** (lower activation peak, collectives spread slightly in wall-clock),
+**not PRISM-style accumulation across multiple loader batches**. To actually halve inter-node AR
+frequency per sample you must accumulate over N separate `next(loader)` batches with one sync —
+which changes effective global batch (a recipe change), not a drop-in env flip. The doc's
+"PRISM exact production config" equivalence was wrong: PRISM accumulates loader batches; our env
+slices one.
+
+**Two more confirmed defects this surfaced:**
+1. **`backward-ms` is polluted under ga>1** (`:1029-1044`): `fwd_context_done` is marked at
+   microbatch 0 but `backward_done` after the whole loop, so `backward-ms` includes
+   microbatch-1's *forward*. It is **not comparable** to the env-diff's clean ga=1 `backward-ms`
+   — the very metric the run was meant to compare. Any ga>1 analysis must switch to
+   `iter-time(ms)`/`gpu-time(ms)` cross-rank spread, or add per-microbatch phase timers.
+2. **`no_sync()` memory was never gated.** FSDP `no_sync()` retains the unsharded/full gradient
+   until the synced microbatch, which can erode the HSDP headroom that fixed the original DDP
+   problem. The 1n smoke gated only on "no IndexError / no NaN" — it captured **no
+   mem/resv/l0free/l0ext**. Unmeasured risk.
+
+**The diagnosis (§4e) still stands** — the env-diff run 8643398 was ga=1, so its `backward-ms`
+was clean and the flat-memory → fabric-contention verdict is unaffected. Only the *proposed
+mitigation* was wrong.
+
+**Corrected lever menu for fabric contention (pick after deciding intent):**
+- **True grad accumulation** — implement accumulation across multiple `next(loader)` batches
+  (accept larger effective global batch or adjust the LR/schedule). Only this actually reduces
+  inter-node AR frequency per sample.
+- **CCL AllReduce algorithm / chunking A/B** (reviewer point 5) — the current scripts force
+  `CCL_ALLREDUCE=ring` + `CCL_CHUNK_SIZE=16MiB` (chosen for the *DDP* workload, ~4% over
+  topo/rabenseifner). Under HSDP + fixed-shape + top-level wrap with a spike/floor failure mode,
+  the AR algorithm and chunk size are **first-class variables**. Low-cost A/B: fixed-shape +
+  top-level HSDP, vary `CCL_ALLREDUCE`/`CCL_CHUNK_SIZE` (ring/chunked vs default vs PRISM's exact
+  env block), metric = p50/p90 backward (or iter-time) cross-rank trend, not mean.
+- **Accept the tax** — if AR latency is genuinely small (PRISM `scaling_study.md:180` measured
+  24.7 ms/step) and the escalation is inter-job dragonfly load, occasional recoverable cohort
+  spikes may just be the 16n reality.
+
+**Pre-capacity config-drift fixes (reviewer points 2–4, all confirmed; capacity not yet
+launched):** `scripts/vitG384_capacity.sh` currently (a) uses `vitG384_cleandata.yaml` (variable
+masks — reintroduces churn source #2; `num_keep_*` live only in `vitG384_fixedshape.yaml:197-213`),
+(b) keeps all three falsified insurance flags (`:103-105`), (c) has no grad-accum. Must be brought
+to the measured env-diff baseline (fixed-shape config, flags unset) **before** any long launch.
+
 ---
 
 ## 5. Current state of the tree (branch `aurora`)
@@ -634,8 +699,15 @@ Run to execute: `scripts/vitG384_hsdp_fixedshape_16n.sh` (all three flags now un
 
 **RESOLVED (2026-07-04, job 8643398 — see §4e).** l0-free and l0-ext are both dead flat
 (±5 MiB / 74 iters); the flags were NOT the accumulator and there is NO external-memory
-accumulation. Verdict = **fabric contention** → the remaining lever is `grad_accum`.
-Next: 1n squeeze-fix smoke, then 16n `VJEPA_GRAD_ACCUM=2` + `FSDP_NO_SYNC_ACCUM=1`.
+accumulation. Verdict = **fabric contention**.
+
+**CORRECTED (2026-07-04 — see §4f).** The proposed `VJEPA_GRAD_ACCUM=2` lever is
+**microbatching, not accumulation across loader batches** — it does NOT reduce inter-node
+AllReduce frequency per optimizer step (verified in `train.py:785-828,1021-1040`), so it cannot
+address fabric contention. The 16n grad_accum job (8643428) was killed while queued. Real levers
+now: (a) implement TRUE grad accumulation across loader batches, or (b) A/B the CCL AllReduce
+algorithm/chunk size, or (c) accept the tax. Also: `backward-ms` is polluted under ga>1, and the
+capacity launcher still has config drift (variable-mask config + falsified flags) to fix first.
 
 Full blow-by-blow: memory `vitG-2b-allreduce-spikes.md`. Key repro scripts:
 `scripts/vitG384_hsdp_fixedshape_16n.sh` (16n gate + free-L0 probe),
