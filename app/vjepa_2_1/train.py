@@ -157,6 +157,21 @@ def main(args, resume_preempt=False):
     # LR/wd/EMA/momentum still step ONCE per optimizer step, so schedules are
     # unchanged. Validated below to divide batch_size and keep micro-bs >= 1.
     grad_accum = int(os.environ.get("VJEPA_GRAD_ACCUM", "1"))
+    # TRUE gradient accumulation (VJEPA_TRUE_ACCUM, default 1 = unchanged). Distinct
+    # from VJEPA_GRAD_ACCUM above: that one SLICES a single loader batch into
+    # microbatches (lowers activation peak, effective batch unchanged, same #collectives
+    # /step). VJEPA_TRUE_ACCUM fetches `true_accum` SEPARATE loader batches per optimizer
+    # step, runs fwd/bwd on each with the inter-node collective deferred (no_sync) to the
+    # LAST one — so there is ONE ReduceScatter/AllReduce per optimizer step instead of
+    # true_accum, halving (at N=2) the inter-node collective FREQUENCY. This is the real
+    # fabric-contention lever (the §4g host-side collective stalls scale with collective
+    # count). Effective global batch scales by N (192*bs2*N). LR kept unchanged (see
+    # memory true-accum-lr-decision: a 2x-larger, less-noisy gradient at fixed LR is more
+    # conservative per-sample, and LR-hotness is this model's known collapse mode).
+    # no_sync ON is affordable here (2B bf16 grad ~4GB vs ~15GB free L0) — this DIVERGES
+    # from PRISM's 7B (no_sync OFF because 14GB grad wouldn't fit); our 2B is fabric-bound
+    # not memory-bound. LR/wd/EMA/momentum still step ONCE per optimizer step.
+    true_accum = int(os.environ.get("VJEPA_TRUE_ACCUM", "1"))
     # Distributed strategy: "ddp" (default, unchanged) or "hsdp" (FSDP1
     # HYBRID_SHARD; shards params/grads/optimizer intra-node to buy back L0
     # headroom on Aurora and remove the 2B backward wedge). See app/vjepa_2_1/hsdp.py.
@@ -769,6 +784,27 @@ def main(args, resume_preempt=False):
             f"per-rank batch={batch_size} -> micro-batch={batch_size // grad_accum}"
         )
 
+    # -- validate TRUE accumulation config (fail loud) --
+    if true_accum > 1:
+        if grad_accum > 1:
+            raise ValueError(
+                "VJEPA_TRUE_ACCUM>1 and VJEPA_GRAD_ACCUM>1 are mutually exclusive "
+                "(one accumulates across loader batches, the other slices one batch). "
+                "Set exactly one."
+            )
+        if loss_reg_std_mult is not None:
+            raise ValueError(
+                "VJEPA_TRUE_ACCUM>1 is not supported together with loss regulation "
+                "(loss_reg_std_mult); the per-step skip logic is not threaded through "
+                "accumulation. Disable one."
+            )
+        logger.info(
+            f"TRUE gradient accumulation ON: true_accum={true_accum}, "
+            f"per-rank batch={batch_size} -> effective per-rank batch="
+            f"{batch_size * true_accum}; ONE inter-node collective per {true_accum} "
+            f"backwards (no_sync on non-final). LR unchanged."
+        )
+
     trailing_losses = []
     step_count = 0
 
@@ -782,15 +818,14 @@ def main(args, resume_preempt=False):
         gpu_time_meter = AverageMeter()
         data_elapsed_time_meter = AverageMeter()
 
-        for itr in range(ipe):
-            itr_start_time = time.time()
-
+        def fetch_sample():
+            # One loader batch with the upstream StopIteration-refresh + retry logic.
+            # Factored out of the loop so TRUE accumulation can pull N batches per step.
+            nonlocal loader
             iter_retries = 0
-            iter_successful = False
-            while not iter_successful:
+            while True:
                 try:
-                    sample = next(loader)
-                    iter_successful = True
+                    return next(loader)
                 except StopIteration:
                     logger.info("Exhausted data loaders. Refreshing...")
                     if "airstore" in dataset_type.lower():
@@ -811,13 +846,19 @@ def main(args, resume_preempt=False):
                             f"Exceeded max retries ({NUM_RETRIES}) when loading data."
                         ) from e
 
+        for itr in range(ipe):
+            itr_start_time = time.time()
+
+            sample = fetch_sample()
+
             for _fpc_sample in sample:
                 bs, fpc = _fpc_sample[0][-1][0].size()
                 mask_meters[fpc].update(bs / batch_size)
 
-            def load_clips():
+            def load_clips(_sample=None):
+                _sample = sample if _sample is None else _sample
                 all_clips, all_masks_enc, all_masks_pred = [], [], []
-                for fpc_sample in sample:
+                for fpc_sample in _sample:
                     udata, masks_enc, masks_pred = fpc_sample
                     all_clips += [udata[0][0].to(device, non_blocking=True)]
                     all_masks_enc += [
@@ -967,7 +1008,55 @@ def main(args, resume_preempt=False):
 
                 # Step 2. Backward & step.
                 run_step = True
-                if grad_accum <= 1:
+                if true_accum > 1:
+                    # -- TRUE accumulation path (VJEPA_TRUE_ACCUM>1) --
+                    # Process `true_accum` SEPARATE loader batches; defer the inter-node
+                    # collective (no_sync on encoder+predictor) to the LAST one, so there
+                    # is ONE ReduceScatter/AllReduce per optimizer step instead of
+                    # true_accum. This is the real fabric lever (fewer collectives =
+                    # fewer §4g host-side stall opportunities). Each sub-batch's loss is
+                    # /true_accum so the summed gradient is the mean over the enlarged
+                    # effective batch. Batch 0 is the already-loaded `clips`; batches
+                    # 1..N-1 are fetched here. no_sync ON is affordable (2B bf16 grad
+                    # ~4GB << ~15GB free L0); DIVERGES from PRISM 7B (memory-bound).
+                    def _accum_no_sync():
+                        es = contextlib.ExitStack()
+                        es.enter_context(encoder.no_sync())
+                        es.enter_context(predictor.no_sync())
+                        return es
+
+                    loss_sum = loss_pred_sum = loss_context_sum = 0.0
+                    lambda_value_step = 0.0
+                    for j in range(true_accum):
+                        if j == 0:
+                            c_j, me_j, mp_j = clips, masks_enc, masks_pred
+                        else:
+                            c_j, me_j, mp_j = load_clips(fetch_sample())
+                        l, lp, lc, lvs = _forward_losses(c_j, me_j, mp_j)
+                        lambda_value_step = lvs
+                        if j == 0:
+                            phase_timer.mark("fwd_target_done")
+                            phase_timer.mark("fwd_context_done")
+                        l = l / true_accum
+                        is_last = j == true_accum - 1
+                        sync_ctx = (
+                            contextlib.nullcontext() if is_last else _accum_no_sync()
+                        )
+                        with sync_ctx:
+                            if scaler is not None:
+                                scaler.scale(l).backward()
+                            else:
+                                l.backward()
+                        loss_sum += float(l) * true_accum  # undo /true_accum for report
+                        loss_pred_sum += float(lp)
+                        loss_context_sum += float(lc)
+                    if scaler is not None:
+                        scaler.unscale_(optimizer)
+                    phase_timer.mark("backward_done")
+                    loss = loss_sum / true_accum
+                    loss_pred = loss_pred_sum / true_accum
+                    loss_context = loss_context_sum / true_accum
+                elif grad_accum <= 1:
                     # -- single-batch path (default; behavior unchanged) --
                     loss, loss_pred, loss_context, lambda_value_step = _forward_losses(
                         clips, masks_enc, masks_pred
