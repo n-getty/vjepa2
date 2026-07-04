@@ -26,6 +26,19 @@ Two levers now exist for the §4g fabric/host-stall residual, both PRISM-informe
    1h chain** (`vitG384_chain_debugscaling.sh`) is the robust vehicle — each slice is walltime-
    bounded so a host-side hang just ends the slice and the successor resumes from latest.pth.tar.
 
+**LIVE STATUS (2026-07-04 ~05:00):**
+- CCL_WORKER_COUNT=4 A/B (8643434): **FAILED** — WebDataset first-batch buffer-fill didn't
+  complete before the 600s watchdog (all 192 ranks reached loader-init + data started flowing).
+  Orthogonal loader-fill flakiness, but **demoted workers=4**; launch path reverted to the
+  proven **workers=1** base (only 74-iter success used it). Raised first-iter deadline 600→900s.
+- True-accum 1n smoke (8643448): **was a NO-OP** — copied a runtime cfg whose folder=`smoke_weak`
+  had a STALE Jul-1 `latest.pth.tar` (epoch=1); trainer auto-resumed it → `range(1, epochs=1)`
+  empty → 0 iters, exit 0, true-accum path never ran. NOT a code/loader bug. Fixed: smoke now
+  patches folder to a unique CKPT_DIR + rm stale ckpt → fresh Meta init. Deleted the confounding
+  `smoke_weak/latest.pth.tar`. **Re-running as 8643455** — this is the real gate.
+  (This also means the earlier ga2 "PASS" was spurious — stale rows; neither accum path had
+  actually executed. The true-accum implementation is still UNVALIDATED until 8643455 returns.)
+
 **Launch vehicle:** `capacity` queue IS available tonight (22 running). Two options:
 - `scripts/vitG384_capacity.sh` — single 12h job. FIXED tonight (fixedshape cfg, flags unset,
   workers=4). Auto-resumes from latest.pth.tar (verified train.py:375 — non-anneal path resumes
