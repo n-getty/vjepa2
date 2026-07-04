@@ -46,6 +46,7 @@ if [[ -f $CKPT_DIR/latest.pth.tar ]]; then
   CURRENT_EPOCH=$($PY -c "import torch; print(torch.load('$CKPT_DIR/latest.pth.tar', map_location='cpu', weights_only=False).get('epoch', 0))" 2>/dev/null || echo 0)
 fi
 echo "progress: epoch $CURRENT_EPOCH / $NUM_EPOCHS"
+START_EP=$CURRENT_EPOCH   # captured for the self-healing resubmit progress-guard at exit
 if (( CURRENT_EPOCH >= NUM_EPOCHS )); then
   echo "ViT-G CPT complete (epoch >= num_epochs). capacity job stops."
   rm -f "$LOCK"
@@ -143,8 +144,68 @@ mpiexec -n 16 -ppn 1 --cpu-bind none \
         --num-nodes 16 --local-world-size 12 --workers 8
 echo "--- staging complete ---"
 
+# ---- STALL WATCHDOG (background): kill a hung training so the successor can take over.
+# The §4g fabric stalls are recoverable multi-minute spikes; the DDP wedge hit 328s and
+# recovered. Only a TRUE hang (no new CSV rows for a long time) should trigger a kill.
+# 1800s (30min) >> any observed recoverable spike (max ~544s) but still bounds a real hang.
+CSV_WATCH="$CKPT_DIR/log_r0.csv"
+STALL_DEADLINE=1800
+FIRST_ITER_DEADLINE=1200   # staging+wrap+load+first iter (loader fill is slow at 16n)
+(
+    start=$(date +%s); last_rows=-1; last_change=$start
+    while true; do
+        sleep 60
+        pgrep -f "app.main_dist_aurora" >/dev/null 2>&1 || exit 0
+        now=$(date +%s)
+        rows=0; [ -f "$CSV_WATCH" ] && rows=$(($(wc -l < "$CSV_WATCH" 2>/dev/null || echo 1)-1))
+        if [ "$rows" -gt 0 ]; then
+            if [ "$rows" -ne "$last_rows" ]; then last_rows=$rows; last_change=$now; fi
+            if [ $((now-last_change)) -gt $STALL_DEADLINE ]; then
+                echo "WATCHDOG: STALL — no new iters for ${STALL_DEADLINE}s at row $rows. Killing for resubmit." >&2
+                pkill -9 -f "app.main_dist_aurora"; exit 1
+            fi
+        elif [ $((now-start)) -gt $FIRST_ITER_DEADLINE ]; then
+            echo "WATCHDOG: NO FIRST ITER within ${FIRST_ITER_DEADLINE}s. Killing for resubmit." >&2
+            pkill -9 -f "app.main_dist_aurora"; exit 1
+        fi
+    done
+) &
+WATCHDOG_PID=$!
+
 mpiexec -n 192 -ppn 12 --cpu-bind depth --depth 16 \
     python -m app.main_dist_aurora --train_mode \
         --fname $PARAMS --params_path $PARAMS \
         --local_data_root $LOCAL_DATA_ROOT
-echo "JOB END: $(date)"
+TRAIN_RC=$?
+kill $WATCHDOG_PID 2>/dev/null
+echo "JOB END: $(date) (train rc=$TRAIN_RC)"
+
+# ---- SELF-HEALING RESUBMIT: if training did not finish all epochs, resubmit a successor
+# (which auto-resumes from latest.pth.tar, train.py:375). Skips if the run is complete or a
+# successor is already queued. Mirrors the chain launcher's resilience but for the 12h job,
+# so an intrinsic-fabric-stall hang (watchdog-killed) does not end the training campaign.
+release_lock() { rm -f "$LOCK"; }
+CUR_EP=0
+[[ -f $CKPT_DIR/latest.pth.tar ]] && CUR_EP=$($PY -c "import torch;print(torch.load('$CKPT_DIR/latest.pth.tar',map_location='cpu',weights_only=False).get('epoch',0))" 2>/dev/null || echo 0)
+# Resubmit-storm guard: count CONSECUTIVE runs that made no epoch progress. A startup
+# crash loop (e.g. the loader-fill hang seen 3x) must not churn the queue forever.
+FAILF=$CKPT_DIR/.consecutive_noprogress
+FAILS=$(cat "$FAILF" 2>/dev/null || echo 0)
+if (( CUR_EP > START_EP )); then FAILS=0; else FAILS=$((FAILS+1)); fi
+echo "$FAILS" > "$FAILF"
+echo "resubmit-guard: start_ep=$START_EP cur_ep=$CUR_EP consecutive_noprogress=$FAILS"
+if (( CUR_EP >= NUM_EPOCHS )); then
+  echo "campaign complete (epoch $CUR_EP >= $NUM_EPOCHS) — no resubmit."
+  release_lock
+elif (( FAILS >= 4 )); then
+  echo "STORM GUARD: $FAILS consecutive runs made no progress — STOPPING resubmit. Needs a human."
+  release_lock
+else
+  QUEUED=$(qstat -u "$USER" 2>/dev/null | grep -c "vitG_cap")
+  if (( QUEUED > 1 )); then
+    echo "successor already queued ($QUEUED vitG_cap jobs) — no resubmit."
+  else
+    release_lock  # let the successor take the lock cleanly
+    NEXT=$(qsub "$ROOT/scripts/vitG384_capacity.sh" 2>&1) && echo "RESUBMITTED successor: $NEXT" || echo "resubmit failed: $NEXT"
+  fi
+fi
