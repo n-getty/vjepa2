@@ -25,7 +25,8 @@
 
 set -eo pipefail
 ROOT=/lus/flare/projects/ModCon/ngetty/vjepa2
-BASE_CFG=$ROOT/configs/vitg16_surg_vid_webdataset_single4/SMOKE_vitG384.yaml
+# DIAG_CFG env overrides the base config (e.g. the 1B vitg384_cleandata for the model-size A/B).
+BASE_CFG=${DIAG_CFG:-$ROOT/configs/vitg16_surg_vid_webdataset_single4/SMOKE_vitG384.yaml}
 VENV=/flare/ModCon/ngetty/venvs/torchtune-pt213-xpu
 PY_STAGE=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python
 
@@ -37,7 +38,8 @@ NW=${VJEPA_NUM_WORKERS:-0}   # default: workerless isolator (Mode A fix)
 PIN=${VJEPA_PIN_MEM:-0}
 WC=${CCL_WORKER_COUNT:-1}
 AR=${CCL_ALLREDUCE:-ring}
-TAG="n${NNODES}_nw${NW}_wc${WC}_ar${AR}"
+CFGTAG=$(basename "$BASE_CFG" .yaml)
+TAG="${CFGTAG}_n${NNODES}_nw${NW}_wc${WC}_ar${AR}"
 CKPT_DIR=/flare/ModCon/ngetty/checkpoints/MODEA_DIAG/$TAG
 PARAMS=$CKPT_DIR/params-pretrain.yaml
 mkdir -p $CKPT_DIR /flare/ModCon/ngetty/logs
