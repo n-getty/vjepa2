@@ -114,6 +114,13 @@ export FSDP_SHARDING=shard_grad_op   # _HYBRID_SHARD_ZERO2
 unset PYTORCH_ALLOC_CONF
 unset FI_MR_CACHE_MONITOR
 unset CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD
+# TRUE grad accumulation (§4f/§4g fabric lever): fetch N loader batches/step, one
+# inter-node collective per step instead of N (fewer host-side-stall opportunities).
+# 1n memory smoke (8643455) PASSED: no_sync full-grad fits with 10.3GiB free L0, loss
+# sane. Default 1 (=proven plain base) unless the 16n verify (8643462) confirms it
+# flattens the fabric spikes — then launch with VJEPA_TRUE_ACCUM=2 in the qsub env.
+# Effective global batch scales Nx; LR unchanged (memory true-accum-lr-decision).
+export VJEPA_TRUE_ACCUM=${VJEPA_TRUE_ACCUM:-1}
 # NOTE: capacity job runs CONTINUOUSLY — do NOT set VJEPA_EXIT_AFTER_CKPT (that's
 # only for the 1h debug-scaling chain slices).
 if [[ -f "${PBS_NODEFILE:-}" ]]; then
@@ -125,7 +132,7 @@ export MASTER_ADDR
 export MASTER_PORT=29500
 export WORLD_SIZE=192
 echo "MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT WORLD_SIZE=$WORLD_SIZE"
-echo "HSDP ENVS: VJEPA_DIST_STRATEGY=$VJEPA_DIST_STRATEGY FSDP_SHARDING=$FSDP_SHARDING transport=none/ofi"
+echo "HSDP ENVS: VJEPA_DIST_STRATEGY=$VJEPA_DIST_STRATEGY FSDP_SHARDING=$FSDP_SHARDING TRUE_ACCUM=$VJEPA_TRUE_ACCUM WORKER_COUNT=$CCL_WORKER_COUNT transport=none/ofi"
 
 export LOCAL_DATA_ROOT=/tmp/vjepa_data/${PBS_JOBID%%.*}
 echo "--- staging shards to $LOCAL_DATA_ROOT (per-node disjoint) ---"
