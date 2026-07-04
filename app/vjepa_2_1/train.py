@@ -191,6 +191,13 @@ def main(args, resume_preempt=False):
     _nw_override = os.environ.get("VJEPA_NUM_WORKERS")
     if _nw_override is not None:
         num_workers = int(_nw_override)
+    # Env override for pin_memory — a Mode-A (DataLoader shm-crash) isolation knob.
+    # VJEPA_PIN_MEM=0 disables the pinned-host-memory staging buffer. (Note:
+    # persistent_workers is NOT plumbed through init_data here, so it is already
+    # effectively False regardless of config — not a Mode-A variable.)
+    _pin_override = os.environ.get("VJEPA_PIN_MEM")
+    if _pin_override is not None:
+        pin_mem = _pin_override == "1"
 
     # -- IMG DATA
     cfgs_img_data = args.get("img_data")

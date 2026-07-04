@@ -699,17 +699,21 @@ def make_webdataset(
     # subsequent `iter(unsupervised_loader)` re-entry hangs after the first
     # successful re-iter — phase-1 job 8527315 (2026-06-06) hung permanently
     # at the 2nd epoch boundary and wasted ~4h of walltime.
-    data_loader = wds.WebLoader(
-        mixed,
+    # wds.WebLoader wraps a torch DataLoader (super().__init__(DataLoader(**kw))), which
+    # REJECTS prefetch_factor when num_workers==0 (ValueError). Make it conditional so a
+    # workerless run (VJEPA_NUM_WORKERS=0 — the Mode-A shm-crash isolator) is valid.
+    loader_kwargs = dict(
         collate_fn=collator,
         batch_size=batch_size,
         shuffle=False,
         drop_last=drop_last,
         pin_memory=pin_mem,
         num_workers=num_workers,
-        prefetch_factor=2,
         persistent_workers=(num_workers > 0) and persistent_workers,
     )
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = int(os.environ.get("VJEPA_PREFETCH_FACTOR", "2"))
+    data_loader = wds.WebLoader(mixed, **loader_kwargs)
 
     class _LenWrapper:
         def __init__(self, loader, length):
