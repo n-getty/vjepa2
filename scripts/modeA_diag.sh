@@ -37,15 +37,17 @@ NW=${VJEPA_NUM_WORKERS:-0}   # default: workerless isolator
 PIN=${VJEPA_PIN_MEM:-0}
 TAG="n${NNODES}_nw${NW}_pin${PIN}"
 CKPT_DIR=/flare/ModCon/ngetty/checkpoints/MODEA_DIAG/$TAG
-RUNTIME_CFG=$ROOT/.runtime_configs/n${NNODES}g${LWS}_weak/configs/vitg16_surg_vid_webdataset_single4/SMOKE_vitG384.yaml
 PARAMS=$CKPT_DIR/params-pretrain.yaml
 mkdir -p $CKPT_DIR /flare/ModCon/ngetty/logs
 rm -f $CKPT_DIR/log_r*.csv $CKPT_DIR/latest.pth.tar   # always a FRESH start (SMOKE, no resume)
 
 echo "JOB START: $(date) PBS_JOBID=$PBS_JOBID  [MODE-A DIAG $TAG: nodes=$NNODES ws=$WS num_workers=$NW pin_mem=$PIN shm_clean=${DIAG_SHM_CLEAN:-0}]"
 
-$PY_STAGE $ROOT/scripts/prepare_runtime_config.py \
-    $BASE_CFG --root $ROOT --num-gpus $LWS --num-nodes $NNODES --weak-scale > /dev/null
+# prepare_runtime_config.py PRINTS the output path; capture it rather than reconstructing the
+# topology-suffix dir (1n -> g12_weak, Nn -> n{N}g12_weak — reconstructing it was a bug).
+RUNTIME_CFG=$($PY_STAGE $ROOT/scripts/prepare_runtime_config.py \
+    $BASE_CFG --root $ROOT --num-gpus $LWS --num-nodes $NNODES --weak-scale | tail -1)
+echo "runtime cfg -> $RUNTIME_CFG"
 # patch folder->CKPT_DIR + ipe=5 + no-save (fresh startup-only test)
 $PY_STAGE - "$RUNTIME_CFG" "$PARAMS" "$CKPT_DIR" <<'PY'
 import sys, yaml
