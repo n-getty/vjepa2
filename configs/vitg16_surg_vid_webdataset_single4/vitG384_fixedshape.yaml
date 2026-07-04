@@ -157,7 +157,7 @@ data:
   - 16
   tubelet_size: 2
   fps: 4
-  num_workers: 2
+  num_workers: 1
   persistent_workers: true
   pin_mem: true
 data_aug:
