@@ -382,6 +382,15 @@ def main(args, resume_preempt=False):
         ("%.5f", "loss-pred"),
         ("%.5f", "loss-context"),
         ("%.5f", "lambda"),
+        # L0 free-memory probe (torchtune MEMPROBE): external CCL/OFI growth is
+        # INVISIBLE to torch's reserved/allocated — it lives in the L0 driver's
+        # free pool. external = l0_used - torch_alloc. If l0-free creeps DOWN as
+        # the backward floor creeps UP -> inter-node CCL/OFI registration
+        # accumulation (the static-buffer/registration fix path). If l0-free is
+        # FLAT while backward spikes cohort-wide -> pure fabric contention
+        # (grad_accum is then the legitimate mitigation, not a band-aid).
+        ("%.1f", "l0-free-mib"),
+        ("%.1f", "l0-ext-mib"),
     )
 
     # -- init model
@@ -1105,6 +1114,20 @@ def main(args, resume_preempt=False):
 
             # -- Logging
             def log_stats():
+                # -- L0 free-memory probe (per rank, per iter). external =
+                # l0_used - torch_alloc catches CCL/OFI growth reserved can't see.
+                l0_free_mib = -1.0
+                l0_ext_mib = -1.0
+                if device.type == "xpu":
+                    try:
+                        free_b, total_b = torch.xpu.mem_get_info()
+                        l0_free_mib = free_b / 1024.0**2
+                        l0_ext_mib = (
+                            (total_b - free_b) - torch.xpu.memory_allocated()
+                        ) / 1024.0**2
+                    except Exception:
+                        pass  # NotImplementedError under pluggable allocator, etc.
+
                 csv_logger.log(
                     epoch + 1,
                     itr,
@@ -1120,6 +1143,8 @@ def main(args, resume_preempt=False):
                     loss_pred_val,
                     loss_context_val,
                     lambda_value_step_val,
+                    l0_free_mib,
+                    l0_ext_mib,
                 )
                 if (
                     (itr % log_freq == 0)
@@ -1132,6 +1157,7 @@ def main(args, resume_preempt=False):
                         "masks: %s "
                         "[wd: %.2e] [lr: %.2e] "
                         "[mem: %.2e] [resv: %.2e] "
+                        "[l0free: %.0f] [l0ext: %.0f] "
                         "[iter: %.1f ms] "
                         "[gpu: %.1f ms] "
                         "[data: %.1f ms]"
@@ -1161,6 +1187,8 @@ def main(args, resume_preempt=False):
                             # growth story is FALSE; if it climbs -> allocator implicated.
                             (torch.xpu.memory_reserved() if device.type == "xpu"
                              else torch.cuda.memory_reserved()) / 1024.0**2,
+                            l0_free_mib,
+                            l0_ext_mib,
                             iter_time_meter.avg,
                             gpu_time_meter.avg,
                             data_elapsed_time_meter.avg,
