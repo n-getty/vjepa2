@@ -131,9 +131,45 @@ fields set, keep-lengths collapse to **exactly one value each** over 300 steps (
 at the measured medians (cfg0 enc 1536/pred 2560; cfg1 enc 768/pred 3584). Config
 `vitG384_fixedshape.yaml`; A/B spike `vitG384_hsdp_fixedshape_16n.sh` (job 8643289).
 
-**Status:** top-level wrap committed & confirmed-engaged; fixed-shape masks committed
-& collator-verified; 16n A/B spike running to confirm the wall-clock drift flattens
-past 120 iters. Only after that PASS does the production `capacity` job launch.
+**16n A/B result (2026-07-04, job 8643320, clean CSV + 720s watchdog).** Fixed-shape
+masks **changed the drift's *character*** — the monotonic *baseline climb* is gone, but
+**intermittent recover-spikes remain**. Raw per-iter (rank0, seconds), iters 21–68:
+
+```
+5 6 6 11 22 5 6 5 6 5 6 6 8 4 5 5 16 4 7 4 5 13 5 5 6 5 6 5 8 6 5 5
+8 8 8 6 24 8 6 15 7 7 8 5 19 6 8 13 9 17 7 15 7 14 9 8 11 11 23 27 245 46
+```
+- **Baseline is FLAT and LOW: median 7.6 s** post-warmup (plain-wrap climbed 9→16→32→54
+  and its *baseline* rose; here the baseline holds ~5–8 s the whole time).
+- **But mean = 15.0 s** because of sparse spikes: 5 of 48 iters > 20 s, including a single
+  **244.5 s** spike at iter 67 (then 46 s at 68 — partially recovering when this snapshot
+  was taken). So spikes are getting *larger/rarer* even as the baseline stays flat.
+
+**Interpretation (hypothesis, unconfirmed).** Fixed-shape masks removed the *dominant,
+per-step* VA churn (baseline no longer climbs) — that half of the reviewer's diagnosis is
+**confirmed by the flat baseline**. The residual big spikes point to a *third, lower-
+frequency* VA/registration event that is NOT per-step:
+  - candidate A: a remaining variable-shape tensor *other* than the two mask cfgs — e.g.
+    the **image branch** (`img_mask`) or a per-source `dataset_fpcs` path (all 16 here, so
+    unlikely), or the `default_collate` of the video buffer itself if clip length varies;
+  - candidate B: a **periodic allocator event** — `gc.collect()` every 50 iters
+    (`GARBAGE_COLLECT_ITR_FREQ`) can free+reallocate segments → new VAs → a burst of IPC/MR
+    re-registration → one huge stall, then recovery. The spike cadence (iters ~43, ~50,
+    ~55, ~67) is not obviously period-50 but overlaps it; worth correlating.
+  - candidate C: CCL/OFI **cache eviction** when the (now fewer) registrations still cross
+    a threshold, causing a periodic rebuild.
+
+**Next diagnostic step (not yet run):** correlate spike iters against (i) the gc cadence
+(try `GARBAGE_COLLECT_ITR_FREQ` off or =1 to see if spikes move/vanish), and (ii) whether
+`num_workers`/prefetch boundaries align. If gc is the trigger, the fix is to stop freeing
+segments (torchtune's `kBucketCap=8GiB` + `garbage_collection_threshold` already partially
+addresses this — but our alloc-conf may still gc). This is likely another *fixable* issue,
+same class (VA stability), just lower-frequency than the mask churn.
+
+**Status:** top-level wrap + fixed-shape masks both committed & verified to remove the
+baseline climb; residual recover-spikes under investigation (candidates above). NOT yet
+cleared for the production `capacity` launch — need the spikes explained/bounded first,
+because a 245 s spike every ~20 iters would still wreck throughput over a 12 h run.
 
 **Also fixed in passing:** HSDP resume derefed `None` when a checkpoint contained opt
 state (opt is built post-wrap, passed as `None` to `load_checkpoint`). Now guarded on
