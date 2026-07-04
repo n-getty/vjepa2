@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 16-NODE HSDP + TRUE_ACCUM=2 + CCL_WORKER_COUNT=4 — stacked fabric-contention levers (§4f/§4g).
+# 16-NODE HSDP + TRUE_ACCUM=2 (workers=1 proven base) — fabric-contention lever (§4f/§4g).
 #
 # Under DDP the 2B backward-ms climbs monotonically (13s -> 328s by iter ~42) as
 # CCL external memory starves the 90%-full tile. HSDP shards params/grads/optimizer
@@ -72,7 +72,7 @@ export CCL_PROCESS_LAUNCHER=none
 export CCL_ATL_TRANSPORT=ofi
 export CCL_KVS_IFACE=hsn0
 export CCL_OP_SYNC=1
-export CCL_WORKER_COUNT=4
+export CCL_WORKER_COUNT=1
 export CCL_ALLREDUCE=ring
 export CCL_CHUNK_SIZE=16777216
 export FI_PROVIDER=cxi
@@ -110,10 +110,12 @@ unset VJEPA_DDP_BUCKET_MB
 
 # -------- TRUE ACCUMULATION (§4f/§4g real fabric lever) --------
 # Fetch 2 loader batches/step, no_sync defers to last -> ONE inter-node collective per
-# optimizer step instead of 2 (halves the §4g host-side-stall count). Stacks with
-# CCL_WORKER_COUNT=4 (complementary: workers speed host-side progress, true-accum reduces
-# how often it runs). Effective global batch 384->768; LR unchanged (see memory
-# true-accum-lr-decision). MUST pass the 1n memory smoke (no_sync full-grad fits) first.
+# optimizer step instead of 2 (halves the §4g host-side-stall count — the collective
+# COUNT is what the host-stalls scale with). Effective global batch 384->768; LR
+# unchanged (see memory true-accum-lr-decision). MUST pass the 1n memory smoke first.
+# NOTE: kept on the PROVEN CCL_WORKER_COUNT=1 base (the only 16n run to reach 74 iters,
+# env-diff 8643398, used workers=1; the workers=4 A/B 8643434 failed its first-iter test
+# — orthogonal loader-fill hang, but for an unattended launch proven > theoretical).
 export VJEPA_TRUE_ACCUM=2
 
 MASTER_ADDR=$(head -n1 "$PBS_NODEFILE"); export MASTER_ADDR
@@ -135,7 +137,7 @@ echo "--- staging complete ---"
 # per-rank CSV (log_r0.csv) does not gain rows within FIRST_ITER_DEADLINE of launch,
 # or stalls (no new rows) for STALL_DEADLINE thereafter.
 CSV_WATCH="$CKPT_DIR/log_r0.csv"   # folder key == $CKPT_DIR (set in the patch above)
-FIRST_ITER_DEADLINE=600   # 10 min: staging+wrap+load+first iter must land by here
+FIRST_ITER_DEADLINE=900   # 15min: loader buffer-fill on Aurora is slow+variable (job 8643434 hung the first-batch fill under 600s); a slow-but-progressing loader must not be killed
 # 12 min: the DDP wedge hit single iters of 328s and RECOVERED; a recovering
 # mega-spike must not be mistaken for a true deadlock. 720s still bounds a real
 # hang (kills within ~12min of the last iter) while surviving spike-and-recover,

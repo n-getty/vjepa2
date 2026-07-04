@@ -83,11 +83,11 @@ export CCL_PROCESS_LAUNCHER=none
 export CCL_ATL_TRANSPORT=ofi
 export CCL_KVS_IFACE=hsn0
 export CCL_OP_SYNC=1
-# CCL_WORKER_COUNT=4 (§4g): matches PRISM production. The env-diff run showed
-# intermittent multi-minute HOST-SIDE collective stalls (iter-ms 365s w/ gpu-ms 21s)
-# — a single progress-engine worker (=1) is a plausible cause; PRISM uses 4 (8 -> EINVAL).
-# Under test in job 8643434; this launcher adopts the value pending that A/B's confirmation.
-export CCL_WORKER_COUNT=4
+# CCL_WORKER_COUNT=1: the PROVEN base. The only 16n run to reach 74 iters (env-diff
+# 8643398) used workers=1; the workers=4 A/B (8643434) failed its first-iter test.
+# For an unattended launch, proven > theoretical. (workers=4 remains a daytime A/B to
+# retry against the §4g host-stalls once someone can babysit it.)
+export CCL_WORKER_COUNT=1
 export CCL_ALLREDUCE=ring
 export CCL_CHUNK_SIZE=16777216
 export FI_PROVIDER=cxi

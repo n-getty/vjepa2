@@ -127,7 +127,7 @@ echo "--- staging complete ---"
 # per-rank CSV (log_r0.csv) does not gain rows within FIRST_ITER_DEADLINE of launch,
 # or stalls (no new rows) for STALL_DEADLINE thereafter.
 CSV_WATCH="$CKPT_DIR/log_r0.csv"   # folder key == $CKPT_DIR (set in the patch above)
-FIRST_ITER_DEADLINE=600   # 10 min: staging+wrap+load+first iter must land by here
+FIRST_ITER_DEADLINE=900   # 15min: Aurora loader buffer-fill is slow+variable (8643434 hung fill <600s)
 # 12 min: the DDP wedge hit single iters of 328s and RECOVERED; a recovering
 # mega-spike must not be mistaken for a true deadlock. 720s still bounds a real
 # hang (kills within ~12min of the last iter) while surviving spike-and-recover,
