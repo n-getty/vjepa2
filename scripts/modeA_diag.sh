@@ -113,13 +113,14 @@ echo "DIAG: nodes=$NNODES WORLD_SIZE=$WS num_workers=$NW pin_mem=$PIN prefetch=$
 echo "=== per-node /dev/shm + ipcs BEFORE training ==="
 mpiexec -n $NNODES -ppn 1 --cpu-bind none bash -c '
   echo "[$(hostname)] shm: $(df -h /dev/shm 2>/dev/null | awk "NR==2{print \$3\"/\"\$2\" used\"}") | ipcs-seg: $(ipcs -m 2>/dev/null | grep -c 0x) | shm-files: $(ls /dev/shm 2>/dev/null | wc -l)"
-' 2>&1 | grep -viE "warn" | sort | head -20
+' 2>&1 | grep -viE "warn" | sort | head -20 || true
 if [[ "${DIAG_SHM_CLEAN:-0}" == "1" ]]; then
-  echo "=== SHM HYGIENE: removing stale torch/psm shm from prior jobs (our patterns only) ==="
-  mpiexec -n $NNODES -ppn 1 --cpu-bind none bash -c '
-    rm -f /dev/shm/torch_* /dev/shm/*psm* /dev/shm/sem.* 2>/dev/null
-    ipcs -m 2>/dev/null | awk "/0x/&&\$3==ENVIRON[\"USER\"]{print \$2}" | xargs -r -n1 ipcrm -m 2>/dev/null
-    true' 2>&1 | grep -viE "warn" | head -3
+  echo "=== SHM HYGIENE: removing stale torch/psm shm (best-effort, never fatal) ==="
+  # NOTE: entire block guarded with `|| true` — under `set -e` a benign nonzero from
+  # rm/ipcrm (nothing to remove) must NOT abort the diagnostic (that killed job 8644220).
+  mpiexec -n $NNODES -ppn 1 --cpu-bind none bash -c \
+    'rm -f /dev/shm/torch_* /dev/shm/*psm* /dev/shm/sem.* 2>/dev/null; true' 2>&1 \
+    | grep -viE "warn" | head -3 || true
   echo "  hygiene done"
 fi
 
