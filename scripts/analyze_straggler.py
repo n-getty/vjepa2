@@ -46,6 +46,7 @@ def main(folder):
     l0free = defaultdict(list)
     l0ext = defaultdict(list)
     dload = defaultdict(list)
+    untracked = defaultdict(list)  # iter-time - gpu-time = host-side stall
     for f in files:
         lines = open(f).read().splitlines()
         hi = [i for i, l in enumerate(lines) if l.startswith("epoch,")]
@@ -88,12 +89,20 @@ def main(folder):
             dl = val("dataload-time(ms)", 1000.0)
             if dl is not None:
                 dload[it].append(dl)
+            # UNTRACKED host-side time = iter-time - gpu-time. Large values = a
+            # host-side collective stall (CCL progress hang) NOT visible in any
+            # GPU phase incl. backward-ms. Job 8643398 iter70: iter=365s gpu=21s
+            # -> 344s untracked, synchronized across all ranks. This is the tail-
+            # latency killer, distinct from in-GPU backward inflation.
+            g = val("gpu-time(ms)", 1000.0)
+            if t is not None and g is not None:
+                untracked[it].append(max(0.0, t - g))
 
     iters = sorted(bwd)
     print(f"ranks={len(files)}  iters={len(iters)}\n")
     print("=== (A) cross-rank backward-ms distribution per iter ===")
     print(f"{'itr':>4} {'n':>4} {'min':>7} {'p50':>7} {'p90':>7} {'max':>7} "
-          f"{'span':>6}  {'l0free':>8} {'l0ext':>7} {'dload_p50':>9}")
+          f"{'span':>6}  {'l0free':>8} {'l0ext':>7} {'untrk_p90':>9}")
     for it in iters:
         a = bwd[it]
         if len(a) < 10:
@@ -103,9 +112,11 @@ def main(folder):
             "1RANK" if mx > 2 * p90 else "flat")
         fr = _pct(l0free[it], .5) if l0free[it] else -1
         ex = _pct(l0ext[it], .5) if l0ext[it] else -1
-        dl = _pct(dload[it], .5) if dload[it] else -1
+        ut = _pct(untracked[it], .9) if untracked[it] else -1
+        # flag host-side stalls: >5s untracked wall that backward doesn't explain
+        tag = " <<HOST-STALL" if ut > 5.0 else ""
         print(f"{it:>4} {len(a):>4} {mn:>7.1f} {p50:>7.1f} {p90:>7.1f} "
-              f"{mx:>7.1f} {span:>6}  {fr:>8.0f} {ex:>7.0f} {dl:>9.1f}")
+              f"{mx:>7.1f} {span:>6}  {fr:>8.0f} {ex:>7.0f} {ut:>9.1f}{tag}")
 
     # (B) trend: floor (min backward) and free-L0 over the run
     print("\n=== (B) floor + free-L0 trend (10-iter windows) ===")

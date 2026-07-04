@@ -553,6 +553,48 @@ NOT yet confirmed for our case:
 
 ---
 
+## 4g. DEEPER LOOK (2026-07-04): the killer spikes are HOST-SIDE, not backward-collective
+
+Re-examining job 8643398's per-phase CSV (not just `backward-ms`) reframes the residual. The
+terminal-region iters, rank0, all columns in ms:
+
+| itr | iter-ms | gpu-ms | Σphases | **UNTRACKED = iter−gpu** | bwd-ms |
+|-----|---------|--------|---------|--------------------------|--------|
+| 68  | 23070   | 23007  | 23037   | 63                       | 20639  |
+| 69  | 85630   | 85515  | 85515   | 115                      | 82829  |
+| 70  | **365317** | **21221** | 21234 | **344096**             | 18966  |
+| 71  | 56818   | 56672  | 56672   | 146                      | 53941  |
+| 72  | 25754   | 25711  | 25712   | 43                       | 22904  |
+
+Two distinct spike modes are now visible:
+- **In-GPU spikes** (68,69,71,72): iter-ms ≈ gpu-ms ≈ bwd-ms — the backward collective genuinely
+  inflates (this is the "cohort backward inflation" §4c/§4e measured; real, still fabric).
+- **Host-side stall** (iter 70): iter-ms=365 s but gpu-ms=21 s → **344 s is UNTRACKED wall time
+  outside every GPU phase**, synchronized across all 192 ranks (rank0/50/100/150/191 all ≈365.5 s
+  wall, ≈19 s backward). This is a Python/CCL **host-side** stall — a collective's host-side
+  progress hanging on a congested fabric then clearing — NOT captured by `backward-ms` at all.
+
+**The run recovered from the 365 s spike** (iters 71→73 back to ~25 s) then went fully silent
+after iter 73 (720 s no-new-rows → watchdog kill), with **zero crash signatures** (0 tracebacks,
+0 OOM, 0 shm errors). So the failure mode is **intermittent multi-minute host-side collective
+stalls that mostly recover but occasionally hang past the watchdog** — a *stability/tail-latency*
+problem, not the steady memory-starvation the DDP wedge was.
+
+**Why this matters for the fix:**
+1. It **strengthens the CCL_WORKER_COUNT=4 probe** (job 8643434): host-side collective progress
+   is exactly what more CCL progress-engine worker threads accelerate. `WORKER_COUNT=1` (our
+   value) means a single thread drives all collective host-side progress; PRISM uses 4. A
+   starved progress thread is a textbook cause of multi-second host-side collective stalls.
+2. It **re-weights grad-accum**: under FSDP `shard_grad_op`, only accumulation that reduces the
+   *number of inter-node collectives per optimizer step* reduces stall opportunities. True
+   loader-batch accumulation with `no_sync` on non-final microbatches does this (fewer
+   ReduceScatters/AllGathers per step); our current microbatch-slicing does NOT. See §4f.
+3. `backward-ms`-based analysis undercounts the problem — future runs must track `iter-ms` vs
+   `gpu-ms` (the UNTRACKED delta) as a first-class metric. `analyze_straggler.py` reads iter-time
+   already; add the untracked-delta column.
+
+---
+
 ## 4e. ENV-DIFF VERDICT (2026-07-04, job 8643398): flags NOT the accumulator → fabric contention
 
 The env-diff run (all three insurance flags **unset**, fixed-shape masks + top-level wrap,
