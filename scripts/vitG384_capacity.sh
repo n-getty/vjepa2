@@ -63,6 +63,10 @@ if [[ -f $CKPT_DIR/latest.pth.tar ]]; then
 fi
 echo "progress: epoch $CURRENT_EPOCH / $NUM_EPOCHS"
 START_EP=$CURRENT_EPOCH   # captured for the self-healing resubmit progress-guard at exit
+# Row count in log_r0.csv at start — the trainer APPENDS across resumes, so iters-THIS-RUN =
+# rows_at_end - rows_at_start. Lets the resubmit policy tell a pre-first-iter crash (0 new rows)
+# from a job that trained then failed. (CKPT_DIR == config folder after the patch above.)
+ROWS_AT_START=$(awk -F, '$2~/^[0-9]+$/{n++} END{print n+0}' "$CKPT_DIR/log_r0.csv" 2>/dev/null || echo 0)
 if (( CURRENT_EPOCH >= NUM_EPOCHS )); then
   echo "ViT-G CPT complete (epoch >= num_epochs). capacity job stops."
   rm -f "$LOCK"
@@ -151,6 +155,16 @@ export WORLD_SIZE=192
 echo "MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT WORLD_SIZE=$WORLD_SIZE"
 echo "HSDP ENVS: VJEPA_DIST_STRATEGY=$VJEPA_DIST_STRATEGY FSDP_SHARDING=$FSDP_SHARDING TRUE_ACCUM=$VJEPA_TRUE_ACCUM WORKER_COUNT=$CCL_WORKER_COUNT transport=none/ofi"
 
+# ---- PRE-LAUNCH SHM HYGIENE + evidence (Mode-A mitigation): a prior/killed job on a node can
+# leave /dev/shm torch/psm segments that starve the next job's DataLoader workers (the shm-unmap
+# crash). Clean our own patterns per node + log df/ipcs so exhaustion is visible if it recurs.
+echo "=== per-node /dev/shm BEFORE (df used / shm-file count) ==="
+mpiexec -n 16 -ppn 1 --cpu-bind none bash -c \
+  'echo "[$(hostname)] $(df -h /dev/shm 2>/dev/null|awk "NR==2{print \$3\"/\"\$2}") files=$(ls /dev/shm 2>/dev/null|wc -l)"' 2>&1 | grep -viE "warn" | sort | head -20
+mpiexec -n 16 -ppn 1 --cpu-bind none bash -c \
+  'rm -f /dev/shm/torch_* /dev/shm/*psm* /dev/shm/sem.* 2>/dev/null; true' 2>&1 | grep -viE "warn" | head -2
+echo "--- shm hygiene done ---"
+
 export LOCAL_DATA_ROOT=/tmp/vjepa_data/${PBS_JOBID%%.*}
 echo "--- staging shards to $LOCAL_DATA_ROOT (per-node disjoint) ---"
 mpiexec -n 16 -ppn 1 --cpu-bind none \
@@ -203,25 +217,30 @@ echo "JOB END: $(date) (train rc=$TRAIN_RC)"
 release_lock() { rm -f "$LOCK"; }
 CUR_EP=0
 [[ -f $CKPT_DIR/latest.pth.tar ]] && CUR_EP=$($PY -c "import torch;print(torch.load('$CKPT_DIR/latest.pth.tar',map_location='cpu',weights_only=False).get('epoch',0))" 2>/dev/null || echo 0)
-# Resubmit-storm guard: count CONSECUTIVE runs that made no epoch progress. A startup
-# crash loop (e.g. the loader-fill hang seen 3x) must not churn the queue forever.
+# HARDENED RESUBMIT POLICY (2026-07-04, after the crash-loop incident). Two counters:
+#  - ITERS THIS RUN: did this job reach iter 0 at all? A pre-first-iter crash (Mode A shm
+#    startup crash) must NEVER auto-resubmit — that was the reckless 12h-churn (7 jobs died
+#    in ~5min without training, ~2300 node-hrs wasted). No iters => STOP, needs a human.
+#  - EPOCH PROGRESS: only reset the guard when an epoch actually banked.
+ROWS_AT_END=$(awk -F, '$2~/^[0-9]+$/{n++} END{print n+0}' "$CKPT_DIR/log_r0.csv" 2>/dev/null || echo 0)
+ITERS_THIS_RUN=$((ROWS_AT_END - ROWS_AT_START))
 FAILF=$CKPT_DIR/.consecutive_noprogress
 FAILS=$(cat "$FAILF" 2>/dev/null || echo 0)
 if (( CUR_EP > START_EP )); then FAILS=0; else FAILS=$((FAILS+1)); fi
 echo "$FAILS" > "$FAILF"
-echo "resubmit-guard: start_ep=$START_EP cur_ep=$CUR_EP consecutive_noprogress=$FAILS"
+echo "resubmit-policy: start_ep=$START_EP cur_ep=$CUR_EP iters_this_run=$ITERS_THIS_RUN consecutive_noprogress=$FAILS"
 if (( CUR_EP >= NUM_EPOCHS )); then
   echo "campaign complete (epoch $CUR_EP >= $NUM_EPOCHS) — no resubmit."
   release_lock
-elif (( FAILS >= 40 )); then
-  # Raised 10->40: the shm-unmap startup crashes are STOCHASTIC (~30-40% of starts are clean:
-  # env-diff 74it, 8643570 93it, 8643746 72it all reached training), NOT deterministic — but
-  # they persisted 8+h across many nodes (an ALCF-side condition, not fixable by our config).
-  # Each failed attempt is cheap (~5min), so 40 = several hours of retries to eventually CATCH
-  # a clean start and bank the first checkpoint (after which guard resets to 0 on progress and
-  # the run is durable). 40 consecutive with ZERO clean starts => genuine persistent fabric
-  # outage => ALCF ticket. This is the right bias for an unattended overnight run vs giving up.
-  echo "STORM GUARD: $FAILS consecutive no-progress runs — STOPPING. Persistent infra; ALCF ticket + manual resubmit."
+elif (( ITERS_THIS_RUN == 0 )); then
+  # Pre-first-iter crash (Mode A). Do NOT resubmit — a job that can't even start must not
+  # churn 12h reservations. Requires human diagnosis (run scripts/modeA_diag.sh).
+  echo "PRE-FIRST-ITER CRASH (0 iters logged) — NOT resubmitting. Mode A; diagnose with scripts/modeA_diag.sh before relaunch."
+  release_lock
+elif (( FAILS >= 5 )); then
+  # Reached iters but hung/failed repeatedly without banking an epoch. Cap at 5 (not 40) —
+  # cheap retries are fine but 5 consecutive no-epoch runs = something wrong, needs a human.
+  echo "RESUBMIT CAP: $FAILS consecutive runs reached iters but banked no epoch — STOPPING. Investigate (Mode B hang?)."
   release_lock
 else
   QUEUED=$(qstat -u "$USER" 2>/dev/null | grep -c "vitG_cap")
