@@ -268,6 +268,38 @@ is the exact fragile combination). So it is a last resort, not a first move.
    `TORCHTUNE_COLOCATE_WARMUP_AT_MAX`). If that flattens the spikes it was warmup
    fragmentation and NO allocator swap is needed.
 
+### ✅ MEASUREMENT VERDICT (2026-07-04, job 8643336, ipe200 + `resv:` logging)
+
+The reviewer's diagnostic gate was run. Result: **the segment-growth hypothesis is
+FALSIFIED, and the pluggable-allocator swap is NOT needed.**
+
+- **`memory_reserved` is DEAD FLAT at 45.8 GiB from iter 0 → 67** (allocated flat 22 GB
+  the whole time). The allocator is *not* touching new segments → CCL is *not* minting new
+  MRs from pool growth. The segment-growth story is false; the pluggable allocator would
+  have treated the wrong disease. (This is exactly the counter the reviewer said to measure,
+  and it decided it cleanly.)
+- **The residual is spike-and-RECOVER around a flat baseline, not escalation.** Full 73-iter
+  trace (rank0, seconds): baseline repeatedly returns to **5–9 s**; spikes are bounded and
+  transient — e.g. iters 60–67 = `15 16 50 18 104 8 7 9` (a 104 s straggler that recovers
+  fully to 7 s the next iter). Post-warmup: **median 10.9 s, max 104 s, only 3 of 53 iters
+  > 30 s.** No climb, no banned:1. The prior run (8643320) was at 245/326 s and dead by
+  iter 69 — this run sails past that point healthy, so those mega-spikes were **run/node-
+  specific degradation** (cf. 8643289 dying of a socket-comm auth fault), not the intrinsic
+  behavior.
+- **Per-rank data confirms the mechanism is a one-rank collective straggler** (from 8643320,
+  still the clearest capture): at a spike, ONE rank sits in `backward` while all others show
+  timer-overflow *waiting at the barrier*, and it's a **different rank each spike**. That is
+  collective *contention/jitter*, not a symmetric memory problem.
+
+**Revised conclusion.** The 16n drift had **two** real, fixed causes (top-level wrap +
+fixed-shape masks), which together converted a fatal monotonic runaway into a **stable run
+with a healthy ~7–11 s baseline** plus **occasional recoverable stragglers**. There is NO
+third memory cause. The remaining straggler tax is a throughput issue, not a stability one —
+the run will not crash. It is addressed by the collective-level levers (grad-accum to halve
+AR frequency; unset `ZE_AFFINITY_MASK` to stop host-fallback collectives), applied and
+A/B'd next. This is a launch-capable state (with those levers to improve throughput), not a
+blocker. **The pluggable allocator and checkpoint-restart are both OFF the table.**
+
 **Also fixed in passing:** HSDP resume derefed `None` when a checkpoint contained opt
 state (opt is built post-wrap, passed as `None` to `load_checkpoint`). Now guarded on
 the local opt object. And the 1n smoke's EMA test hung because it inherited
