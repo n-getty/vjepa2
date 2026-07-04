@@ -43,11 +43,25 @@ mkdir -p $CKPT_DIR /flare/ModCon/ngetty/logs
 # trainer APPENDS to per-rank CSVs; clear stale rows from a prior run in this CKPT_DIR
 rm -f $CKPT_DIR/log_r*.csv
 
-echo "JOB START: $(date) PBS_JOBID=$PBS_JOBID  [1-node ga=2 squeeze-fix smoke]"
+echo "JOB START: $(date) PBS_JOBID=$PBS_JOBID  [1-node TRUE-ACCUM memory smoke]"
 
 $PY_STAGE $ROOT/scripts/prepare_runtime_config.py \
     $BASE_CFG --root $ROOT --num-gpus 12 --num-nodes 1 --weak-scale > /dev/null
-cp $RUNTIME_CFG $PARAMS
+# CRITICAL: patch the run folder to THIS run's unique CKPT_DIR. Otherwise the trainer
+# writes to the config's shared `smoke_weak` dir, auto-resumes its STALE latest.pth.tar
+# (job 8643448 read epoch=1 from a Jul-1 ckpt -> range(1,epochs=1) empty -> 0 iters,
+# exit 0, NEVER ran the true-accum path). Patch folder + start from Meta init (epoch 0).
+$PY_STAGE - "$RUNTIME_CFG" "$PARAMS" "$CKPT_DIR" <<'PY'
+import sys, yaml
+src, dst, folder = sys.argv[1], sys.argv[2], sys.argv[3]
+d = yaml.safe_load(open(src))
+d["folder"] = folder
+d["meta"]["save_every_freq"] = 1000000000  # no checkpoint saving in a smoke
+yaml.safe_dump(d, open(dst, "w"), sort_keys=False)
+print(f"patched smoke params -> {dst} (folder={folder}, fresh Meta init, no-save)")
+PY
+# ensure a clean start: no stale ckpt/CSV in this run's folder
+rm -f $CKPT_DIR/latest.pth.tar $CKPT_DIR/log_r*.csv
 echo "staged runtime cfg -> $PARAMS"
 
 cd $ROOT
@@ -111,9 +125,8 @@ echo "JOB END: $(date)"
 
 # ---- VERDICT: engaged + iters + MEMORY (the critical no_sync gate) + loss ----
 OU=$(ls -t /flare/ModCon/ngetty/logs/${PBS_JOBID%%.*}.*.OU 2>/dev/null | head -1)
-# the trainer writes CSVs under the config's `folder` (runtime cfg = <folder>_weak),
-# not $CKPT_DIR; find the freshest log_r0.csv touched by this run.
-CSV=$(ls -t /flare/ModCon/ngetty/checkpoints/SMOKE_vitG384/*/log_r0.csv 2>/dev/null | head -1)
+# folder was patched to $CKPT_DIR above, so the CSV is HERE (no more shared-dir pollution).
+CSV=$CKPT_DIR/log_r0.csv
 echo "=== (1) TRUE accum engaged? (want 'TRUE gradient accumulation ON: true_accum=2') ==="
 [ -n "$OU" ] && grep -m1 "TRUE gradient accumulation ON" "$OU" || echo "FAIL: not engaged — check OU"
 echo "=== (2) iters logged (want ~40, no crash) [CSV=$CSV] ==="
