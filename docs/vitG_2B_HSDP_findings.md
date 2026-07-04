@@ -38,6 +38,11 @@ Two levers now exist for the §4g fabric/host-stall residual, both PRISM-informe
   `smoke_weak/latest.pth.tar`. **Re-running as 8643455** — this is the real gate.
   (This also means the earlier ga2 "PASS" was spurious — stale rows; neither accum path had
   actually executed. The true-accum implementation is still UNVALIDATED until 8643455 returns.)
+- **True-accum 1n smoke (8643455): PASS** (fresh Meta init, epoch 0) — 40 real iters, true_accum=2
+  engaged, loss 0.330→0.313 sane, steady ~9.8s/iter. **MEMORY GATE PASS: l0-free min 10.3 GiB,
+  flat** — the `no_sync` full unsharded gradient hold fits with >10 GiB headroom, decisively
+  answering reviewer point 7 and validating the deliberate divergence from PRISM's memory-bound
+  7B (no_sync-OFF). True-accum implementation empirically validated. **16n verification: 8643462.**
 
 **Launch vehicle:** `capacity` queue IS available tonight (22 running). Two options:
 - `scripts/vitG384_capacity.sh` — single 12h job. FIXED tonight (fixedshape cfg, flags unset,
