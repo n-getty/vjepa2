@@ -213,6 +213,61 @@ destroy throughput. The good news: the run is otherwise healthy (loss 0.33 stabl
 all 192 ranks synchronized between spikes), and the remaining fix is a known, validated,
 additive allocator swap rather than an open research question.
 
+### ⚠️ REVIEWER CORRECTION (2026-07-04) — the segment-growth conclusion above is NOT yet supported
+
+A second reviewer flagged that the "allocator segment growth → CCL MR accumulation →
+pluggable-allocator fix" conclusion (the three paragraphs above) was committed **on
+inference, not measurement**, and has two unresolved tensions. Both check out against our
+own data — the conclusion is **retracted pending measurement**:
+
+1. **Spike-and-RECOVER contradicts monotonic depletion.** Our data: 245 s → 46 s →
+   baseline ~7 s. Monotonic L0 depletion does not recover — it escalates to banned:1 (what
+   DDP did). A transient that clears is the signature of a **one-rank straggler propagating
+   through the collective barrier**, not a permanently-out-of-L0 pool.
+2. **Per-rank evidence CONFIRMS one-rank straggler, not symmetric pool exhaustion**
+   (job 8643320, checked rank0/50/100/150/191 at the spike iters):
+   - iter 245 s: **rank50 `backward=241 s`** (the straggler) while all others show timer-
+     overflow (`-102`, i.e. *waiting at the barrier*).
+   - iter 326 s: now **rank0/100/150 wait** (`-21`) while rank50 is slow again and rank191
+     is fast (`5`). **Different rank stalls each spike.** A symmetric allocator-pool problem
+     would slow *all* ranks together; this does not. (Matches the earlier
+     `vitG-2b-allreduce-spikes.md` note: "rank 150 +328 s late, different rank each spike,
+     compute uniform" — which the segment-growth writeup overlooked.)
+3. **Wrong counter measured.** The segment story rests on "the pool touches new segments,"
+   which lives in `memory_reserved`, NOT the `max_memory_allocated` we logged (bytes in
+   use). That was never measured. **Now added** (train.py logs `resv:` alongside `mem:`) —
+   flat reserved ⇒ segment-growth hypothesis is **false**; climbing-then-plateau ⇒ warmup
+   fragmentation (fix by pre-growing, not swapping allocators); unbounded climb ⇒ allocator
+   implicated. Job **8643336** (ipe200, resv logging) is the decisive test.
+
+**Also:** the pluggable-allocator fix, even if reserved climbs, is an **extrapolation not a
+match** — torchtune validated `usm_caching_alloc.so` under FSDP2/GRPO, not FSDP1/HSDP, and
+`UPSTREAM_FILING_DRAFT_l0_resource_pool.md` signature #4 is literally
+"XPUPluggableAllocator + FSDP → banned:1 at step 1" (at 32B; likely not fatal at 2B, but it
+is the exact fragile combination). So it is a last resort, not a first move.
+
+**Corrected plan — cheap/safe/mechanism-aligned levers, in order (BEFORE any allocator swap):**
+1. **Run fixed-shape to iter 200+** (job 8643336) — does spike frequency **plateau**
+   (warmup artifact → launchable, possibly with checkpoint-restart) or **escalate to
+   banned:1** (real depletion → allocator swap justified)? Everything downstream depends on
+   this; we keep cutting at 68–177 iters and cannot tell which. **This run is isolated** (no
+   grad-accum, no ZE change) so the `resv:` signal is clean.
+2. **`FSDP_NO_SYNC_ACCUM` + `gradient_accumulation_steps=2`** — PRISM's single biggest win;
+   halves inter-node AR frequency = halves the collective-stall/MR-registration rate, the
+   exact accumulator. Already implemented (`VJEPA_GRAD_ACCUM`) but the spike scripts don't
+   use it. Additive, reversible, throughput win regardless. NOTE: at bs=2, grad_accum=2 →
+   micro-bs=1, which trips the `weight_distance_loss` bs≥2 landmine — mitigated by the
+   `squeeze(1)` fix in `models/utils/modules.py`, but must be smoke-verified first.
+3. **Unset `ZE_AFFINITY_MASK` (+ `set_device(local_rank)`)** — `main_dist_aurora.py:35`
+   pins one tile/rank → CCL sees `node_dev_uuids` size 1 → intra-node collectives
+   host-fallback (~1.75 GB/s). Slow collectives amplify every stall. PRISM unsets it in
+   production. ~5 % + removes a contention amplifier. (Needs care: the 144-context concern
+   the comment cites is real — verify context count doesn't explode.)
+4. **Allocator warmup / pre-grow** — only if #1 shows reserved plateaus: front-load a
+   max-shape forward/backward before the timed loop (à la torchtune
+   `TORCHTUNE_COLOCATE_WARMUP_AT_MAX`). If that flattens the spikes it was warmup
+   fragmentation and NO allocator swap is needed.
+
 **Also fixed in passing:** HSDP resume derefed `None` when a checkpoint contained opt
 state (opt is built post-wrap, passed as `None` to `load_checkpoint`). Now guarded on
 the local opt object. And the 1n smoke's EMA test hung because it inherited
