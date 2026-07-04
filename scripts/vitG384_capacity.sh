@@ -128,6 +128,12 @@ export WDS_LOCAL_SLICING=1
 export VJEPA_DIST_STRATEGY=hsdp
 export LOCAL_WORLD_SIZE=12
 export FSDP_SHARDING=shard_grad_op   # _HYBRID_SHARD_ZERO2
+# MODE-A FIX (2026-07-04): the shm-unmap startup crash that killed ~60% of jobs is the
+# DataLoader worker mp/file-backed-shm handoff being fragile at 192-rank scale (NOT /dev/shm
+# exhaustion — verified 4K/504G empty). num_workers=0 (main-process loading) eliminates it:
+# 16n modeA_diag 8644227 clean, 5.6-6.9s/iter, data ~1.3s overlapped = negligible cost
+# (WebDataset streaming is I/O-light). Overridable via qsub -v but default 0 for survivability.
+export VJEPA_NUM_WORKERS=${VJEPA_NUM_WORKERS:-0}
 # §4f/§4e: the three "insurance" flags below were FALSIFIED by the env-diff run
 # (8643398) — they were not the accumulator, memory is flat with/without them, and
 # PRISM's production launcher is grep-clean of all three. Keeping them means NOT
