@@ -25,8 +25,10 @@
 
 set -eo pipefail
 ROOT=/lus/flare/projects/ModCon/ngetty/vjepa2
-# DIAG_CFG env overrides the base config (e.g. the 1B vitg384_cleandata for the model-size A/B).
-BASE_CFG=${DIAG_CFG:-$ROOT/configs/vitg16_surg_vid_webdataset_single4/SMOKE_vitG384.yaml}
+# DIAG_CFG env overrides the base config. DEFAULT is the REAL fixedshape config (batches_per_rank
+# ~795), NOT SMOKE (bp_r=2). The SMOKE config's tiny data caused constant re-iteration churn that
+# stalled the loader and produced invalid throughput numbers — must measure on real data.
+BASE_CFG=${DIAG_CFG:-$ROOT/configs/vitg16_surg_vid_webdataset_single4/vitG384_fixedshape.yaml}
 VENV=/flare/ModCon/ngetty/venvs/torchtune-pt213-xpu
 PY_STAGE=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python
 
@@ -58,7 +60,7 @@ import sys, yaml
 src, dst, folder = sys.argv[1], sys.argv[2], sys.argv[3]
 d = yaml.safe_load(open(src))
 d["folder"] = folder
-d["optimization"]["ipe"] = 25
+d["optimization"]["ipe"] = 30
 d["optimization"]["epochs"] = 1
 d["meta"]["save_every_freq"] = 1000000000
 yaml.safe_dump(d, open(dst, "w"), sort_keys=False)
