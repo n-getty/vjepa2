@@ -34,6 +34,9 @@ CKPT_DIR=/flare/ModCon/ngetty/checkpoints/SPIKETEST_vitG384/fixedshape_n16g12
 RUNTIME_CFG=$ROOT/.runtime_configs/n16g12_weak/configs/vitg16_surg_vid_webdataset_single4/vitG384_fixedshape.yaml
 PARAMS=$CKPT_DIR/params-pretrain.yaml
 mkdir -p $CKPT_DIR /flare/ModCon/ngetty/logs
+# Clear stale per-rank CSVs from a prior run in this CKPT_DIR — the trainer APPENDS,
+# so leftover rows corrupt the windowed drift analysis and the watchdog row-count.
+rm -f $CKPT_DIR/log_r*.csv
 
 echo "JOB START: $(date) PBS_JOBID=$PBS_JOBID  [16-node HSDP no-wedge verify]"
 
@@ -116,7 +119,11 @@ echo "--- staging complete ---"
 # or stalls (no new rows) for STALL_DEADLINE thereafter.
 CSV_WATCH="$CKPT_DIR/log_r0.csv"   # folder key == $CKPT_DIR (set in the patch above)
 FIRST_ITER_DEADLINE=600   # 10 min: staging+wrap+load+first iter must land by here
-STALL_DEADLINE=300        # 5 min with no new row after training starts = wedged
+# 12 min: the DDP wedge hit single iters of 328s and RECOVERED; a recovering
+# mega-spike must not be mistaken for a true deadlock. 720s still bounds a real
+# hang (kills within ~12min of the last iter) while surviving spike-and-recover,
+# which is exactly the signal we're trying to observe past iter 120.
+STALL_DEADLINE=720
 (
     start=$(date +%s); last_rows=-1; last_change=$start
     while true; do
