@@ -1131,7 +1131,7 @@ def main(args, resume_preempt=False):
                         "[%d, %5d] loss: %.3f (pred=%.3f ctx=%.3f λ=%.3f) "
                         "masks: %s "
                         "[wd: %.2e] [lr: %.2e] "
-                        "[mem: %.2e] "
+                        "[mem: %.2e] [resv: %.2e] "
                         "[iter: %.1f ms] "
                         "[gpu: %.1f ms] "
                         "[data: %.1f ms]"
@@ -1154,6 +1154,13 @@ def main(args, resume_preempt=False):
                             _new_lr,
                             (torch.xpu.max_memory_allocated() if device.type == "xpu"
                              else torch.cuda.max_memory_allocated()) / 1024.0**2,
+                            # RESERVED (segment pool) — the counter that actually tests
+                            # the "allocator touches new segments -> CCL mints new MRs"
+                            # hypothesis. max_memory_allocated (above) is BYTES in use and
+                            # says nothing about segment count. If resv is flat -> segment-
+                            # growth story is FALSE; if it climbs -> allocator implicated.
+                            (torch.xpu.memory_reserved() if device.type == "xpu"
+                             else torch.cuda.memory_reserved()) / 1024.0**2,
                             iter_time_meter.avg,
                             gpu_time_meter.avg,
                             data_elapsed_time_meter.avg,
