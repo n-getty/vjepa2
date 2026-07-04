@@ -166,10 +166,52 @@ segments (torchtune's `kBucketCap=8GiB` + `garbage_collection_threshold` already
 addresses this — but our alloc-conf may still gc). This is likely another *fixable* issue,
 same class (VA stability), just lower-frequency than the mask churn.
 
-**Status:** top-level wrap + fixed-shape masks both committed & verified to remove the
-baseline climb; residual recover-spikes under investigation (candidates above). NOT yet
-cleared for the production `capacity` launch — need the spikes explained/bounded first,
-because a 245 s spike every ~20 iters would still wreck throughput over a 12 h run.
+### RESIDUAL SPIKES DIAGNOSED (2026-07-04): allocator segment growth → CCL MR accumulation
+
+The residual spikes are **NOT random and NOT gc** (`sync_gc` defaults False, confirmed not
+in config — that code path never fired). Two facts localize the cause exactly:
+
+1. **The spike lives entirely in `backward-ms`** (per-phase CSV, job 8643320 iters 55–69):
+   fwd-target/fwd-context/opt/ema/dataload all stay flat (~2–4 s, ~0 s) while backward goes
+   `4.6 → 12.3 → 18.7 → 24.1 → [102 desync] → 42.8 → …` and iter-time hits 245 s then 326 s.
+   So it is the **gradient collective stalling**, not compute or the loader.
+2. **The small spikes are quasi-periodic and rising in frequency** (spike iters 11, 23, 28,
+   43, 46, 51, 54, 56, 58, 60, then continuous 64+), i.e. an **accumulator crossing a
+   threshold** — not i.i.d. noise. Baseline stays flat ~7 s between them.
+
+**Mechanism (now matched to torchtune's documented 32B signature).**
+`static_xccl_buffer_weight_sync.md:5` + `allocator_strategy.md`: with
+`CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536` (which we set to avoid banned:1 eviction
+crashes), **CCL never evicts IPC handles, so it accumulates one MR/IPC entry for every
+allocator *segment* it ever touches.** Fixed-shape masks stopped the *per-step* new-VA
+churn (baseline no longer climbs), but the PyTorch caching allocator still **grows/fragments
+its pool over the first ~60 iters**, touching new 1 GiB segments; each new segment → new CCL
+MR → L0 free memory (~2.5 GiB headroom) is slowly depleted → backward collectives stall,
+escalating until continuous. That is precisely the iter-64 onset we see. This is the SAME
+external-memory class as the original DDP wedge, one layer deeper: DDP starved L0 immediately
+(90 % occupancy); HSDP+fixed-shape delays it to ~iter 64 but doesn't bound it.
+
+**The actual production fix (identified, not yet applied): the pluggable caching allocator.**
+torchtune's validated mechanism for **≤4B models** (our 2B qualifies) is
+`recipes/dev/usm_caching_alloc.so` — a **power-of-2 bucketing** XPU allocator
+(`allocator_strategy.md:133`, "Production for ≤4B, 130 steps validated"). Power-of-2 buckets
+mean only a *fixed, small set of segment sizes* is ever allocated, so after warmup the pool
+stops touching new segments → CCL stops minting new MRs → external memory **plateaus**. It is
+activated in the trainer via `torch.xpu.memory.XPUPluggableAllocator` +
+`change_current_allocator(...)` BEFORE any XPU allocation (torchtune `distributed.py:~101`),
+with `XPU_USM_ALLOC_SO` pointing at the `.so`. Caveats to handle: (a) these allocators don't
+implement `getMemoryInfo`, so our `max_memory_allocated` logging will need a guard; (b) must
+run before the first alloc; (c) do NOT use at 32B (documented to fail there — irrelevant to us).
+`expandable_segments:True` is NOT an option — it's an Intel oneCCL USM-pointer-rejection bug
+on Aurora (torchtune `allocator_strategy.md:71`), a no-op at best.
+
+**Status / clearance.** Two of three churn sources fixed & verified (top-level wrap: baseline;
+fixed-shape masks: per-step VA). Third source (segment-growth → MR accumulation) **diagnosed
+and mechanism-matched**; fix = pluggable power-of-2 caching allocator, staged next. **NOT yet
+cleared for the 12 h `capacity` launch** — a 245 s stall accumulating every ~20 iters would
+destroy throughput. The good news: the run is otherwise healthy (loss 0.33 stable, mem 22 GB,
+all 192 ranks synchronized between spikes), and the remaining fix is a known, validated,
+additive allocator swap rather than an open research question.
 
 **Also fixed in passing:** HSDP resume derefed `None` when a checkpoint contained opt
 state (opt is built post-wrap, passed as `None` to `load_checkpoint`). Now guarded on
