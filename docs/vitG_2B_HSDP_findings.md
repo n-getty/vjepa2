@@ -25,16 +25,20 @@ handoff fragile at 192 ranks; NOT /dev/shm exhaustion). 3× clean 16n startups g
 
 **THREE DISTINCT RUNTIME FAILURE MODES (do not conflate — each has a different cause + fix):**
 
-1. **Silent fabric hang** (2×: e36, e58). Cohort-wide collective stall — per-rank CSV analysis:
-   **mean 87% of 192 ranks stuck high together** on every spike (low min), and the backward
-   **floor is FLAT ~2s** (does NOT rise). => fabric-collective contention, NOT compute straggler,
-   NOT L0/mem accumulation (mem-accum would raise the floor — it doesn't). Consistent with
-   `CCL_ALLREDUCE=ring` chain-depth at N=16 (15 inter-node hops). AGPT/torchtitan hit the same class
-   at 256N and cannot root-cause it either (silent = no traceback). Handling: watchdog (1800s
-   no-progress) → pkill → auto-resubmit from `latest.pth.tar`. **Testing `CCL_ALLREDUCE=double_tree`
-   (log-depth ~4 hops) vs ring** — see the A/B below. CAVEAT: an isolated warmed ring run spiked only
-   2% of iters vs the campaign's frequent spikes → a large part is likely INTER-JOB dragonfly
-   contention (shared fabric), not our algorithm; if double_tree ≈ ring, accept-the-tax + ALCF ticket.
+1. **Silent fabric hang — ROOT-CAUSED 2026-07-05 (job 8645821 forensics, 384 stacks captured).**
+   The per-rank faulthandler watchdog fired at 600s and dumped stacks: **~396 thread-frames blocked in
+   the BACKWARD gradient AllReduce** (`distributed_c10d.py:3239 all_reduce` ← `fsdp _reduce_grad` ←
+   `_post_backward_hook`) while **24 frames are one collective BEHIND** in the next iter's forward
+   all-gather (`_pre_forward_unshard` → `_unshard`). **MECHANISM = FSDP collective DESYNC, not a dead
+   rank:** a few ranks lag entering the fwd all-gather; the majority reach the backward AllReduce and
+   block forever waiting for the stragglers, which wait on a collective the majority already left →
+   deadlock. **This UNIFIES spikes + hangs as ONE phenomenon at different severity** — fabric
+   contention makes ranks lag; mild → recoverable cohort-wide spike (87% stuck, then proceed; flat ~2s
+   backward floor rules out mem-accum), severe → straggler never catches up → permanent deadlock →
+   watchdog kills. It is the HSDP ZERO2 grad-AllReduce over the 16-node replicate dim. 1B avoided it
+   (~half grad volume → shorter collectives → smaller straggler window). Handling: watchdog (1800s) →
+   forensics (SIGUSR1 stacks + nodefile) → pkill → auto-resubmit. **This is the concrete reproducer
+   AGPT/torchtitan lacked** ("silent, no traceback") — we now HAVE the traceback → ALCF ticket.
 
 2. **Stochastic bf16 NaN** (6 events: e16/r180, e23/r58, e31/r175, e36/r141, e51/r3, e57/r152 —
    every one a DISTINCT rank AND host). ~1/400 opt-steps, definitively stochastic (not a bad node,
