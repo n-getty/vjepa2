@@ -1195,36 +1195,53 @@ def main(args, resume_preempt=False):
                     loss_pred = loss_pred_sum / grad_accum
                     loss_context = loss_context_sum / grad_accum
 
-                # -- Symmetric non-finite loss guard (SURVIVABILITY, not a root-cause fix).
-                # A rare bf16 transient can make ONE rank's loss non-finite (observed: 1 of
-                # 192 ranks at e16). The old `assert not np.isnan(loss)` hard-killed the whole
-                # job. Instead every rank all-reduces a finite flag (MIN) so ALL ranks branch
-                # IDENTICALLY — skip the optimizer step together (no collective mismatch, no
-                # crash), discard the bad grads via the existing zero_grad, and CONTINUE.
-                # We deliberately do NOT add grad clipping: Meta's V-JEPA recipe uses none
-                # (bounded L1/L2-to-EMA loss); clipping would mask signal and change dynamics.
-                # Each skip is INSTRUMENTED (rank/host/iter) as a datapoint for later
-                # root-cause (node recurrence / batch-order / precursor spike / ckpt). See
-                # memory nan-crash-rootcause + ga2-not-validated-16n.
-                local_finite = 1.0 if np.isfinite(loss) else 0.0
-                if world_size > 1:
-                    _flag = torch.tensor([local_finite], device=device)
-                    torch.distributed.all_reduce(
-                        _flag, op=torch.distributed.ReduceOp.MIN
-                    )
-                    all_finite = bool(_flag.item() >= 0.5)
-                else:
-                    all_finite = local_finite >= 0.5
+                # -- Symmetric non-finite guard (SURVIVABILITY, not a root-cause fix).
+                # A rare bf16 transient can make ONE rank's loss non-finite (observed ~1/400
+                # steps, always a distinct rank/host = stochastic). The old
+                # `assert not np.isnan(loss)` hard-killed the whole job. We skip the opt step
+                # on ALL ranks together instead (discard grads via zero_grad, EMA/schedule
+                # advance, continue) — no crash, no collective mismatch. NO grad clipping
+                # (Meta's recipe uses none; bounded L1/L2-to-EMA loss).
+                #
+                # PIGGYBACK DESIGN (2026-07-05): we do NOT add a per-iter all_reduce for this
+                # (that was train.py:1212 in the old version — one hang blocked THERE; on a
+                # fabric-deadlock-bound run every extra inter-node collective is another
+                # deadlock surface, see mode-b-hang-investigation). Instead we exploit a
+                # collective that ALREADY ran: after backward, FSDP does ReduceScatter+AllReduce
+                # over the gradients, which SUMS every rank's contribution into every rank's
+                # grad shard. So a non-finite loss on ANY rank → its whole grad is non-finite →
+                # after the reduce, EVERY rank's local .grad shard is non-finite. A purely LOCAL
+                # torch.isfinite scan of our own grads is therefore SYMMETRIC across all 192
+                # ranks (validated: reduce-scatter propagates NaN to all shards) with ZERO added
+                # collectives. Belt-and-suspenders: also OR in our own loss check (a NaN we
+                # produced locally is known without looking at grads). See nan-crash-rootcause.
+                local_bad = (not np.isfinite(loss))
+                if not local_bad:
+                    # Cheap single-scalar scan: sum each grad to a scalar (NaN/Inf propagates
+                    # through sum), stack, ONE isfinite — one device sync instead of ~850
+                    # per-tensor .all() calls. Grads are already reduced across ranks here, so
+                    # this is symmetric globally.
+                    with torch.no_grad():
+                        _gsums = [
+                            _p.grad.sum()
+                            for _p in (list(encoder.parameters()) + list(predictor.parameters()))
+                            if _p.grad is not None
+                        ]
+                        if _gsums:
+                            local_bad = not bool(torch.isfinite(torch.stack(_gsums)).all())
+                all_finite = not local_bad  # symmetric: NaN grad reduced onto every rank
                 if not all_finite:
                     run_step = False
-                    if not np.isfinite(loss):
-                        # Only the offending rank(s) log — keeps this to a few lines, not 192.
+                    # Every rank sees it now (grad is globally NaN), so gate the log to rank 0
+                    # + the loss-origin rank to keep it to a couple lines, not 192.
+                    if not np.isfinite(loss) or rank == 0:
                         logger.warning(
-                            "NON-FINITE loss=%s epoch=%d itr=%d rank=%d host=%s — SKIPPING "
-                            "optimizer step (grads discarded, EMA/schedule advance). "
-                            "Survivability guard; root-cause TBD. loss_pred=%s loss_ctx=%s"
-                            % (loss, epoch + 1, itr, rank, socket.gethostname(),
-                               loss_pred, loss_context)
+                            "NON-FINITE guard FIRED epoch=%d itr=%d rank=%d host=%s "
+                            "local_loss_finite=%s — SKIPPING optimizer step (grads discarded, "
+                            "EMA/schedule advance). Survivability guard; root-cause TBD. "
+                            "loss=%s loss_pred=%s loss_ctx=%s"
+                            % (epoch + 1, itr, rank, socket.gethostname(),
+                               np.isfinite(loss), loss, loss_pred, loss_context)
                         )
 
                 if run_step:
