@@ -273,6 +273,25 @@ TRAIN_RC=$?
 kill $WATCHDOG_PID 2>/dev/null
 echo "JOB END: $(date) (train rc=$TRAIN_RC)"
 
+# ---- BAD-NODE DETECTION (added 2026-07-05, AGPT-style). A THIRD failure mode observed
+# (job 8645296): a rank "died from signal 9" — the SYSTEM (OOM-killer / node health-check /
+# hardware fault) killed a rank, cascading SIGTERM to others. This is NOT our watchdog, NOT a
+# hang, NOT the bf16 NaN — it's a bad node (AGPT's documented "shepherd died from signal 9"
+# signature). Our silent-hang forensics don't fire here (the rank is already dead, nothing to
+# stack-dump). Record the offending host(s) to a persistent bad_nodes.txt so we can (a) track
+# recurrence for an ALCF ticket, (b) later feed PBS node exclusion. Best-effort; scrape THIS
+# job's stderr/stdout for the signal-9/15 host lines. (Log path: the PBS -o dir.)
+BAD_NODES_FILE=$CKPT_DIR/bad_nodes.txt
+_thislog=$(ls -t /flare/ModCon/ngetty/logs/${PBS_JOBID%%.*}* 2>/dev/null | head -1)
+if [[ -n "$_thislog" ]]; then
+  # host lines look like: "x4213c5s5b0n0.hsn.cm.aurora.alcf.anl.gov: rank 23 died from signal 9"
+  _sig9hosts=$(grep -B1 'died from signal 9' "$_thislog" 2>/dev/null | grep -oE 'x4[0-9a-z]+\.hsn\.cm\.aurora\.alcf\.anl\.gov' | sort -u)
+  if [[ -n "$_sig9hosts" ]]; then
+    echo "BAD-NODE: signal-9 rank death this job on: $_sig9hosts (recording to $BAD_NODES_FILE)"
+    for h in $_sig9hosts; do echo "$(date +%Y-%m-%d) jobid=${PBS_JOBID%%.*} $h" >> "$BAD_NODES_FILE"; done
+  fi
+fi
+
 # ---- SELF-HEALING RESUBMIT: if training did not finish all epochs, resubmit a successor
 # (which auto-resumes from latest.pth.tar, train.py:375). Skips if the run is complete or a
 # successor is already queued. Mirrors the chain launcher's resilience but for the 12h job,
