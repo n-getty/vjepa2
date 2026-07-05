@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# ViT-G (2B) @ 384 surgical CPT — single long capacity job, 12h walltime.
+# ViT-G (2B) @ 384 surgical CPT — capacity job, 6h walltime (was 12h; hard cap
+# per user: NO 12h jobs while recipe is unresolved). Walltime is set IN-SCRIPT so
+# every self-resubmit successor also inherits 6h — a CLI -l override would not.
 # 2B sibling of vitg384_capacity.sh (1B). Runs continuously (no self-resubmit,
 # no EXIT_AFTER_CKPT); swaps in for the debug-scaling chain via the shared LOCK
 # once a large allocation lands. See vitG384_chain_debugscaling.sh header and
@@ -12,7 +14,7 @@
 #PBS -A ModCon
 #PBS -q capacity
 #PBS -l select=16
-#PBS -l walltime=12:00:00
+#PBS -l walltime=06:00:00
 #PBS -l filesystems=home:flare
 #PBS -j oe
 #PBS -o /flare/ModCon/ngetty/logs/
