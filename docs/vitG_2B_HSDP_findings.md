@@ -64,10 +64,15 @@ both instrument the stuck rank; we captured nothing. Now shipped (env-gated, def
 Ruled OUT with evidence: DAOS-17499 `libpil4dfs` FSDP-AllGather hang (PRISM's cause) — we are on
 Lustre `/lus/flare`, no pil4dfs.
 
-**CCL_ALLREDUCE A/B (in flight, scripts/vitG384_allreduce_ab_16n.sh, fixedshape ipe200 no-save):**
-- RING baseline (job 8645758, iters 50-166): backward p50=4820 p90=8314 p99=20207 max=26227 ms;
-  spike-iters(max>15s)=**2/116 (2%)**; rank0 iter-time p50=9.6s. (PBS-killed at 166 iters, fine.)
-- double_tree (job 8645804): RUNNING — verdict pending.
+**CCL_ALLREDUCE A/B (DONE, scripts/vitG384_allreduce_ab_16n.sh, fixedshape ipe200 no-save):**
+- RING (job 8645758, iters50+): backward p50=4820 p90=8314 p99=20207; spike-iters=**2/116 (2%)**; iter p50=9.6s
+- double_tree (job 8645804, iters50+): backward p50=5031 p90=9259 p99=19835; spike-iters=**3/144 (2%)**; iter p50=10.0s
+- **VERDICT: double_tree does NOT help — ring equal-or-better (~4% faster p50, identical 2% spike rate).**
+  Ring chain-depth is NOT the spike driver (log-depth double_tree would have flattened them; it didn't).
+  Both isolated runs spiked only ~2% vs the campaign's frequent spikes → the driver is the FABRIC
+  ENVIRONMENT (inter-job dragonfly contention + bad nodes), NOT the AllReduce algorithm. **Keep ring.**
+  The reviewer's ring-contention hypothesis is refuted by experiment; the spikes are accept-the-tax +
+  ALCF escalation, now proven not assumed.
 
 **Track record:** ~1 disruptive event / 3.5-4h, ALL self-healed (no lost progress beyond a partial
 epoch). Net e15→e81 (66 epochs) across 4 jobs, fully autonomous. This SUPERSEDES the 2026-07-04
