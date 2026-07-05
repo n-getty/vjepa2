@@ -816,6 +816,48 @@ def main(args, resume_preempt=False):
     trailing_losses = []
     step_count = 0
 
+    # -- Per-rank HANG WATCHDOG (diagnostic; env-gated, default OFF so the proven
+    # recipe is untouched unless VJEPA_ITER_WATCHDOG_S is set). Ported/upgraded from
+    # PRISM's step-watchdog (BaseMM_PRISM/src/training/trainer_native.py): each rank
+    # arms a faulthandler timer at the top of every iter; if the iter exceeds the
+    # timeout the offending rank DUMPS ITS OWN PYTHON STACK to stderr (showing the
+    # exact line/collective it is blocked on) — the attribution we lacked when we
+    # blindly pkill'd. Rank+host prefix lets us cross-map to a bad node. Motivation:
+    # our 16n Mode-B hangs were killed blind with ZERO forensics; AGPT/torchtitan and
+    # PRISM both instrument the stuck rank rather than guessing. This is the missing
+    # evidence-collection, NOT a fix. See memory vitG-2b-allreduce-spikes.
+    import faulthandler as _fh
+    import signal as _sig
+    _iter_watchdog_s = float(os.environ.get("VJEPA_ITER_WATCHDOG_S", "0"))
+    _watchdog_on = _iter_watchdog_s > 0
+    if _watchdog_on:
+        # Register SIGUSR1 -> dump ALL-THREAD stacks of THIS rank AND CONTINUE (does not
+        # abort — verified). The shell watchdog (capacity.sh capture_hang_forensics) sends
+        # SIGUSR1 to every rank on a true hang, so each of the 192 ranks prints exactly where
+        # it is blocked (which collective/line) to stderr -> job log, then the shell pkill -9
+        # does the actual kill. (SIGABRT cannot be faulthandler-registered on this build:
+        # "signal 6 cannot be registered" — verified; SIGUSR1 is the correct trigger.)
+        try:
+            _fh.enable(all_threads=True)
+            _fh.register(_sig.SIGUSR1, all_threads=True, chain=False)
+        except Exception as _e:  # never let diag setup break training
+            logger.warning(f"[hang-watchdog] faulthandler.register(SIGUSR1) failed: {_e}")
+        # dump_traceback_later prints ALL threads' stacks after the timeout unless
+        # cancelled first; repeat=False so a single dump per arm. We re-arm each iter.
+        logger.info(
+            f"[hang-watchdog] per-rank iter watchdog ON: {_iter_watchdog_s}s "
+            f"(rank={rank} host={socket.gethostname()}); dumps stack if an iter stalls, "
+            f"and on SIGUSR1 from the shell watchdog."
+        )
+
+    def _watchdog_arm():
+        if _watchdog_on:
+            _fh.dump_traceback_later(_iter_watchdog_s, repeat=False, exit=False)
+
+    def _watchdog_disarm():
+        if _watchdog_on:
+            _fh.cancel_dump_traceback_later()
+
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
         logger.info("Epoch %d" % (epoch + 1))
@@ -856,6 +898,7 @@ def main(args, resume_preempt=False):
 
         for itr in range(ipe):
             itr_start_time = time.time()
+            _watchdog_arm()  # per-rank hang stack-dump (no-op unless VJEPA_ITER_WATCHDOG_S set)
 
             sample = fetch_sample()
 
@@ -1334,6 +1377,7 @@ def main(args, resume_preempt=False):
                     )
 
             log_stats()
+            _watchdog_disarm()  # iter completed within the deadline — cancel the stack-dump timer
             # NOTE: the old hard `assert not np.isnan(loss)` is intentionally removed.
             # A non-finite loss is now handled SYMMETRICALLY above (all-reduce MIN finite
             # flag -> every rank skips the step together) instead of crashing the job. The
