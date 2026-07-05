@@ -1,13 +1,81 @@
-# ViT-G 2B on Aurora — HSDP port findings & open drift problem (2026-07-03)
+# ViT-G 2B on Aurora — HSDP port findings, failure-mode taxonomy & live-run status (2026-07-03 → 2026-07-05)
 
 **Purpose:** hand-off for review. Goal = train ViT-G **2B** V-JEPA 2.1 continued-pretrain
 at 16 nodes (192 XPU tiles) on Aurora. The 1B sibling already trains fine at 16n under
 DDP. This doc records what's verified, what's still open, and what's been ruled out —
 written to be reviewed by a fresh agent, so hypotheses are labelled as such.
+**Read the "CURRENT STATE (2026-07-05)" section first — it supersedes the older verdicts below.**
 
 ---
 
-## FINAL VERDICT (2026-07-04): fabric contention is the intrinsic 16n tax — accept it, make training survive it
+## CURRENT STATE (2026-07-05) — TRAINING LIVE & SELF-HEALING; three failure modes catalogued
+
+**Training is running and banking epochs autonomously.** The 2B CPT resumed from the Meta
+`vjepa2_1_vitG_384.pt` init and has progressed **e15 → e81+** (66+ epochs) across 4 self-healing
+capacity jobs. Recipe: HSDP `shard_grad_op`, OFI transport, `CCL_WORKER_COUNT=1`,
+`CCL_ALLREDUCE=ring`, `VJEPA_NUM_WORKERS=0`, `VJEPA_TRUE_ACCUM=1` (ga=1), fixedshape config,
+**6h walltime in-script** (every resubmit successor inherits 6h — user hard constraint: no 12h jobs).
+loss_pred healthy ~0.31-0.33; total loss rises only via the scheduled λ ramp (0→~0.5), every
+component stable. LR decay is **step-based** (WarmupCosine, 999 warmup / 9990 T_max steps); the
+ipe reslice (ipe30×ep333 = ipe333×ep30 = 9990 steps) is exactly LR-equivalent to the 1B recipe.
+Current ~2040 steps ≈ **1B-epoch 6** (1B saturated ~ep19 ≈ 6327 steps ≈ 2B-ep211) — plenty of runway.
+
+**Startup blocker SOLVED — Mode A shm crash = `VJEPA_NUM_WORKERS=0`** (DataLoader worker mp/shm
+handoff fragile at 192 ranks; NOT /dev/shm exhaustion). 3× clean 16n startups gated it; holds.
+
+**THREE DISTINCT RUNTIME FAILURE MODES (do not conflate — each has a different cause + fix):**
+
+1. **Silent fabric hang** (2×: e36, e58). Cohort-wide collective stall — per-rank CSV analysis:
+   **mean 87% of 192 ranks stuck high together** on every spike (low min), and the backward
+   **floor is FLAT ~2s** (does NOT rise). => fabric-collective contention, NOT compute straggler,
+   NOT L0/mem accumulation (mem-accum would raise the floor — it doesn't). Consistent with
+   `CCL_ALLREDUCE=ring` chain-depth at N=16 (15 inter-node hops). AGPT/torchtitan hit the same class
+   at 256N and cannot root-cause it either (silent = no traceback). Handling: watchdog (1800s
+   no-progress) → pkill → auto-resubmit from `latest.pth.tar`. **Testing `CCL_ALLREDUCE=double_tree`
+   (log-depth ~4 hops) vs ring** — see the A/B below. CAVEAT: an isolated warmed ring run spiked only
+   2% of iters vs the campaign's frequent spikes → a large part is likely INTER-JOB dragonfly
+   contention (shared fabric), not our algorithm; if double_tree ≈ ring, accept-the-tax + ALCF ticket.
+
+2. **Stochastic bf16 NaN** (6 events: e16/r180, e23/r58, e31/r175, e36/r141, e51/r3, e57/r152 —
+   every one a DISTINCT rank AND host). ~1/400 opt-steps, definitively stochastic (not a bad node,
+   not checkpoint-deterministic, not a corrupt clip — full source scan = 0 non-finite clips; the 1B
+   ran the same raw sources clean unprotected). **FIX = symmetric NaN-skip guard** (all_reduce MIN
+   finite flag → all ranks skip the opt step together, EMA/schedule advance, no crash), logged with
+   rank/host/itr. Zero crashes where the old `assert not np.isnan(loss)` would have been 6. NO grad
+   clipping added (Meta recipe uses none; bounded L1-to-EMA loss; the two numerical traps —
+   loss_exp=1.0 and 1/d_ij — already closed). Verdict: survivability-solved, not worth root-causing.
+
+3. **Bad-node death / signal 9** (1×: job 8645296, rank 23 "died from signal 9" on x4213c5s5b0n0,
+   cascade SIGTERM, PBS Exit_status=0, used 3:54/6:00 — NOT walltime, NOT our watchdog, NOT a hang).
+   The SYSTEM killed a rank (OOM-killer / node health-check / hardware) = AGPT's documented
+   "shepherd died from signal 9" bad-node signature. Auto-resubmit still recovered (8645821). Added
+   `bad_nodes.txt` logging to track host recurrence for ALCF ticketing / future PBS node-exclusion.
+
+**HANG FORENSICS (the real gap the user identified — we were blind-killing hangs).** AGPT and PRISM
+both instrument the stuck rank; we captured nothing. Now shipped (env-gated, default-on in capacity):
+- Per-rank in-process watchdog (`VJEPA_ITER_WATCHDOG_S=600`, train.py): faulthandler
+  `dump_traceback_later` armed each iter → the stuck rank dumps its ALL-THREAD stack (exact blocked
+  collective/line) BEFORE the shell kill. Validated at 1n (stall → correct stack).
+- SIGUSR1 → faulthandler all-thread dump-and-continue (SIGABRT can't be registered on this build).
+  Shell watchdog SIGUSR1s all 192 ranks + snapshots the nodefile to `hang_diag/` before pkill.
+- Candidate fix staged behind `VJEPA_CCL_TMP_BUF=1` (default OFF): `CCL_SYCL_*_TMP_BUF=1` = persistent
+  temp buffers instead of L0 IPC handles (torchtune signature-#3 workaround). Enable only if forensics
+  confirm the L0-IPC path.
+Ruled OUT with evidence: DAOS-17499 `libpil4dfs` FSDP-AllGather hang (PRISM's cause) — we are on
+Lustre `/lus/flare`, no pil4dfs.
+
+**CCL_ALLREDUCE A/B (in flight, scripts/vitG384_allreduce_ab_16n.sh, fixedshape ipe200 no-save):**
+- RING baseline (job 8645758, iters 50-166): backward p50=4820 p90=8314 p99=20207 max=26227 ms;
+  spike-iters(max>15s)=**2/116 (2%)**; rank0 iter-time p50=9.6s. (PBS-killed at 166 iters, fine.)
+- double_tree (job 8645804): RUNNING — verdict pending.
+
+**Track record:** ~1 disruptive event / 3.5-4h, ALL self-healed (no lost progress beyond a partial
+epoch). Net e15→e81 (66 epochs) across 4 jobs, fully autonomous. This SUPERSEDES the 2026-07-04
+"FINAL VERDICT" below (which predated the NaN guard, forensics, and the three-mode taxonomy).
+
+---
+
+## FINAL VERDICT (2026-07-04, SUPERSEDED by the 2026-07-05 section above): fabric contention is the intrinsic 16n tax — accept it, make training survive it
 
 Both fabric levers are now **exhausted by experiment**:
 - **CCL_WORKER_COUNT=4** (8643434): failed (loader-fill hang; orthogonal, demoted).
