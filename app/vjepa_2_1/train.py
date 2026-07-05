@@ -957,8 +957,17 @@ def main(args, resume_preempt=False):
                             loss, n = 0, 0
                             for zi, hi, d_i in zip(z, h, d_weights):
                                 for zij, hij, d_ij in zip(zi, hi, d_i):
+                                    # clamp_min(1.0): d_ij is a grid distance; the smallest
+                                    # NONZERO value is 1.0 (adjacent cell, offset_context_loss
+                                    # False). d_ij CAN be 0 when an enc token shares a grid
+                                    # (d,h,w) with a pred token (masks not disjoint) -> 1/0 = inf
+                                    # -> NaN. Flooring at 1.0 treats a coincident token like a
+                                    # nearest-neighbor (weight 1.0) and is a NO-OP for all
+                                    # legitimate d_ij >= 1.0. Secondary backstop to the loader's
+                                    # non-finite gate. NOTE: assumes offset_context_loss=False
+                                    # (our config); if that's enabled, revisit the floor value.
                                     loss_n = torch.abs(zij - hij) ** loss_exp * (
-                                        1 / d_ij.unsqueeze(2)
+                                        1 / d_ij.unsqueeze(2).clamp_min(1.0)
                                     )
                                     loss += torch.mean(loss_n) / loss_exp
                                     n += 1

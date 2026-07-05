@@ -356,7 +356,22 @@ class VideoDecoder:
             # next sample). Skip for images (single repeated frame -> 0 temporal
             # variance is expected and benign for the image branch).
             if not is_image and self.min_clip_std > 0.0:
-                clip_std = float(np.asarray(buffer, dtype=np.float32).std())
+                arr = np.asarray(buffer, dtype=np.float32)
+                clip_std = float(arr.std())
+                # NON-FINITE GATE (2026-07-05): a corrupt clip with NaN/Inf pixels gives
+                # std()=nan, and `nan < min_clip_std` is FALSE — so it would be KEPT and feed
+                # NaN straight into the model (this crashed the 2B at epoch 16, rank 180 only:
+                # loss->nan->allreduce->assert). np.isfinite catches BOTH the nan/inf-std case
+                # and, defensively, any non-finite pixel. Checked before the low-variance test.
+                if (not np.isfinite(clip_std)) or (not np.isfinite(arr).all()):
+                    key = sample.get("__key__", "N/A")
+                    logger.warning(
+                        "Dropping NON-FINITE clip (std=%s) source=%s key=%s "
+                        "— corrupt pixels (NaN/Inf), would poison the loss.",
+                        clip_std, source_name or "?", key,
+                    )
+                    _record_dropped_clip(source_name, -1.0)
+                    return None
                 if clip_std < self.min_clip_std:
                     key = sample.get("__key__", "N/A")
                     logger.warning(
