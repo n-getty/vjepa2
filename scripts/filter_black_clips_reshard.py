@@ -131,7 +131,13 @@ def _clip_std(dec, members, fpc):
     buf, _ = dec.loadvideo_decord(vid_bytes, fpc)
     if buf is None or len(buf) == 0:
         return None, False  # decode failure -> keep
-    return float(np.asarray(buf, dtype=np.float32).std()), True
+    arr = np.asarray(buf, dtype=np.float32)
+    # NON-FINITE detection: a corrupt clip (NaN/Inf pixels) gives std()=nan, and the
+    # runtime `std < min_clip_std` test is False -> it would be KEPT and poison the loss
+    # (crashed the 2B at epoch 16). Flag it so the drop logic removes it at rest too.
+    if not np.isfinite(arr).all():
+        return float("nan"), True  # non-finite -> ok=True, std=nan -> dropped below
+    return float(arr.std()), True
 
 
 def process_range(args, shards, lo, hi):
@@ -146,11 +152,17 @@ def process_range(args, shards, lo, hi):
         if os.path.exists(out_path) and not args.force:
             print(f"  [skip] {base} exists (use --force)", flush=True)
             continue
-        kept = dropped = decode_fail = 0
+        kept = dropped = decode_fail = nonfinite = 0
         tmp_path = out_path + ".tmp"
         with tarfile.open(tmp_path, "w") as out:
             for key, members in _group_members(in_path):
                 std, ok = _clip_std(dec, members, args.frames_per_clip)
+                # drop non-finite (std=nan from corrupt pixels) OR low-variance. Order the
+                # non-finite test FIRST because `nan < min_clip_std` is False (the runtime bug).
+                if ok and (not np.isfinite(std)):
+                    dropped += 1
+                    nonfinite += 1
+                    continue
                 if ok and std < args.min_clip_std:
                     dropped += 1
                     continue
@@ -160,10 +172,12 @@ def process_range(args, shards, lo, hi):
                     out.addfile(tinfo, io.BytesIO(data))
                 kept += 1
         os.replace(tmp_path, out_path)
-        per_shard[base] = {"kept": kept, "dropped": dropped, "decode_fail": decode_fail}
+        per_shard[base] = {"kept": kept, "dropped": dropped, "decode_fail": decode_fail,
+                           "nonfinite": nonfinite}
         tot = kept + dropped
         print(f"  [{si:04d}] {base}: kept={kept} dropped={dropped} "
-              f"({100*dropped/tot if tot else 0:.1f}%) decode_fail={decode_fail}", flush=True)
+              f"({100*dropped/tot if tot else 0:.1f}%) decode_fail={decode_fail} "
+              f"NONFINITE={nonfinite}", flush=True)
     partial = os.path.join(args.output, f"_partial_{lo}_{hi}.json")
     with open(partial, "w") as f:
         json.dump({"range": [lo, hi], "elapsed_s": time.time() - t0,
