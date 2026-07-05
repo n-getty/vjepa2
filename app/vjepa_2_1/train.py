@@ -6,6 +6,7 @@
 
 import contextlib
 import os
+import socket
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
 try:
@@ -1151,6 +1152,38 @@ def main(args, resume_preempt=False):
                     loss_pred = loss_pred_sum / grad_accum
                     loss_context = loss_context_sum / grad_accum
 
+                # -- Symmetric non-finite loss guard (SURVIVABILITY, not a root-cause fix).
+                # A rare bf16 transient can make ONE rank's loss non-finite (observed: 1 of
+                # 192 ranks at e16). The old `assert not np.isnan(loss)` hard-killed the whole
+                # job. Instead every rank all-reduces a finite flag (MIN) so ALL ranks branch
+                # IDENTICALLY — skip the optimizer step together (no collective mismatch, no
+                # crash), discard the bad grads via the existing zero_grad, and CONTINUE.
+                # We deliberately do NOT add grad clipping: Meta's V-JEPA recipe uses none
+                # (bounded L1/L2-to-EMA loss); clipping would mask signal and change dynamics.
+                # Each skip is INSTRUMENTED (rank/host/iter) as a datapoint for later
+                # root-cause (node recurrence / batch-order / precursor spike / ckpt). See
+                # memory nan-crash-rootcause + ga2-not-validated-16n.
+                local_finite = 1.0 if np.isfinite(loss) else 0.0
+                if world_size > 1:
+                    _flag = torch.tensor([local_finite], device=device)
+                    torch.distributed.all_reduce(
+                        _flag, op=torch.distributed.ReduceOp.MIN
+                    )
+                    all_finite = bool(_flag.item() >= 0.5)
+                else:
+                    all_finite = local_finite >= 0.5
+                if not all_finite:
+                    run_step = False
+                    if not np.isfinite(loss):
+                        # Only the offending rank(s) log — keeps this to a few lines, not 192.
+                        logger.warning(
+                            "NON-FINITE loss=%s epoch=%d itr=%d rank=%d host=%s — SKIPPING "
+                            "optimizer step (grads discarded, EMA/schedule advance). "
+                            "Survivability guard; root-cause TBD. loss_pred=%s loss_ctx=%s"
+                            % (loss, epoch + 1, itr, rank, socket.gethostname(),
+                               loss_pred, loss_context)
+                        )
+
                 if run_step:
                     if scaler is not None:
                         scaler.step(optimizer)
@@ -1301,7 +1334,11 @@ def main(args, resume_preempt=False):
                     )
 
             log_stats()
-            assert not np.isnan(loss), "loss is nan"
+            # NOTE: the old hard `assert not np.isnan(loss)` is intentionally removed.
+            # A non-finite loss is now handled SYMMETRICALLY above (all-reduce MIN finite
+            # flag -> every rank skips the step together) instead of crashing the job. The
+            # event is logged with rank/host/itr for later root-cause. Re-adding an assert
+            # here would reintroduce the fatal single-rank crash the guard exists to prevent.
 
         # -- Save Checkpoint
         logger.info("avg. loss %.3f" % loss_meter.avg)
