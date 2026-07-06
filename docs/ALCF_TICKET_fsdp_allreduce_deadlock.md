@@ -21,7 +21,17 @@ This appears to be the same silent-hang class other Aurora large-scale jobs repo
 torchtitan runs at 256N document "silent hangs, no traceback, blind-rotate a node"). **We captured the
 traceback** via a per-rank `faulthandler.dump_traceback_later` watchdog, which is attached below.
 
-## Captured evidence (job 8645821, ~19:22 UTC, epoch 98 iter 15)
+## Captured evidence (REPRODUCED — 2 instrumented hangs, same signature)
+
+**Both captured hangs blocked at the FSDP backward gradient AllReduce** (`_reduce_grad`), confirming
+the signature is reproducible, not a one-off:
+- job 8645821 (e98): 114 per-rank dumps in backward `_reduce_grad`, ~10 in fwd unshard.
+- job 8646258 (e145, ~04:00 UTC 2026-07-06): 372 thread-frames in backward `_reduce_grad`, 24 in fwd
+  `_pre_forward_unshard` — identical split.
+(A third hang, job 8645921, blocked in an application-level all_reduce we have since removed; not
+relevant to the FSDP-collective signature.)
+
+## Captured evidence detail (job 8645821, ~19:22 UTC, epoch 98 iter 15)
 
 A per-rank 600 s stall watchdog dumped stacks. Of **145 per-rank dumps** captured before the kill:
 - **114 ranks** blocked in the **backward gradient AllReduce**:
