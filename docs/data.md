@@ -32,7 +32,7 @@ against disk and decodes a sample.)
 | `surgvu24_clean` | 320G | 2000 | SurgVU-24 / SurgToolLoc robotic. `_clean` = black-clip filtered (~19% of raw was byte-identical pure black). | ✅ |
 | `surgtoolloc2022` | 203G | 1500 | SurgToolLoc-2022 robotic. | ✅ |
 | `sitl_2026` | 179G | 512 | Leo's newer SITL re-segmentation, 4,144 clips @ 60s/30fps/1080p (distinct `v2_` keys). Owner-only perms. | ✅ |
-| `grasp` | 133G | 124 | GraSP robotic prostatectomy, 1,988 clips @ 60s. Video-native segmentation; modality-matched to our evals. | ✅ |
+| `grasp` | 133G | 124 | GraSP robotic prostatectomy, 1,988 clips @ 60s. Video-native segmentation; modality-matched to our evals. **This IS the raw-video superset of PSI-AVA / TAPIR (BCV-Uniandes)** — TAPIR's repo hosts only sampled frames + annotations of these same cases, so "get TAPIR/PSI-AVA video" is already satisfied here (frames also packed as `psi_ava_img`). | ✅ |
 | `sitl` | 90G | 600 | Original SITL segmentation (kept alongside `sitl_2026` per decision). | ✅ |
 | `cholec80` | 70G | 182 | Cholec80 laparoscopic cholecystectomy 25fps, 2,916 clips. Domain-broadening (laparoscopic). | ✅ |
 | `surgenet_robotic_clean` | 23G | 500 | SurgeNet robotic subset, minus 40 eval-leaked source videos (318 clips dropped) — eval-scrub. | ✅ |
@@ -43,6 +43,7 @@ against disk and decodes a sample.)
 | `gynsurg` | ✅ | 190 | GynSurg action segments, gyn laparoscopy (**new sub-domain**), 1080p/30fps pre-cut clips (≥4s filter) → **3,053 clips**. Shares Vienna pool w/ `lapgyn6_events`. ⚠️ median 13.6s → only ~45% fill the 64f cooldown window (rest padded; see cooldown note). | ✅ |
 | `lapgyn6_events` | ✅ | 134 | LapGyn6-Events segments, gyn laparoscopy → **2,155 clips**. Shares Vienna pool w/ `gynsurg`, no dedup (different segment types). ⚠️ median 11.9s → only ~37% fill 64f (rest padded). | ✅ |
 | `surgenet_lap` | ✅ | 365 | SurgeNet **laparoscopic** YouTube set (4fps), **5,843 clips**: raw procedure dirs re-segmented to 60s + `clips_1min` subset. Eval-gated at segment time (crop-aug ref, 0 leaks); 96.9% distinct from `lemon`. Owner-only. The first lap-SurgeNet in the corpus. | ✅ |
+| `openh` | ⏳ ingesting | — | **Open-H-Embodiment** (`nvidia/PhysicalAI-Robotics-Open-H-Embodiment`, CC-BY-4.0). 50-institution medical robot dataset, LeRobot v2.1; top level is only Surgical + Endoscopy. **~37K kept RGB endoscope clips** across cmr_surgical (30.5K, robotic chole 1080p/60fps), cuhk/ut_austin/jhu (endoscopy), hamlyn (knot-tying). Dropped: wrist/depth/fluoro/stereo-right/goal views. **Re-encoded to 512p/8fps on ingest** (heichole-style decode-contention fix; raw ~3.2 TB → ~0.3 TB). Duration: 81% ≥16s (cmr all 60s), so 64f-cooldown padding is minor except the small jhu tail (median 5.2s). Job 8652503. | ⏳ pending weight decision |
 
 ### `small_surg` bundle members
 
@@ -236,6 +237,9 @@ ingested and in the 15-source configs (see §1). Remaining below are still open.
 4. Treat the GI/cataract sets (EndoMapper, Cataract-*, LDPolypVideo, Kvasir-Capsule) as optional *off-domain broadening* only. NOTE: `lemon` is no longer "unclaimed" — it's in the mix (53,637 clips); this was the higher-leverage source and it's now used.
 5. Before ingesting **M2CAI16** or **SurgBench**, run the pHash dedup gate against Cholec80 / existing corpus — both heavily overlap what we hold.
 6. ✅ **Gyn-laparoscopy** ingested — **GynSurg** (3,053) + **LapGyn6-Events** (2,155) are in the mix (new sub-domain). Ingested without pHash dedup per decision (shared Vienna pool, different segment types).
+7. ⏳ **Open-H-Embodiment** (`nvidia/PhysicalAI-Robotics-Open-H-Embodiment`) — ingesting as `openh` (~37K clips, 512p/8fps re-encode; see §1 row + job 8652503). Largest new *temporal* surgical source since GraSP; all-surgical/endoscopy, no distractor domains.
+8. ❌ **TAPIR / PSI-AVA (BCV-Uniandes)** — **redundant, do not re-ingest.** TAPIR = the PSI-AVA method/repo; PSI-AVA is a subset of **GraSP**, whose raw video we already hold as `grasp` (1,988 clips), and whose frames are packed as `psi_ava_img` (73.6K). The TAPIR repo hosts only sampled frames + annotations — no new video.
+9. ⛔ **bc-z** (`/eagle/tpc/leonardo_borgioli/surg_vid/bc-z`, Polaris) — **blocked on permissions.** Leo's dir is `drwx--S---` (owner-only); permission-denied even via the shared `tpc` group, and the parent `surg_vid/` is unreadable too. `/eagle` is not mounted on Aurora, so it would need a Polaris→flare transfer *after* Leo grants read (`chmod g+rx`). Also flag: public "BC-Z" is a **non-surgical Google kitchen-manipulation** dataset — confirm these are surgical clips before hauling them into the corpus.
 
 ---
 
