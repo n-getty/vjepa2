@@ -176,6 +176,34 @@ def _add(tar, name, data):
     tar.addfile(ti, io.BytesIO(data))
 
 
+def _salvage_tmp(tmp_path):
+    """Read complete {mp4,json,cls} triples from a killed write-mode .tmp tar.
+
+    A tar interrupted mid-write (e.g. walltime kill) has valid members up to the
+    truncation point but no EOF marker. Streaming read ("r|") tolerates that and
+    yields members until the truncated tail, which raises — we keep everything
+    read before it. Returns (done_keys:set, triples:dict[key]->{ext:bytes}).
+    """
+    triples = {}
+    if not os.path.exists(tmp_path):
+        return set(), triples
+    buf = {}
+    try:
+        with tarfile.open(tmp_path, "r|") as tf:
+            for m in tf:
+                if not m.isfile():
+                    continue
+                base = m.name.split("/")[-1]
+                key, _, ext = base.partition(".")
+                buf.setdefault(key, {})[ext] = tf.extractfile(m).read()
+    except Exception:
+        pass  # truncated tail — everything already buffered is fine
+    for key, mem in buf.items():
+        if {"mp4", "json", "cls"} <= set(mem):
+            triples[key] = mem
+    return set(triples), triples
+
+
 def main():
     args = parse_args()
     kept = list_kept_files()
@@ -222,15 +250,34 @@ def main():
     opener = urllib.request.build_opener(*handlers)
 
     n_ok = n_dl_fail = n_enc_fail = 0
+    n_salvaged = 0
     bytes_in = bytes_out = 0
     t0 = time.time()
     tmp_path = out_path + ".tmp"
     raw = os.path.join(tmpdir, "raw.mp4")
     enc = os.path.join(tmpdir, "enc.mp4")
+
+    # Within-range RESUME: if a prior run left a truncated .tmp for this range
+    # (walltime kill), salvage its complete triples so we don't re-download them.
+    # We rewrite a clean tmp2 (dropping the truncated tail), seed it with the
+    # salvaged triples, then only fetch the clips not already present.
+    done_keys, salvaged = _salvage_tmp(tmp_path)
+    if done_keys:
+        print(f"[openh] resume {tar_name}: salvaged {len(done_keys)} complete triples "
+              f"from prior .tmp", flush=True)
+
     print(f"[openh] {len(files)} clips -> {tar_name}  ss={args.short_side} fps={args.fps} "
           f"crf={args.crf} g={args.gop} ffmpeg={ffmpeg}", flush=True)
-    with tarfile.open(tmp_path, "w") as tar:
+    tmp2 = out_path + ".tmp2"
+    with tarfile.open(tmp2, "w") as tar:
+        # re-emit salvaged triples first (mp4, json, cls order)
+        for key, mem in salvaged.items():
+            for ext in ("mp4", "json", "cls"):
+                _add(tar, f"{key}.{ext}", mem[ext])
+            n_salvaged += 1
         for idx, path in enumerate(files):
+            if _key_for(path) in done_keys:
+                continue  # already salvaged
             for p in (raw, enc):
                 try:
                     os.remove(p)
@@ -256,26 +303,29 @@ def main():
             n_ok += 1
             if n_ok % 200 == 0:
                 el = time.time() - t0
-                print(f"  ...{n_ok} ok ({el:.0f}s, {n_ok/el:.1f}/s, "
-                      f"{bytes_out/1e9:.1f}GB out)", flush=True)
-    os.replace(tmp_path, out_path)
-    for p in (raw, enc):
+                print(f"  ...{n_ok} new ok (+{n_salvaged} salvaged) ({el:.0f}s, "
+                      f"{n_ok/el:.1f}/s, {bytes_out/1e9:.1f}GB out)", flush=True)
+    os.replace(tmp2, out_path)
+    for p in (raw, enc, tmp_path):
         try:
             os.remove(p)
         except OSError:
             pass
 
+    total_ok = n_ok + n_salvaged
     partial = os.path.join(args.output_staging,
                            f"_partial_{tar_name.replace('.tar','')}.json")
     with open(partial, "w") as f:
-        json.dump({"tar": tar_name, "clips_ok": n_ok, "dl_fail": n_dl_fail,
+        json.dump({"tar": tar_name, "clips_ok": total_ok, "new_ok": n_ok,
+                   "salvaged": n_salvaged, "dl_fail": n_dl_fail,
                    "enc_fail": n_enc_fail, "bytes_in": bytes_in, "bytes_out": bytes_out,
                    "elapsed_s": time.time() - t0,
                    "short_side": args.short_side, "fps": args.fps,
                    "crf": args.crf, "gop": args.gop}, f, indent=2)
     ratio = (100 * bytes_out / bytes_in) if bytes_in else 0.0
-    print(f"DONE {tar_name}: ok={n_ok} dl_fail={n_dl_fail} enc_fail={n_enc_fail} "
-          f"size={bytes_in/1e9:.1f}->{bytes_out/1e9:.1f}GB ({ratio:.0f}%) "
+    print(f"DONE {tar_name}: ok={total_ok} (new={n_ok} salvaged={n_salvaged}) "
+          f"dl_fail={n_dl_fail} enc_fail={n_enc_fail} "
+          f"new_size={bytes_in/1e9:.1f}->{bytes_out/1e9:.1f}GB ({ratio:.0f}%) "
           f"{time.time()-t0:.0f}s -> {out_path}", flush=True)
 
 
