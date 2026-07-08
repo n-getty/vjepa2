@@ -21,7 +21,7 @@
 #PBS -A AuroraGPT
 #PBS -q capacity
 #PBS -l select=1:ncpus=208
-#PBS -l walltime=04:00:00
+#PBS -l walltime=08:00:00
 #PBS -l filesystems=home:flare
 #PBS -j oe
 #PBS -o /flare/ModCon/ngetty/logs/
