@@ -92,7 +92,7 @@ data:
   # multibypass140 = 140 lap gastric-bypass procedures, Bern+Strasbourg (2 centers).
   # Both are raw full procedures cut to 60s; min_clip_std drops HeiChole's
   # white-censored out-of-body spans (std~0) like it drops surgvu24 black clips.
-  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/heichole
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/heichole_512
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/multibypass140
   # gynsurg + lapgyn6_events = gynecologic laparoscopy (NEW sub-domain for us),
   # pre-cut action/event segments kept as-is (>=4s filter applied at segment time).
@@ -108,7 +108,14 @@ data:
   # 96.9% distinct from LEMON (different YouTube scrape). Black filter ~no-op
   # (sampled pixel std >=32); runtime min_clip_std backstop stays on. Owner-only.
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_lap
+  # openh = Open-H-Embodiment (nvidia HF), 36,693 RGB endoscope clips re-encoded
+  # to 512p/8fps: cmr_surgical 29,839 (robotic chole+prostatectomy+more), cuhk
+  # 2,158, ut_austin 1,894, jhu 1,783, hamlyn 1,019. Largest new temporal
+  # surgical source since GraSP; all surgical/endoscopy (no distractor domains).
+  # weight 1 like every other source (sqrt-temp compresses its size).
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/openh
   datasets_weights:
+  - 1
   - 1
   - 1
   - 1
@@ -133,6 +140,7 @@ data:
   crop_size: 384
   patch_size: 16
   dataset_fpcs:
+  - 16
   - 16
   - 16
   - 16

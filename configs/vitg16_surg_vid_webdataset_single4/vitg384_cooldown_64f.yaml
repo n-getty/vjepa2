@@ -50,7 +50,7 @@ data:
   # (filter_short_videos=False), same benign padding as kinetics400@64f. Net: ~half
   # the gyn clips give weaker temporal signal here; kept for domain diversity. In
   # the 16f PRETRAIN config they're fully fine (16f@4fps needs only 4s; 100% clear).
-  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/heichole
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/heichole_512
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/multibypass140
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/gynsurg
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/lapgyn6_events
@@ -59,7 +59,14 @@ data:
   # dropped) + clean clips_1min subset. Eval-gated at segment time (crop-aug ref,
   # 0 leaks). 96.9% distinct from LEMON. Owner-only. Weight 1.
   - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/surgenet_lap
+  # openh = Open-H-Embodiment (nvidia HF), 36,693 RGB endoscope clips @512p/8fps:
+  # cmr_surgical 29,839 (robotic chole+prostatectomy+more) + cuhk/ut_austin/jhu/
+  # hamlyn tail. ⚠️ 64f window: cmr is all 60s (fills fully) but ~81% of openh is
+  # ≥16s corpus-wide; the small jhu-surgical tail (median 5.2s) pads heavily
+  # (benign, same as gyn — see fps-vs-fpc-and-64f-padding). Weight 1.
+  - /flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/openh
   datasets_weights:
+  - 1
   - 1
   - 1
   - 1
@@ -81,6 +88,7 @@ data:
   crop_size: 384
   patch_size: 16
   dataset_fpcs:
+  - 64
   - 64
   - 64
   - 64

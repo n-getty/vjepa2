@@ -19,7 +19,7 @@ Root: `/flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/`
 
 All sources are resharded `.tar` WebDataset. The active ViT-g 384 mix
 (`configs/vitg16_surg_vid_webdataset_single4/vitg384_cleandata.yaml` for pretrain,
-`vitg384_cooldown_64f.yaml` for cooldown) uses **15 sources, all weight 1.0**, with
+`vitg384_cooldown_64f.yaml` for cooldown) uses **16 sources, all weight 1.0**, with
 `sampling_temperature: 0.5` (sqrt-size) and `min_clip_std: 1.0` (drops black/frozen clips).
 The bottom 5 rows were added this session. **All 15 verified 2026-07-03**: metadata present,
 `shard_count` == disk tar count, sampled clips decode with json/cls sidecars — launch-ready.
@@ -43,7 +43,7 @@ against disk and decodes a sample.)
 | `gynsurg` | ✅ | 190 | GynSurg action segments, gyn laparoscopy (**new sub-domain**), 1080p/30fps pre-cut clips (≥4s filter) → **3,053 clips**. Shares Vienna pool w/ `lapgyn6_events`. ⚠️ median 13.6s → only ~45% fill the 64f cooldown window (rest padded; see cooldown note). | ✅ |
 | `lapgyn6_events` | ✅ | 134 | LapGyn6-Events segments, gyn laparoscopy → **2,155 clips**. Shares Vienna pool w/ `gynsurg`, no dedup (different segment types). ⚠️ median 11.9s → only ~37% fill 64f (rest padded). | ✅ |
 | `surgenet_lap` | ✅ | 365 | SurgeNet **laparoscopic** YouTube set (4fps), **5,843 clips**: raw procedure dirs re-segmented to 60s + `clips_1min` subset. Eval-gated at segment time (crop-aug ref, 0 leaks); 96.9% distinct from `lemon`. Owner-only. The first lap-SurgeNet in the corpus. | ✅ |
-| `openh` | ⏳ ingesting | — | **Open-H-Embodiment** (`nvidia/PhysicalAI-Robotics-Open-H-Embodiment`, CC-BY-4.0). 50-institution medical robot dataset, LeRobot v2.1; top level is only Surgical + Endoscopy. **~37K kept RGB endoscope clips** across cmr_surgical (30.5K, robotic chole 1080p/60fps), cuhk/ut_austin/jhu (endoscopy), hamlyn (knot-tying). Dropped: wrist/depth/fluoro/stereo-right/goal views. **Re-encoded to 512p/8fps on ingest** (heichole-style decode-contention fix; raw ~3.2 TB → ~0.3 TB). Duration: 81% ≥16s (cmr all 60s), so 64f-cooldown padding is minor except the small jhu tail (median 5.2s). Job 8652503. | ⏳ pending weight decision |
+| `openh` | 353G | 2293 | **Open-H-Embodiment** (`nvidia/PhysicalAI-Robotics-Open-H-Embodiment`, CC-BY-4.0). 50-institution medical robot dataset, LeRobot v2.1; top level is only Surgical + Endoscopy. **36,693 RGB endoscope clips** @512p/8fps: cmr_surgical 29,839 (robotic chole+prostatectomy+more), cuhk 2,158, ut_austin 1,894, jhu 1,783, hamlyn 1,019. Dropped: wrist/depth/fluoro/stereo-right/goal views. **Re-encoded to 512p/8fps on ingest** (heichole-style decode-contention fix; raw 1.21 TB → 0.17 TB, 14%). Duration: 81% ≥16s (cmr all 60s), so 64f-cooldown padding is minor except the small jhu tail (median 5.2s). Largest new temporal surgical source since GraSP. | ✅ |
 
 ### `small_surg` bundle members
 
@@ -100,7 +100,7 @@ address spatial-task underperformance (see §4 and the draft
 - `dataset_type: WebDataset`, `batch_size: 2` per rank (pretrain) / `1` (cooldown 64f), `crop_size: 384`, `patch_size: 16`, `tubelet_size: 2`
 - `fps: 4`, `dataset_fpcs: 16` (pretrain) / `64` (cooldown) — cooldown lengthens the temporal window, fps stays 4.
 - `sampling_temperature: 0.5`, `min_clip_std: 1.0`
-- **15 sources** as of this session (was 10; +heichole, +multibypass140, +gynsurg, +lapgyn6_events, +surgenet_lap).
+- **16 sources** as of this session (was 10; +heichole, +multibypass140, +gynsurg, +lapgyn6_events, +surgenet_lap, +openh).
 
 ---
 
@@ -229,7 +229,7 @@ folder of ophthalmic (cataract) video sets: `cat-101` (=Cataract-101), `cat-21` 
 ### Recommendation
 
 **DONE this session (2026-07-03):** items 1, 2 (HeiChole), 6, plus surgenet_lap and lemon are all
-ingested and in the 15-source configs (see §1). Remaining below are still open.
+ingested and in the configs (see §1). Remaining below are still open.
 
 1. ✅ **MultiBypass140** — ingested (`multibypass140`, 13,090 clips).
 2. ✅ **HeiChole** ingested (`heichole`, 894). **AutoLaparo** — form submitted, still awaiting the emailed link (not yet acquired).
@@ -237,7 +237,7 @@ ingested and in the 15-source configs (see §1). Remaining below are still open.
 4. Treat the GI/cataract sets (EndoMapper, Cataract-*, LDPolypVideo, Kvasir-Capsule) as optional *off-domain broadening* only. NOTE: `lemon` is no longer "unclaimed" — it's in the mix (53,637 clips); this was the higher-leverage source and it's now used.
 5. Before ingesting **M2CAI16** or **SurgBench**, run the pHash dedup gate against Cholec80 / existing corpus — both heavily overlap what we hold.
 6. ✅ **Gyn-laparoscopy** ingested — **GynSurg** (3,053) + **LapGyn6-Events** (2,155) are in the mix (new sub-domain). Ingested without pHash dedup per decision (shared Vienna pool, different segment types).
-7. ⏳ **Open-H-Embodiment** (`nvidia/PhysicalAI-Robotics-Open-H-Embodiment`) — ingesting as `openh` (~37K clips, 512p/8fps re-encode; see §1 row + job 8652503). Largest new *temporal* surgical source since GraSP; all-surgical/endoscopy, no distractor domains.
+7. ✅ **Open-H-Embodiment** (`nvidia/PhysicalAI-Robotics-Open-H-Embodiment`) — ingested as `openh` (36,693 clips @512p/8fps) and **in both recipe configs at weight 1** (`vitG384_cleandata` + `vitg384_cooldown_64f`; NOT the live `fixedshape` run, to keep that arc comparable). Largest new *temporal* surgical source since GraSP; all-surgical/endoscopy, no distractor domains.
 8. ❌ **TAPIR / PSI-AVA (BCV-Uniandes)** — **redundant, do not re-ingest.** TAPIR = the PSI-AVA method/repo; PSI-AVA is a subset of **GraSP**, whose raw video we already hold as `grasp` (1,988 clips), and whose frames are packed as `psi_ava_img` (73.6K). The TAPIR repo hosts only sampled frames + annotations — no new video.
 9. ❌ **bc-z** (`/eagle/tpc/leonardo_borgioli/surg_vid/bc-z`, Polaris) — **inspected, non-surgical, EXCLUDED.** Access granted 2026-07-07; inspected via `ssh polaris` + a sample clip copied to Aurora. It is the **Google BC-Z robot-manipulation dataset** (24,423 4s clips @256px/4fps; `21task`/`79task` `.tfrecord` provenance, `bc-z-robot/`), *not* surgical — the sample frame is a robot arm reaching for a bowl on a tabletop. Filed under Leo's `surg_vid/` by accident (name collision with the surgical sets). Off-domain for a surgical FM and would dilute the corpus; the base V-JEPA 2 checkpoint already saw ample general/manipulation video. Not ingested.
 
