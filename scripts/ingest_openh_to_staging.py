@@ -115,12 +115,20 @@ def _embodiment(path: str) -> str:
 
 
 def _key_for(path: str) -> str:
-    emb = _embodiment(path)
-    # episode stem + a couple of disambiguating path parts (chunk, view) so keys are unique
-    stem = _SANITIZE.sub("_", os.path.splitext(os.path.basename(path))[0]).strip("_")
-    chunk = _SANITIZE.sub("_", path.split("/")[-3]).strip("_") if len(path.split("/")) >= 3 else "c"
-    view = _SANITIZE.sub("_", path.split("/")[-2]).strip("_")
-    src = f"{emb}_{chunk}_{view}_{stem}"
+    """Collision-free key from the FULL LeRobot path (domain-stripped).
+
+    NOTE: an earlier version keyed on <emb>_<chunk>_<view>_<stem> and DROPPED the
+    task/dataset middle levels, so clips differing only by task subdir (e.g.
+    hamlyn/knot_tying/.../episode_000000 vs hamlyn/suturing/.../episode_000000)
+    collided — 22K of 37K clips overwrote each other at reshard. Keep the whole
+    path (minus the leading Surgical/Endoscopy domain and the literal 'videos'
+    dir) so every episode across every task is distinct. Mirrors
+    scripts/rekey_openh_reshard.py:new_key."""
+    parts = path.split("/")
+    rest = [p for p in parts[1:] if p != "videos"]
+    stem = rest[-1].rsplit(".", 1)[0]
+    mid = "_".join(rest[:-1])
+    src = _SANITIZE.sub("_", f"{mid}_{stem}").strip("_")
     return f"openh__{src}_clip_0000"
 
 

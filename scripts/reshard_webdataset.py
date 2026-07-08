@@ -77,6 +77,8 @@ def index_samples(tars: List[Path]) -> Dict[str, Dict[str, Tuple[Path, str]]]:
     Reads only the tar index (no payloads), so this pass is I/O-cheap.
     """
     index: Dict[str, Dict[str, Tuple[Path, str]]] = defaultdict(dict)
+    collisions = 0
+    n_members = 0
     for tar_path in tars:
         with tarfile.open(tar_path, "r|") as tf:
             for member in tf:
@@ -87,7 +89,22 @@ def index_samples(tars: List[Path]) -> Dict[str, Dict[str, Tuple[Path, str]]]:
                     continue
                 key = m.group("key")
                 ext = m.group("ext")
+                n_members += 1
+                # A repeated (key, ext) means two PHYSICAL samples share a key and
+                # one will silently overwrite the other — this is the openh
+                # collision class (docs: rekey_openh_reshard.py). Reshard indexes
+                # by key, so it CANNOT preserve both; loudly flag rather than drop
+                # data silently. The fix belongs upstream (unique keys at pack
+                # time), not here.
+                if ext in index[key]:
+                    collisions += 1
                 index[key][ext] = (tar_path, member.name)
+    if collisions:
+        # count distinct media members vs distinct keys to show the true loss
+        print(f"  WARNING: {collisions} (key,ext) COLLISIONS across {n_members} members "
+              f"-> {collisions} samples will be silently dropped by key-indexing. "
+              f"Source has non-unique keys; fix at pack time (see rekey_openh_reshard.py).",
+              file=sys.stderr)
     return index
 
 
