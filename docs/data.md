@@ -18,17 +18,24 @@ Paths use the `/flare/...` mount (equivalent to `/lus/flare/projects/...`).
 Root: `/flare/ModCon/ngetty/data/surg_vid_webdataset_resharded/`
 
 All sources are resharded `.tar` WebDataset. The active ViT-g 384 mix
-(`configs/vitg16_surg_vid_webdataset_single4/vitg384_cleandata.yaml` for pretrain,
-`vitg384_cooldown_64f.yaml` for cooldown) uses **16 sources, all weight 1.0**, with
-`sampling_temperature: 0.5` (sqrt-size) and `min_clip_std: 1.0` (drops black/frozen clips).
-The bottom 5 rows were added this session. **All 15 verified 2026-07-03**: metadata present,
-`shard_count` == disk tar count, sampled clips decode with json/cls sidecars — launch-ready.
-(To re-verify before a run, the check compares each config source's `metadata.json` shard_urls
-against disk and decodes a sample.)
+(`configs/vitg16_surg_vid_webdataset_single4/vitG384_cleandata.yaml` for the 2B pretrain —
+note capital `G` = `vit_gigantic`; the lowercase `vitg384_cleandata.yaml` is the 1B
+`vit_giant` variant, kept in sync — and `vitg384_cooldown_64f.yaml` for cooldown) uses
+**16 sources, all weight 1.0**, with `sampling_temperature: 0.5` (sqrt-size) and
+`min_clip_std: 1.0` (drops black/frozen clips). **~342K clips total** across the 16 sources.
+kinetics400 is the largest raw count (136K, the non-surgical anchor), then lemon (53.6K) and
+openh (36.7K) — but `sampling_temperature: 0.5` compresses all of these so no single source
+dominates the actual draw.
+
+The bottom 6 rows were added this session (+heichole, +multibypass140, +gynsurg,
++lapgyn6_events, +surgenet_lap, +openh). All 16 verified launch-ready: metadata present,
+`shard_count` == disk tar count, sampled clips decode with json/cls sidecars, and every
+config validates 16/16/16 (datasets == weights == fpcs). (To re-verify before a run, compare
+each config source's `metadata.json` shard_urls against disk and decode a sample.)
 
 | Source key | On disk | Shards | Modality / notes | In active ViT-g mix |
 |---|---|---|---|---|
-| `kinetics400` | 15G | 500 | General action video (non-surgical anchor). ~59% of clip count. | ✅ |
+| `kinetics400` | 15G | 500 | General action video (non-surgical anchor), 136,246 clips (~40% of raw clip count, but sqrt-temp compresses its sampling weight). | ✅ |
 | `surgvu24_clean` | 320G | 2000 | SurgVU-24 / SurgToolLoc robotic. `_clean` = black-clip filtered (~19% of raw was byte-identical pure black). | ✅ |
 | `surgtoolloc2022` | 203G | 1500 | SurgToolLoc-2022 robotic. | ✅ |
 | `sitl_2026` | 179G | 512 | Leo's newer SITL re-segmentation, 4,144 clips @ 60s/30fps/1080p (distinct `v2_` keys). Owner-only perms. | ✅ |
@@ -38,11 +45,11 @@ against disk and decodes a sample.)
 | `surgenet_robotic_clean` | 23G | 500 | SurgeNet robotic subset, minus 40 eval-leaked source videos (318 clips dropped) — eval-scrub. | ✅ |
 | `lemon` | ~900G | — | LEMON / Surg-3M: 4,194 YouTube surgical videos → 53,650 clips, 35 procedures (2,527 lap + 1,667 robotic). pHash-deduped vs eval + surgenet_robotic. Owner-only. | ✅ |
 | `small_surg` | (symlinks) | — | Symlink bundle of the 6 tiny sets below (926 clips total). Bundled so temperature sampling sizes them by combined count instead of oversampling each individually. | ✅ |
-| `heichole` | ✅ | 55 | HeiChole: 24 HD lap-chole full procedures, 3 centers → **894 clips** @ 60s/1080p/25fps. White-censored out-of-body spans dropped by `min_clip_std`. | ✅ |
+| `heichole_512` | ✅ | 256 | HeiChole: 24 HD lap-chole full procedures, 3 centers → **894 clips** @ 60s/25fps. **Re-encoded to 512 short-side** (`heichole_512`, from the raw 1080p `heichole/`) — the raw was 1765 ms/clip decode (4× others) and drove a dataloader stall; re-encode → 182 ms, 894/894 kept. The config points at `heichole_512`. White-censored out-of-body spans dropped by `min_clip_std`. | ✅ |
 | `multibypass140` | ✅ | 818 | MultiBypass140: 140 lap gastric-bypass procedures, Bern+Strasbourg (2 centers) → **13,090 clips** @ 60s. | ✅ |
 | `gynsurg` | ✅ | 190 | GynSurg action segments, gyn laparoscopy (**new sub-domain**), 1080p/30fps pre-cut clips (≥4s filter) → **3,053 clips**. Shares Vienna pool w/ `lapgyn6_events`. ⚠️ median 13.6s → only ~45% fill the 64f cooldown window (rest padded; see cooldown note). | ✅ |
 | `lapgyn6_events` | ✅ | 134 | LapGyn6-Events segments, gyn laparoscopy → **2,155 clips**. Shares Vienna pool w/ `gynsurg`, no dedup (different segment types). ⚠️ median 11.9s → only ~37% fill 64f (rest padded). | ✅ |
-| `surgenet_lap` | ✅ | 365 | SurgeNet **laparoscopic** YouTube set (4fps), **5,843 clips**: raw procedure dirs re-segmented to 60s + `clips_1min` subset. Eval-gated at segment time (crop-aug ref, 0 leaks); 96.9% distinct from `lemon`. Owner-only. The first lap-SurgeNet in the corpus. | ✅ |
+| `surgenet_lap` | ✅ | 365 | SurgeNet **laparoscopic** YouTube set (4fps), **3,984 clips**: raw procedure dirs re-segmented to 60s + `clips_1min` subset. Eval-gated at segment time (crop-aug ref, 0 leaks); 96.9% distinct from `lemon`. Owner-only. The first lap-SurgeNet in the corpus. | ✅ |
 | `openh` | 353G | 2293 | **Open-H-Embodiment** (`nvidia/PhysicalAI-Robotics-Open-H-Embodiment`, CC-BY-4.0). 50-institution medical robot dataset, LeRobot v2.1; top level is only Surgical + Endoscopy. **36,693 RGB endoscope clips** @512p/8fps: cmr_surgical 29,839 (robotic chole+prostatectomy+more), cuhk 2,158, ut_austin 1,894, jhu 1,783, hamlyn 1,019. Dropped: wrist/depth/fluoro/stereo-right/goal views. **Re-encoded to 512p/8fps on ingest** (heichole-style decode-contention fix; raw 1.21 TB → 0.17 TB, 14%). Duration: 81% ≥16s (cmr all 60s), so 64f-cooldown padding is minor except the small jhu tail (median 5.2s). Largest new temporal surgical source since GraSP. | ✅ |
 
 ### `small_surg` bundle members
@@ -166,6 +173,7 @@ FORM = email/Google-form approval · FRAMES-ONLY = no temporal video released ·
 
 | Dataset | Modality | Access | New temporal video | Host | Notes |
 |---|---|---|---|---|---|
+| **Open-H-Embodiment** | Robotic surgery + endoscopy (multi-institution) | **OPEN** (HF, CC-BY-4.0) | 36,693 RGB endoscope clips, 5 embodiments | HF `nvidia/PhysicalAI-Robotics-Open-H-Embodiment` | ✅ **ingested 2026-07-08** → `openh/` (36,693 clips @512p/8fps) + **in configs** (weight 1). Streaming download→re-encode; raw 1.21 TB → 0.17 TB. Largest new temporal surgical source since GraSP; top level is only Surgical+Endoscopy (no distractor domains). See §1 row. |
 | **MultiBypass140** | Laparoscopic (gastric bypass) | **OPEN** (`wget` zip) | 140 videos, 2 centers | CAMMA S3 (`s3.unistra.fr`) | ✅ **downloaded** (365 GB) → resharded `multibypass140/` (13,090 clips) + **in configs**. CC-BY-NC-SA. `github.com/CAMMA-public/MultiBypass140` |
 | **UCL Rectal Cancer** | Laparoscopic (TME) | **OPEN** (CC-BY) | 75 MP4s, ~380h, 1080p/25fps | UCL RDR / figshare | **~765 GB** — HEAD one file before staging. figshare API gives direct URLs. DOI 10.5522/04/24769530 |
 | **HeiChole** | Lap cholecystectomy | **TEAM-JOIN** (Synapse) | 24 HD full videos (`Full/HD/`), ~22h, 3 centers | Synapse `syn18824884` | ✅ **downloaded** (108GB) → resharded `heichole/` (894 clips) + **in configs**. Access = join Team 3390210 (instant); Download-scoped PAT. HD only (`Full/` SD + `Skill/` are dupes/subclips). |
@@ -228,11 +236,11 @@ folder of ophthalmic (cataract) video sets: `cat-101` (=Cataract-101), `cat-21` 
 
 ### Recommendation
 
-**DONE this session (2026-07-03):** items 1, 2 (HeiChole), 6, plus surgenet_lap and lemon are all
-ingested and in the configs (see §1). Remaining below are still open.
+**DONE (2026-07-03 → 07-08):** items 1, 2 (HeiChole), 6, 7 (Open-H), plus surgenet_lap and lemon
+are all ingested and in the configs (see §1). Remaining open items flagged below.
 
 1. ✅ **MultiBypass140** — ingested (`multibypass140`, 13,090 clips).
-2. ✅ **HeiChole** ingested (`heichole`, 894). **AutoLaparo** — form submitted, still awaiting the emailed link (not yet acquired).
+2. ✅ **HeiChole** ingested (`heichole_512`, 894, re-encoded). **AutoLaparo** — form submitted, still awaiting the emailed link (not yet acquired).
 3. **UCL Rectal Cancer** — still open, if you want bulk laparoscopic video and can absorb ~765 GB.
 4. Treat the GI/cataract sets (EndoMapper, Cataract-*, LDPolypVideo, Kvasir-Capsule) as optional *off-domain broadening* only. NOTE: `lemon` is no longer "unclaimed" — it's in the mix (53,637 clips); this was the higher-leverage source and it's now used.
 5. Before ingesting **M2CAI16** or **SurgBench**, run the pHash dedup gate against Cholec80 / existing corpus — both heavily overlap what we hold.
@@ -259,7 +267,7 @@ territory. Full table (frames = sampled count; ✅/⚠️ = our holdings):
 | Source | Procedure / modality | #Frames | Public | For us |
 |---|---|---|---|---|
 | Cholec80 | Lap cholecystectomy | 179,164 | Yes | ✅ have (video) |
-| HeiChole | Lap cholecystectomy | 53,427 | Yes (Synapse) | ✅ in mix (video, `heichole`) |
+| HeiChole | Lap cholecystectomy | 53,427 | Yes (Synapse) | ✅ in mix (video, `heichole_512`) |
 | hSDB-Chole | Lap cholecystectomy | 18,064 | Yes | Cholec-like |
 | RAMIE-UMCU | RA esophagectomy | 377,287 | **No (private)** | — |
 | ESAD | RA prostatectomy | 47,282 | Yes | ✅ packed (`esad_img`, image branch) |
@@ -363,7 +371,10 @@ bulk pretraining fuel. The `frames-only` tags below flag that trade-off, not un-
 | EgoSurgery-Phase | 20 | 1,350,000 (25 fps) | |
 | MultiBypass140 | 140 | N/A | ✅ have (`multibypass140`, 13,090 clips) |
 | SurgBench | 225 / 25 | 53M frames | |
-| HeiChole | 33 | N/A | ✅ have (`heichole`, 894 clips) |
+| HeiChole | 33 | N/A | ✅ have (`heichole_512`, 894 clips) |
+| Open-H-Embodiment | ~37K episodes | N/A | ✅ have (`openh`, 36,693 clips @512p/8fps) — nvidia HF, robotic surgery + endoscopy |
+| TAPIR / PSI-AVA | — | keyframes + annots | ✅ have via `grasp` (raw video superset) + `psi_ava_img` (frames) — do not re-ingest |
+| BC-Z (Google) | 24,423 clips | N/A | ❌ inspected, **non-surgical** (robot kitchen-manipulation) — excluded despite Leo's `surg_vid/bc-z` path |
 | SurgPub-Video | ~3,000 | 25M annotated frames | |
 | M2CAI16 Workflow | 41 | N/A | |
 | SimuScope | — | synthetic dataset | |
