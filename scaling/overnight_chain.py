@@ -87,6 +87,25 @@ def _current_epoch(cfg):
     return last
 
 
+# Liveness lock via log mtime: the trainer appends to log_r0.csv every iteration, so a recently-touched
+# log means ANOTHER launcher (e.g. a parallel capacity job) is actively training this cell. This lets
+# two independent jobs (debug-scaling chain + a capacity hedge) share one run set WITHOUT colliding on
+# latest.pth.tar — each only claims cells whose log is stale. No trainer change, no separate lockfile.
+LIVENESS_STALE_S = int(os.environ.get("SCALING_LIVENESS_STALE_S", "900"))  # 15 min
+
+
+def _is_live(cfg, stale_s=LIVENESS_STALE_S):
+    """True if this cell's log_r0.csv was modified within stale_s (someone is training it now)."""
+    import time
+    csv = os.path.join(_run_folder(cfg), "log_r0.csv")
+    if not os.path.exists(csv):
+        return False
+    try:
+        return (time.time() - os.path.getmtime(csv)) < stale_s
+    except OSError:
+        return False
+
+
 def build_link_script(ctrl, nodes, account, partition, code_folder, cpus_per_task,
                       max_depth, softlimit_s, python_exe):
     """PBS script for ONE chain link. Reads chain.cfglist, runs unfinished cells, resubmits successor."""
@@ -172,14 +191,23 @@ echo "=== CHAIN LINK $DEPTH end $(date) ==="
 """
 
 
-def emit_launch_block(ctrl, cpus_per_task):
-    """Print a bash block launching all UNFINISHED cells on contiguous node blocks. Empty if all done."""
+def emit_launch_block(ctrl, cpus_per_task, nodefile="nodefile.full", max_nodes=None):
+    """Print a bash block launching UNFINISHED, UNCLAIMED cells on contiguous node blocks of `nodefile`.
+    Empty if nothing to claim. `nodefile` lets a parallel capacity job use its own nodefile.cap +
+    private nf split files (prefixed by the nodefile stem) so it doesn't clobber the debug chain's.
+    `max_nodes` caps how many cells are packed (so the block fits the job's allocation)."""
+    stem = nodefile.replace("nodefile.", "").replace("nodefile", "full") or "full"  # full|cap for private nf_ files
     cells = _cells_from_cfglist(ctrl)
     todo = []
     for cfg in cells:
         cur, tgt = _current_epoch(cfg), _target_epochs(cfg)
-        if cur < tgt:
-            todo.append(cfg)
+        if cur >= tgt:
+            continue                       # already at target -> skip
+        if _is_live(cfg):
+            print(f"# SKIP {os.path.basename(cfg)}: log fresh (<{LIVENESS_STALE_S}s) — another job is "
+                  f"training it; avoid checkpoint collision")
+            continue                       # another launcher (e.g. capacity hedge) owns it right now
+        todo.append(cfg)
     if not todo:
         return ""
     # BAKE the absolute ctrl path into the emitted block. It runs as a standalone `bash <file>` where
@@ -194,6 +222,10 @@ def emit_launch_block(ctrl, cpus_per_task):
         base = os.path.splitext(cfg)[0]
         spec = json.load(open(base + "_launch.json"))
         nodes, tiles = int(spec["nodes"]), int(spec["tiles"])
+        # stop packing once we'd exceed this job's node allocation (capacity may be smaller than sum)
+        if max_nodes is not None and cursor + nodes > max_nodes:
+            lines.append(f'echo "# capacity full at {cursor} nodes; deferring remaining cells to next round"')
+            break
         ppn = min(tiles, 12)
         lo, hi = cursor + 1, cursor + nodes
         cursor += nodes
@@ -201,7 +233,7 @@ def emit_launch_block(ctrl, cpus_per_task):
         slug = os.path.basename(base)
         env = "".join(f'  export {k}="{v}"\n' for k, v in (spec.get("env") or {}).items())
         lines += [
-            f'NF{i}="$CTRL/nf_{i}"; sed -n "{lo},{hi}p" "$CTRL/nodefile.full" > "$NF{i}"',
+            f'NF{i}="$CTRL/nf_{stem}_{i}"; sed -n "{lo},{hi}p" "$CTRL/{nodefile}" > "$NF{i}"',
             f'H{i}=$(head -1 "$NF{i}")',
             f'echo "[{slug}] nodes {lo}..{hi} head $H{i} port {port} {spec["dist_strategy"]}"',
             "(",
@@ -218,6 +250,54 @@ def emit_launch_block(ctrl, cpus_per_task):
     lines += ['for p in "${PIDS[@]}"; do wait $p || true; done',
               'echo "link cells finished"']
     return "\n".join(lines)
+
+
+def build_capacity_script(ctrl, nodes, account, code_folder, cpus_per_task, walltime_h, python_exe):
+    """PBS for a PARALLEL capacity HEDGE: one long job (capacity allows up to 168h) that INTERNALLY
+    loops re-emit->run until all cells are done or walltime. No PBS-chaining needed (capacity has long
+    walltime, unlike debug-scaling's 1h). Shares configs/run-folders with the debug-scaling chain; the
+    _emit liveness lock (log mtime) makes the two cooperate — each only claims cells the other isn't
+    actively training, so no latest.pth.tar collision. Whichever job runs first drains the work; the
+    other finds cells already done/live and idles or exits. Safe to run both; cancel the loser."""
+    hh = int(walltime_h)
+    return f"""#!/bin/bash -l
+#PBS -N sweepcap_{nodes}n
+#PBS -l select={nodes}
+#PBS -l walltime={hh:02d}:00:00
+#PBS -l filesystems=home:flare
+#PBS -q capacity
+#PBS -A {account}
+#PBS -j oe
+#PBS -o {ctrl}/capacity.log
+
+set -o pipefail
+
+CTRL="{ctrl}"
+CODE="{code_folder}"
+cd "$CODE"
+{AURORA_ENV}
+cp "$PBS_NODEFILE" "$CTRL/nodefile.cap"
+echo "=== CAPACITY HEDGE start $(date) nodes={nodes} walltime={hh}h ==="
+
+# internal loop: while cells remain and no STOP, emit unclaimed/unfinished cells and run them.
+round=0
+while [ ! -f "$CTRL/STOP" ] && [ ! -f "$CTRL/CHAIN_COMPLETE" ]; do
+  round=$((round+1))
+  LAUNCH=$({python_exe} -m scaling.overnight_chain _emit --ctrl "$CTRL" --cpus {cpus_per_task} --nodefile nodefile.cap --max-nodes {nodes})
+  if [ -z "$LAUNCH" ]; then
+    # nothing to claim: either all done, or the debug chain is actively training everything left.
+    if [ "$({python_exe} -m scaling.overnight_chain _remaining --ctrl "$CTRL")" -eq 0 ]; then
+      echo "ALL CELLS COMPLETE — capacity hedge done."; touch "$CTRL/CHAIN_COMPLETE"; break
+    fi
+    echo "[cap round $round] no unclaimed cells (debug chain owns them) — idle 300s"; sleep 300; continue
+  fi
+  echo "$LAUNCH" > "$CTRL/_cap_block_$round.sh"
+  echo "[cap round $round] running unclaimed cells $(date)"
+  bash "$CTRL/_cap_block_$round.sh"
+  sleep 10
+done
+echo "=== CAPACITY HEDGE end $(date) ==="
+"""
 
 
 def start(ctrl, configs, nodes, account, partition, code_folder, cpus_per_task, max_depth,
@@ -279,11 +359,18 @@ def main():
     st = sub.add_parser("status"); st.add_argument("--ctrl", required=True)
     sp = sub.add_parser("stop"); sp.add_argument("--ctrl", required=True)
     em = sub.add_parser("_emit"); em.add_argument("--ctrl", required=True); em.add_argument("--cpus", type=int, default=16)
+    em.add_argument("--nodefile", default="nodefile.full"); em.add_argument("--max-nodes", type=int, default=None)
     pr = sub.add_parser("_progress"); pr.add_argument("--ctrl", required=True)
+    rm = sub.add_parser("_remaining"); rm.add_argument("--ctrl", required=True)
+    cap = sub.add_parser("capacity", help="submit a PARALLEL capacity hedge (shares run set; liveness-locked)")
+    cap.add_argument("--ctrl", required=True); cap.add_argument("--nodes", type=int, required=True)
+    cap.add_argument("--account", default="AuroraGPT"); cap.add_argument("--code-folder", default=os.getcwd())
+    cap.add_argument("--cpus-per-task", type=int, default=16); cap.add_argument("--walltime-h", type=int, default=48)
+    cap.add_argument("--python", default="python"); cap.add_argument("--dry-run", action="store_true")
 
     args = ap.parse_args()
     if not args.cmd:
-        ap.error("a subcommand is required (start/status/stop/_emit/_progress)")
+        ap.error("a subcommand is required (start/status/stop/capacity/_emit/_progress/_remaining)")
     if args.cmd == "start":
         configs = sorted(glob.glob(args.configs))
         if args.wave:
@@ -295,16 +382,37 @@ def main():
             raise SystemExit(f"no configs match {args.configs} wave={args.wave} exclude={args.exclude}")
         start(args.ctrl, configs, args.nodes, args.account, args.partition, args.code_folder,
               args.cpus_per_task, args.max_depth, args.softlimit_s, args.python, args.dry_run)
+    elif args.cmd == "capacity":
+        # reuses the SAME ctrl (cfglist + run folders) as an existing chain; liveness lock prevents
+        # collision. Does NOT touch chain.cfglist — the chain must already have written it.
+        if not os.path.exists(os.path.join(args.ctrl, "chain.cfglist")):
+            raise SystemExit(f"{args.ctrl}/chain.cfglist missing — run `start` (the debug chain) first")
+        script = build_capacity_script(args.ctrl, args.nodes, args.account,
+                                       os.path.abspath(args.code_folder), args.cpus_per_task,
+                                       args.walltime_h, args.python)
+        pbs = os.path.join(args.ctrl, "capacity.pbs")
+        with open(pbs, "w") as f:
+            f.write(script)
+        print(f"wrote {pbs}; capacity hedge on {args.nodes} nodes, {args.walltime_h}h")
+        if args.dry_run:
+            print("--dry-run: not submitting"); return
+        out = subprocess.run(["qsub", pbs], capture_output=True, text=True)
+        if out.returncode != 0:
+            raise SystemExit("qsub FAILED: " + out.stderr)
+        print("capacity hedge submitted:", out.stdout.strip())
     elif args.cmd == "status":
         status(args.ctrl)
     elif args.cmd == "stop":
         open(os.path.join(args.ctrl, "STOP"), "w").close()
-        print(f"touched STOP in {args.ctrl} — chain halts after current link")
+        print(f"touched STOP in {args.ctrl} — chain + capacity hedge halt after current work")
     elif args.cmd == "_emit":
-        print(emit_launch_block(args.ctrl, args.cpus))
+        print(emit_launch_block(args.ctrl, args.cpus, nodefile=args.nodefile, max_nodes=args.max_nodes))
     elif args.cmd == "_progress":
-        # sum of current epochs across all cells (crash-loop / progress detector)
         print(sum(_current_epoch(cfg) for cfg in _cells_from_cfglist(args.ctrl)))
+    elif args.cmd == "_remaining":
+        # count cells not yet at target epoch (for the capacity loop's completion check)
+        print(sum(1 for cfg in _cells_from_cfglist(args.ctrl)
+                  if _current_epoch(cfg) < _target_epochs(cfg)))
 
 
 if __name__ == "__main__":
