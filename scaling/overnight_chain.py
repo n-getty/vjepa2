@@ -179,7 +179,13 @@ def emit_launch_block(ctrl, cpus_per_task):
             todo.append(cfg)
     if not todo:
         return ""
-    lines = ['echo "launching %d unfinished cells"' % len(todo), 'declare -a PIDS=()']
+    # BAKE the absolute ctrl path into the emitted block. It runs as a standalone `bash <file>` where
+    # $CTRL from the outer PBS is NOT inherited (bug: link 1 wrote to /nf_* -> permission denied, 0
+    # cells launched). Use an absolute CTRL literal so the block is self-contained.
+    ctrl_abs = os.path.abspath(ctrl)
+    lines = [f'CTRL="{ctrl_abs}"',
+             'echo "launching %d unfinished cells (CTRL=$CTRL)"' % len(todo),
+             'declare -a PIDS=()']
     cursor = 0
     for i, cfg in enumerate(todo):
         base = os.path.splitext(cfg)[0]
@@ -249,7 +255,8 @@ def status(ctrl):
 
 def main():
     ap = argparse.ArgumentParser(description="Self-resubmitting scaling-sweep chain")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    # NOTE: no required=True — the login node's python3.6 argparse rejects it. Guard below instead.
+    sub = ap.add_subparsers(dest="cmd")
 
     s = sub.add_parser("start")
     s.add_argument("--ctrl", required=True)
@@ -272,6 +279,8 @@ def main():
     pr = sub.add_parser("_progress"); pr.add_argument("--ctrl", required=True)
 
     args = ap.parse_args()
+    if not args.cmd:
+        ap.error("a subcommand is required (start/status/stop/_emit/_progress)")
     if args.cmd == "start":
         configs = sorted(glob.glob(args.configs))
         if args.wave:
