@@ -153,9 +153,11 @@ def run(run_dir, t_star_ckpt, t_star_model, resolution, frames_per_clip, data_gl
     enc_run = _build_encoder(run_model, ckpt, "target_encoder", resolution, frames_per_clip, device)
     enc_tst = _build_encoder(t_star_model, t_star_ckpt, "target_encoder", resolution, frames_per_clip, device)
 
-    loader = _fixed_clip_loader(data_glob, resolution, frames_per_clip, seed)
+    # only read ~max_clips files (+margin for undecodable skips), not the whole 82K pool
+    max_files = int(max_clips * 1.3) + 8 if max_clips else None
+    loader = _fixed_clip_loader(data_glob, resolution, frames_per_clip, seed, max_files=max_files)
     X = _extract_features(enc_run, loader, device, max_clips, subsample_tokens)
-    loader = _fixed_clip_loader(data_glob, resolution, frames_per_clip, seed)  # same order
+    loader = _fixed_clip_loader(data_glob, resolution, frames_per_clip, seed, max_files=max_files)  # same order
     Y = _extract_features(enc_tst, loader, device, max_clips, subsample_tokens)
 
     n = min(len(X), len(Y))
@@ -182,21 +184,53 @@ def _has_xpu():
         return False
 
 
-def _fixed_clip_loader(data_glob, resolution, frames_per_clip, seed):
-    """Minimal deterministic clip loader over a glob of video files. Placeholder that reuses the
-    repo VideoDataset; kept thin because the alignment math is the validated part."""
-    from src.datasets.data_manager import init_data
+def _fixed_clip_loader(data_glob, resolution, frames_per_clip, seed, batch_size=4, max_files=None):
+    """Self-contained deterministic clip loader: decord-decode a fixed set of videos -> batched
+    (B, C, T, H, W) float tensors normalized like the trainer (ImageNet mean/std). Decoupled from the
+    training data_manager (whose init_data signature has no crop_size and needs a transform+collator);
+    for an eval-only feature extractor a thin direct reader is more robust. Deterministic: sorted file
+    list + fixed uniform frame sampling + fixed seed, so every run/T* sees the SAME clips (required for
+    a fair fixed-ruler comparison). Yields batches; skips undecodable clips."""
     import torch
+    import decord
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    decord.bridge.set_bridge("native")
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
     paths = sorted(glob.glob(data_glob))
-    loader, _ = init_data(
-        data="videodataset", root_path=paths, batch_size=4,
-        dataset_fpcs=[frames_per_clip], fps=4, crop_size=resolution,
-        num_workers=0, world_size=1, rank=0, training=False, drop_last=False,
-    )
-    return loader
+    if max_files:
+        paths = paths[:max_files]
+
+    def _load_one(p):
+        try:
+            vr = decord.VideoReader(p, width=resolution, height=resolution)
+            n = len(vr)
+            if n < 1:
+                return None
+            idx = np.linspace(0, n - 1, frames_per_clip).astype(int)
+            frames = vr.get_batch(idx).asnumpy()          # (T, H, W, C) uint8
+            x = frames.astype(np.float32) / 255.0
+            x = (x - mean) / std
+            x = np.transpose(x, (3, 0, 1, 2))              # (C, T, H, W)
+            return torch.from_numpy(x)
+        except Exception:
+            return None
+
+    class _Loader:
+        def __iter__(self):
+            buf = []
+            for p in paths:
+                t = _load_one(p)
+                if t is None:
+                    continue
+                buf.append(t)
+                if len(buf) == batch_size:
+                    yield (torch.stack(buf),)
+                    buf = []
+            if buf:
+                yield (torch.stack(buf),)
+
+    return _Loader()
 
 
 # Default T* = Meta V-JEPA2 ViT-g/16 @384 (epoch 40, world_size 512 — the released general pretrain).

@@ -1,11 +1,19 @@
 # Neural Scaling Laws for V-JEPA 2.1 — Experimental Design Spec
 
-**Status:** DRAFT for review — no code / no compute yet.
-**Date:** 2026-07-09
+**Status:** LIVE — pipeline built + validated; real sweep TRAINING on Aurora (updated 2026-07-10).
+**Date:** 2026-07-09 (rev 2026-07-10)
 **Owner:** Neil Getty
+**Code:** all tooling under `scaling/` (see `scaling/README.md`); configs `configs/scaling/real/`;
+outputs `/flare/ModCon/ngetty/experiments/scaling_real/`.
 **Decision context:** New parallel research line. Fit compute-optimal (Chinchilla-style) scaling
 relationships for JEPA-style video SSL: at fixed FLOP budgets, sweep model size to find the
 param/data-optimal recipe, then fit the optimal-frontier exponents.
+
+**Progress at a glance (2026-07-10):** full pipeline validated end-to-end on synthetic (recovers
+planted α=β=0.5) and on real Aurora runs. Calibration done. Full-K400 corpus (241K clips) ingested.
+DDP ladder training via a self-resubmitting chain. **First real result: a clean 1e18 IsoFLOP parabola
+on Metric B, N_opt ≈ vit_base (134M); Metric B and raw loss disagree (confirming the core thesis).**
+Pending: more budgets for the α/β fit, Metric A (SSv2, staged), HSDP giant/gigantic smoke gate.
 
 **Scope (IMPORTANT):** This line is **general first, NOT domain-specific.** The scaling law is fit
 on general video SSL (standard corpora + standard downstream benchmarks), so the result is a
@@ -25,6 +33,49 @@ to **two** well-posed y-axes in parallel: (1) **downstream probe error** (what t
 (2) a **frozen common-space prediction loss** (intrinsic, novel). Running both on one sweep lets us
 report whether an intrinsic JEPA loss and downstream quality track each other under scaling — itself
 a publishable result.
+
+---
+
+## 0a. Code map (for collaborators — start here)
+
+All scaling-analysis code is isolated under **`scaling/`** (a self-contained Python package; run
+everything with `module load frameworks`). It does NOT fork the trainer — the only trainer touch is an
+additive `scaling.json` sidecar in `app/vjepa_2_1/train.py`. Read `scaling/README.md` first.
+
+| you want to… | look at |
+|---|---|
+| the whole pipeline + current run commands | `scaling/README.md` |
+| FLOPs/params per model (analytic, meta-device) | `scaling/flops.py` |
+| IsoFLOP planner (fixed global batch, parallelogram cap) | `scaling/plan.py` |
+| per-size launch topology (DDP/HSDP, batch, packing) | `scaling/topology.py` |
+| generate per-cell training configs | `scaling/gen_configs.py` → `configs/scaling/real/` |
+| the two y-axis evaluators | `scaling/eval_metric_a.py` (SSv2 probe), `scaling/eval_metric_b.py` (frozen-T*) |
+| collect → fit exponents → plot | `scaling/collect.py`, `scaling/fit.py`, `scaling/plot.py` |
+| how the sweep actually runs unattended | `scaling/overnight_chain.py` (self-resubmitting chain) |
+| calibration (per-size batch/throughput) | `scaling/gen_calib_configs.py`, `scaling/read_calib.py` |
+
+**Data/artifacts (on flare, not in git):** corpus `data/kinetics400_full_wds/kinetics400` (241K clips);
+SSv2 eval `data/ssv2_eval/{webm,labels}`; T\* `checkpoints/vjepa2_1_vitg_384.pt`; run outputs
+`experiments/scaling_real/<slug>/`.
+
+## 0b. First real result (2026-07-10)
+
+The 1e18-FLOP IsoFLOP row, scored on **Metric B** (frozen-T\* linear-predictivity error, lower=better),
+over the complete DDP ladder:
+
+| model | params | Metric B (↓) | raw loss |
+|---|---|---|---|
+| vit_tiny | 49M | 0.856 | 0.568 |
+| vit_small | 67M | 0.797 | 0.510 |
+| **vit_base** | **134M** | **0.774** ← N_opt | 0.416 |
+| vit_large | 355M | 0.835 | 0.444 |
+
+Two takeaways: (1) a **clean U-shaped IsoFLOP parabola** with a fitted optimum at ~vit_base — real
+compute-optimal behavior, first shown for JEPA video SSL. (2) **Metric B and raw loss DISAGREE** (loss
+ranks large ≈ base as good; Metric B shows large is clearly worse at this budget) — empirical
+confirmation of §1's thesis that raw JEPA loss is the wrong y-axis. Plot:
+`experiments/scaling_metricb_first.png`. NOT yet the finished law — α/β exponents need ≥2 complete
+budgets (only 1e18 is complete so far).
 
 ---
 

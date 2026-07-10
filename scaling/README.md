@@ -69,17 +69,37 @@ python -m scaling.plot --csv scaling/experiments.csv --metric metric_a_error_acc
 | file | stage | notes |
 |---|---|---|
 | `flops.py` | FLOPs+params | term-by-term (not 6ND); exact params via meta-device |
-| `plan.py` | IsoFLOP plan | fixed global batch; steps=C/(tf·gbatch) |
-| `gen_configs.py` | configs | drift-safe overrides + geometry guard |
+| `plan.py` | IsoFLOP plan | fixed global batch; steps=C/(tf·gbatch); `--max-corpus-epochs` parallelogram cap |
+| `topology.py` | per-size launch | hold gbatch fixed, factor into (tiles,per_rank_bs,accum,ddp/hsdp); cell packing |
+| `gen_configs.py` | configs | drift-safe overrides + geometry guard; `--use-topology` emits `<slug>_launch.json` |
+| `gen_calib_configs.py` / `read_calib.py` | calibration | measure per-size max batch + clips/s (throughput) |
 | `collect.py` | runs→CSV | last-K-mean loss + status gate + metric-sidecar join |
 | `fit.py` | α,β | PRISM parabola/power-law/bootstrap; measured D_opt; configurable metric |
 | `plot.py` | figure | 2×2 IsoFLOP; reuses fit.py |
-| `eval_metric_a.py` | Metric A | SSv2 frozen-probe driver (gen/read) |
-| `eval_metric_b.py` | Metric B | frozen-T* linear-predictivity (dimension-agnostic) |
+| `eval_metric_a.py` | Metric A | SSv2 frozen-probe driver (gen/read); GPU |
+| `eval_metric_b.py` | Metric B | frozen-T* linear-predictivity (dimension-agnostic); self-contained decord loader; runs CPU or XPU |
+| `overnight_chain.py` | run driver | **self-resubmitting** 1h debug-scaling chain; resumes from latest.pth.tar; crash-loop/walltime guards |
+| `sweep_launch.py` | run driver | topology-aware hold-node launcher (node blocks per cell, HSDP env) |
+| `hold_node_job.py` / `hold_run.py` | run driver | generic hold-node control loop (iterate on bugs w/o requeue) |
+| `fanout_pbs.py` | run driver | one multi-node PBS, N cells concurrent one-per-node |
 
-## Status
-All stages implemented and validated end-to-end on synthetic data with planted exponents (fit recovers
-α=0.5, β=0.5 exactly, incl. through the Metric-A sidecar join). Remaining before real numbers: settle
-budget ladder + global batch (design doc §7), stage SSv2 to flare, pick T* checkpoint, run the sweep.
-```
-```
+Trainer touchpoint (NOT in `scaling/`): `app/vjepa_2_1/train.py` writes a rank-0 `scaling.json`
+sidecar when a config carries a `scaling:` stamp, and resolves `embed_dim_encoder` for any ladder
+size. Corpus ingest: `scripts/ingest_k400full_{to_wds.py,pbs.sh}` (raw K400 → WebDataset, lossless).
+
+## Status (2026-07-10 — LIVE)
+Pipeline validated end-to-end on synthetic data (fit recovers planted α=β=0.5) AND now on **real
+Aurora runs**. Calibration complete (sweep ≈202 node-h; strong batch-amortization). Full-K400 corpus
+ingested (241,258 clips). The DDP ladder is training via `overnight_chain` (self-resubmitting). First
+real result: a clean **1e18 IsoFLOP parabola on Metric B** with N_opt ≈ vit_base (134M) — and Metric B
+disagrees with raw loss (confirming the design thesis). Remaining: more budgets to complete for the
+α/β exponent fit; Metric A (SSv2, staged at `/flare/ModCon/ngetty/data/ssv2_eval/`) needs a GPU slot;
+HSDP giant/gigantic pending a smoke gate.
+
+## The real study (current invocation)
+- corpus: `/flare/ModCon/ngetty/data/kinetics400_full_wds/kinetics400` (241K clips)
+- configs: `configs/scaling/real/*.yaml` (+ `_launch.json` per cell)
+- outputs: `/flare/ModCon/ngetty/experiments/scaling_real/<slug>/`
+- run: `python -m scaling.overnight_chain start --ctrl <ctrl> --configs 'configs/scaling/real/*.yaml' --exclude giant,gigantic --nodes 16`
+- check: `python -m scaling.overnight_chain status --ctrl <ctrl>`
+- T*: `/flare/ModCon/ngetty/checkpoints/vjepa2_1_vitg_384.pt` (Meta ViT-g e40, model `vit_giant`)
