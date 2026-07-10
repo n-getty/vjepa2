@@ -199,11 +199,69 @@ def _fixed_clip_loader(data_glob, resolution, frames_per_clip, seed):
     return loader
 
 
+# Default T* = Meta V-JEPA2 ViT-g/16 @384 (epoch 40, world_size 512 — the released general pretrain).
+# General (no domain bias); loads via checkpoint_key='target_encoder'. Registry name = vit_giant.
+T_STAR_CKPT = "/flare/ModCon/ngetty/checkpoints/vjepa2_1_vitg_384.pt"
+T_STAR_MODEL = "vit_giant"
+LADDER_ORDER = ["vit_tiny", "vit_small", "vit_base", "vit_large", "vit_giant", "vit_gigantic"]
+
+
+def _model_from_dir(rd):
+    b = os.path.basename(rd)
+    for m in LADDER_ORDER:
+        if b.startswith(m):
+            return m
+    return "?"
+
+
+def run_all(runs_root, t_star_ckpt, t_star_model, data_glob, resolution, frames,
+            lam, max_clips, subsample_tokens, train_frac, seed):
+    """Score every completed run under runs_root, then apply the CEILING GATE (design doc §7b).
+
+    Ceiling gate: Metric B is trustworthy only if 1-R2 still DECREASES as N grows at the top. Our
+    vit_gigantic (1.9B) is BIGGER than T* (1B ViT-g), so predicting T* may saturate there. We score
+    all runs, then per budget check metric_b decreases giant->gigantic. If not (ceiling hit), FLAG the
+    gigantic cell -> report Metric B tiny..giant, use Metric A (SSv2) for gigantic instead."""
+    import json as _json
+    from collections import defaultdict
+    runs = sorted(d for d in glob.glob(os.path.join(runs_root, "*")) if os.path.isdir(d))
+    scored = []
+    for rd in runs:
+        sj = os.path.join(rd, "scaling.json")
+        has_ckpt = os.path.exists(os.path.join(rd, "latest.pth.tar")) or glob.glob(os.path.join(rd, "*.pth.tar"))
+        if not (os.path.exists(sj) and has_ckpt):
+            continue
+        try:
+            run(rd, t_star_ckpt, t_star_model, resolution, frames, data_glob,
+                lam, max_clips, subsample_tokens, train_frac, seed)
+            mb = _json.load(open(os.path.join(rd, "metric_B.json")))
+            scored.append((os.path.basename(rd), _model_from_dir(rd), mb.get("metric_b_error")))
+        except Exception as e:
+            print(f"  SKIP {os.path.basename(rd)}: {e}")
+    print("\n=== CEILING GATE (metric_b must decrease giant->gigantic) ===")
+    by_budget = defaultdict(dict)
+    for name, model, err in scored:
+        budget = name.split("_C")[-1] if "_C" in name else "?"
+        by_budget[budget][model] = err
+    flagged = []
+    for budget, d in sorted(by_budget.items()):
+        g, gg = d.get("vit_giant"), d.get("vit_gigantic")
+        if g is not None and gg is not None:
+            ok = gg < g
+            print(f"  C{budget}: giant={g:.4f} gigantic={gg:.4f} -> "
+                  f"{'OK' if ok else 'CEILING HIT — flag gigantic, use Metric A there'}")
+            if not ok:
+                flagged.append(f"vit_gigantic_C{budget}")
+    print(f"  flagged: {flagged or 'none'}")
+    return scored, flagged
+
+
 def main():
     ap = argparse.ArgumentParser(description="Metric B: frozen-T* linear-predictivity error")
-    ap.add_argument("--run-dir", required=True, help="a sweep run folder (has scaling.json + ckpt)")
-    ap.add_argument("--t-star-ckpt", required=True, help="fixed reference encoder checkpoint")
-    ap.add_argument("--t-star-model", required=True, help="T* model_name (e.g. vit_giant_xformers)")
+    ap.add_argument("--run-dir", help="a single sweep run folder (has scaling.json + ckpt)")
+    ap.add_argument("--runs-root", help="batch: score ALL runs under this dir + ceiling gate")
+    ap.add_argument("--t-star-ckpt", default=T_STAR_CKPT, help="fixed reference encoder checkpoint")
+    ap.add_argument("--t-star-model", default=T_STAR_MODEL, help="T* model_name")
     ap.add_argument("--data-glob", required=True, help="held-out clips glob (fixed eval set)")
     ap.add_argument("--resolution", type=int, default=256)
     ap.add_argument("--frames", type=int, default=16)
@@ -213,8 +271,15 @@ def main():
     ap.add_argument("--train-frac", type=float, default=0.7)
     ap.add_argument("--seed", type=int, default=239)
     args = ap.parse_args()
-    run(args.run_dir, args.t_star_ckpt, args.t_star_model, args.resolution, args.frames,
-        args.data_glob, args.lam, args.max_clips, args.subsample_tokens, args.train_frac, args.seed)
+    if args.runs_root:
+        run_all(args.runs_root, args.t_star_ckpt, args.t_star_model, args.data_glob,
+                args.resolution, args.frames, args.lam, args.max_clips, args.subsample_tokens,
+                args.train_frac, args.seed)
+    elif args.run_dir:
+        run(args.run_dir, args.t_star_ckpt, args.t_star_model, args.resolution, args.frames,
+            args.data_glob, args.lam, args.max_clips, args.subsample_tokens, args.train_frac, args.seed)
+    else:
+        ap.error("need --run-dir or --runs-root")
 
 
 if __name__ == "__main__":
