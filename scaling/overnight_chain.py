@@ -136,8 +136,12 @@ echo "epochs-before=$EP_BEFORE"
 RESUB_EARLY=0
 if [ -f "$CTRL/HEARTBEAT_OK" ] && [ ! -f "$CTRL/STOP" ] && [ ! -f "$CTRL/CHAIN_COMPLETE" ] \
    && [ "$DEPTH" -lt {max_depth} ]; then
-  ( sleep 5; qsub "$CTRL/link.pbs" > "$CTRL/next_jobid_$DEPTH.txt" 2>&1 ) &
-  RESUB_EARLY=1; echo "successor queued EARLY (heartbeat present)"
+  # FOREGROUND qsub while the job is alive (a backgrounded resubmit is KILLED by PBS teardown at job
+  # exit — the depth-1 dropped-chain bug). Submitting the successor NOW (start of link) is safe: it
+  # queues behind us and waits for nodes; debug-scaling max_run=1 just means it can't start until we
+  # release. This is the primary walltime-survival path once a chain has a heartbeat.
+  qsub "$CTRL/link.pbs" > "$CTRL/next_jobid_$DEPTH.txt" 2>&1
+  RESUB_EARLY=1; echo "successor queued EARLY (heartbeat present): $(cat $CTRL/next_jobid_$DEPTH.txt)"
 fi
 
 # ---- run the cells for up to ~{softlimit_s}s, then let walltime handle the rest ----
@@ -158,8 +162,8 @@ if [ "$RESUB_EARLY" -eq 0 ] && [ ! -f "$CTRL/STOP" ] && [ ! -f "$CTRL/CHAIN_COMP
     # depth==1 allowed even w/o progress: a cold start's first epoch may exceed the soft limit for
     # the slowest cell, so give the chain a second link to reach the first checkpoint. Depth>=2 with
     # ZERO progress = crash loop -> stop.
-    ( sleep 5; qsub "$CTRL/link.pbs" > "$CTRL/next_jobid_$DEPTH.txt" 2>&1 ) &
-    echo "successor queued at END (progress=$((EP_AFTER-EP_BEFORE)) depth=$DEPTH)"
+    qsub "$CTRL/link.pbs" > "$CTRL/next_jobid_$DEPTH.txt" 2>&1
+    echo "successor queued at END (progress=$((EP_AFTER-EP_BEFORE)) depth=$DEPTH): $(cat $CTRL/next_jobid_$DEPTH.txt)"
   else
     echo "NO PROGRESS at depth $DEPTH >=2 — CRASH-LOOP GUARD, not resubmitting."
     touch "$CTRL/CHAIN_STALLED"
