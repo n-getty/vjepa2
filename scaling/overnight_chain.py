@@ -129,22 +129,13 @@ echo "$LAUNCH" > "$CTRL/_launch_block_$DEPTH.sh"
 EP_BEFORE=$({python_exe} -m scaling.overnight_chain _progress --ctrl "$CTRL")
 echo "epochs-before=$EP_BEFORE"
 
-# resubmit successor EARLY (so a walltime-kill still continues the chain) — but ONLY if a heartbeat
-# file says a prior link actually trained. On the FIRST link there's no heartbeat yet, so we instead
-# resubmit at the END gated on progress (below). This splits the difference: links after a known-good
-# one get walltime-survival; a crash-looping cold start cannot spawn an infinite chain.
-RESUB_EARLY=0
-if [ -f "$CTRL/HEARTBEAT_OK" ] && [ ! -f "$CTRL/STOP" ] && [ ! -f "$CTRL/CHAIN_COMPLETE" ] \
-   && [ "$DEPTH" -lt {max_depth} ]; then
-  # FOREGROUND qsub while the job is alive (a backgrounded resubmit is KILLED by PBS teardown at job
-  # exit — the depth-1 dropped-chain bug). Submitting the successor NOW (start of link) is safe: it
-  # queues behind us and waits for nodes; debug-scaling max_run=1 just means it can't start until we
-  # release. This is the primary walltime-survival path once a chain has a heartbeat.
-  qsub "$CTRL/link.pbs" > "$CTRL/next_jobid_$DEPTH.txt" 2>&1
-  RESUB_EARLY=1; echo "successor queued EARLY (heartbeat present): $(cat $CTRL/next_jobid_$DEPTH.txt)"
-fi
-
 # ---- run the cells for up to ~{softlimit_s}s, then let walltime handle the rest ----
+# NOTE: resubmit is END-ONLY (not early). An EARLY resubmit (at link start) races debug-scaling's
+# "max 1 job in Q state per user" limit — if any of our jobs is still queued, the early qsub fails
+# ("would exceed per-user limit of jobs in Q state") and the chain silently drops (observed depth 6).
+# At END, THIS job is in R/E state (not Q), so its own slot doesn't count against the Q limit and the
+# successor qsub succeeds. We lose pure walltime-survival (if PBS hard-kills before we reach the END
+# qsub), but the {softlimit_s}s timeout returns control well before the 1h walltime, so END runs.
 timeout {softlimit_s} bash "$CTRL/_launch_block_$DEPTH.sh"
 echo "=== CHAIN LINK $DEPTH cells returned $(date) ==="
 
@@ -152,18 +143,26 @@ echo "=== CHAIN LINK $DEPTH cells returned $(date) ==="
 EP_AFTER=$({python_exe} -m scaling.overnight_chain _progress --ctrl "$CTRL")
 echo "epochs-after=$EP_AFTER (before=$EP_BEFORE)"
 if [ "$EP_AFTER" -gt "$EP_BEFORE" ]; then
-  touch "$CTRL/HEARTBEAT_OK"   # this chain has proven it can train -> future links may resub early
+  touch "$CTRL/HEARTBEAT_OK"
 fi
 
-# END-gated resubmit (covers the first link + any link that didn't resub early), only on real progress.
-if [ "$RESUB_EARLY" -eq 0 ] && [ ! -f "$CTRL/STOP" ] && [ ! -f "$CTRL/CHAIN_COMPLETE" ] \
-   && [ "$DEPTH" -lt {max_depth} ]; then
+# END resubmit, gated on progress (crash-loop guard). Retry the qsub a few times in case a sibling
+# job is momentarily still in Q (the per-user Q-limit is transient as other jobs start running).
+if [ ! -f "$CTRL/STOP" ] && [ ! -f "$CTRL/CHAIN_COMPLETE" ] && [ "$DEPTH" -lt {max_depth} ]; then
   if [ "$EP_AFTER" -gt "$EP_BEFORE" ] || [ "$DEPTH" -eq 1 ]; then
-    # depth==1 allowed even w/o progress: a cold start's first epoch may exceed the soft limit for
-    # the slowest cell, so give the chain a second link to reach the first checkpoint. Depth>=2 with
-    # ZERO progress = crash loop -> stop.
-    qsub "$CTRL/link.pbs" > "$CTRL/next_jobid_$DEPTH.txt" 2>&1
-    echo "successor queued at END (progress=$((EP_AFTER-EP_BEFORE)) depth=$DEPTH): $(cat $CTRL/next_jobid_$DEPTH.txt)"
+    ok=0
+    for attempt in 1 2 3 4 5 6; do
+      out=$(qsub "$CTRL/link.pbs" 2>&1)
+      echo "$out" > "$CTRL/next_jobid_$DEPTH.txt"
+      if echo "$out" | grep -q "aurora-pbs"; then
+        echo "successor queued at END (progress=$((EP_AFTER-EP_BEFORE)) depth=$DEPTH): $out"; ok=1; break
+      fi
+      echo "qsub attempt $attempt failed ($out) — retrying in 60s"; sleep 60
+    done
+    if [ "$ok" -eq 0 ]; then
+      echo "SUCCESSOR QSUB FAILED after retries — chain will drop; monitor should catch it."
+      touch "$CTRL/CHAIN_QSUB_FAILED"
+    fi
   else
     echo "NO PROGRESS at depth $DEPTH >=2 — CRASH-LOOP GUARD, not resubmitting."
     touch "$CTRL/CHAIN_STALLED"
