@@ -735,6 +735,16 @@ def main(args, resume_preempt=False):
                 next(momentum_scheduler)
                 mask_collator.step()
 
+    def _atomic_torch_save(obj, path):
+        # Write to a temp file in the SAME directory, then os.replace() (atomic
+        # rename on POSIX). Guarantees `path` is never a truncated half-write when
+        # walltime SIGTERM lands mid-save. Without this, the chain resumes from a
+        # corrupt latest.pth.tar ("failed finding central directory") and stalls.
+        # Larger cells (bigger ckpt = longer write) hit the kill window more often.
+        tmp = f"{path}.tmp.{os.getpid()}"
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+
     def save_checkpoint(epoch, path):
         if dist_strategy == "hsdp":
             # FULL_STATE_DICT is a COLLECTIVE: every rank must enter the context
@@ -770,7 +780,7 @@ def main(args, resume_preempt=False):
                 "dist_strategy": "hsdp",
             }
             try:
-                torch.save(save_dict, path)
+                _atomic_torch_save(save_dict, path)
             except Exception as e:
                 logger.info(f"Encountered exception when saving checkpoint: {e}")
             return
@@ -790,7 +800,7 @@ def main(args, resume_preempt=False):
             "lr": lr,
         }
         try:
-            torch.save(save_dict, path)
+            _atomic_torch_save(save_dict, path)
         except Exception as e:
             logger.info(f"Encountered exception when saving checkpoint: {e}")
 
