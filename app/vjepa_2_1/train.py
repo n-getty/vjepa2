@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
+import json
 import os
 import socket
 
@@ -121,6 +122,10 @@ def main(args, resume_preempt=False):
     normalize_predictor = cfgs_model.get("normalize_predictor", False)
     modality_embedding = cfgs_model.get("modality_embedding", False)
     levels_predictor = cfgs_model.get("levels_predictor", 4)
+    # Provisional encoder embed_dim by name (kept for the 3 canonical sizes); the AUTHORITATIVE value
+    # is read from the built encoder right after init_video_model (below) so ANY ladder size works.
+    # Without that, unknown sizes (tiny/small/base — used by the scaling sweep) left this unbound and
+    # crashed at forward_target's `embed_dim=embed_dim_encoder` default (NameError). See scaling study.
     if model_name == "vit_large":
         embed_dim_encoder = 1024
     elif model_name == "vit_giant_xformers":
@@ -128,7 +133,7 @@ def main(args, resume_preempt=False):
     elif model_name == "vit_gigantic_xformers":
         embed_dim_encoder = 1664
     else:
-        print("Model name not recognized :(")
+        embed_dim_encoder = None  # set authoritatively from the built encoder below
 
     # -- DATA
     cfgs_data = args.get("data")
@@ -177,6 +182,20 @@ def main(args, resume_preempt=False):
     # HYBRID_SHARD; shards params/grads/optimizer intra-node to buy back L0
     # headroom on Aurora and remove the 2B backward wedge). See app/vjepa_2_1/hsdp.py.
     dist_strategy = os.environ.get("VJEPA_DIST_STRATEGY", "ddp").lower()
+
+    # SAFETY GUARD: activation-checkpointing-off is only affordable when HSDP
+    # shards the optimizer state (2B ViT-g @ 384: ~22 GB HSDP baseline vs ~57 GB
+    # DDP). Under DDP the full 48-layer activation set pushes the tile to ~82 GB
+    # and OOMs (measured 2026-07-09, job 8659973). The active vitG384 configs ship
+    # ckpt-off as the default recipe (they are always launched HSDP), so protect
+    # any DDP launch of them from a guaranteed OOM by forcing ckpt back on.
+    if (not use_activation_checkpointing) and dist_strategy == "ddp":
+        logger.warning(
+            "use_activation_checkpointing=false is unsafe under DDP (OOMs the 2B "
+            "at ~82 GB); forcing it ON. Set VJEPA_DIST_STRATEGY=hsdp to keep it off."
+        )
+        use_activation_checkpointing = True
+
     tubelet_size = cfgs_data.get("tubelet_size")
     fps = cfgs_data.get("fps")
     crop_size = cfgs_data.get("crop_size", 224)
@@ -450,6 +469,27 @@ def main(args, resume_preempt=False):
         modality_embedding=modality_embedding,
     )
     target_encoder = copy.deepcopy(encoder)
+
+    # Authoritative encoder embed_dim from the built model (single source of truth; supports any ladder
+    # size, not just the 3 hardcoded above). forward_target/forward_context use this as their default.
+    embed_dim_encoder = encoder.backbone.embed_dim
+
+    # -- scaling-law sidecar: if the config carries a `scaling:` stamp (written by
+    # scaling/gen_configs.py), dump run identity + measured param counts to a rank-0
+    # JSON next to the loss CSV. The collector (scaling/collect.py) joins this with
+    # log_r0.csv; keeping it a static sidecar means ZERO edits to the training hot path.
+    if rank == 0 and args.get("scaling") is not None:
+        try:
+            _sc = dict(args.get("scaling"))
+            _sc["n_params_encoder"] = sum(p.numel() for p in encoder.parameters())
+            _sc["n_params_predictor"] = sum(p.numel() for p in predictor.parameters())
+            _sc["n_params_measured"] = _sc["n_params_encoder"] + _sc["n_params_predictor"]
+            _sc["model_name"] = model_name
+            _sc["world_size"] = world_size
+            with open(os.path.join(folder, "scaling.json"), "w") as _f:
+                json.dump(_sc, _f, indent=2)
+        except Exception as _e:  # never let logging break training
+            logger.warning(f"[scaling] sidecar write failed: {_e}")
 
     if compile_model:
         logger.info("Compiling encoder, target_encoder, and predictor.")
@@ -830,6 +870,7 @@ def main(args, resume_preempt=False):
     import signal as _sig
     _iter_watchdog_s = float(os.environ.get("VJEPA_ITER_WATCHDOG_S", "0"))
     _watchdog_on = _iter_watchdog_s > 0
+    _dump_fh = None  # per-rank stack dump file; set below when watchdog is on
     if _watchdog_on:
         # Register SIGUSR1 -> dump ALL-THREAD stacks of THIS rank AND CONTINUE (does not
         # abort — verified). The shell watchdog (capacity.sh capture_hang_forensics) sends
@@ -837,9 +878,26 @@ def main(args, resume_preempt=False):
         # it is blocked (which collective/line) to stderr -> job log, then the shell pkill -9
         # does the actual kill. (SIGABRT cannot be faulthandler-registered on this build:
         # "signal 6 cannot be registered" — verified; SIGUSR1 is the correct trigger.)
+        # Per-rank dump FILE. faulthandler writes raw stacks with NO rank/host prefix, so
+        # when all 192 ranks dump into the shared job stdout they are un-attributable — we
+        # cannot tell WHICH node the stalled ranks are on (the exact question ALCF needs to
+        # answer whether the deadlock is a same-PG order divergence or a cross-PG straggler
+        # cascade). Give each rank its own file so `grep -l _pre_forward_unshard` maps the
+        # stalled ranks to hosts. Kept in hang_diag/ alongside the nodefile the shell captures.
+        _hang_dir = os.path.join(folder, "hang_diag") if folder else None
+        if _hang_dir:
+            try:
+                os.makedirs(_hang_dir, exist_ok=True)
+                _dump_path = os.path.join(
+                    _hang_dir, f"stack_rank{rank:04d}_{socket.gethostname()}.txt"
+                )
+                _dump_fh = open(_dump_path, "a", buffering=1)  # line-buffered, append
+            except Exception as _e:
+                logger.warning(f"[hang-watchdog] per-rank dump file open failed: {_e}")
         try:
             _fh.enable(all_threads=True)
-            _fh.register(_sig.SIGUSR1, all_threads=True, chain=False)
+            # SIGUSR1 dump goes to the per-rank file if we have one, else stderr.
+            _fh.register(_sig.SIGUSR1, file=_dump_fh, all_threads=True, chain=False)
         except Exception as _e:  # never let diag setup break training
             logger.warning(f"[hang-watchdog] faulthandler.register(SIGUSR1) failed: {_e}")
         # dump_traceback_later prints ALL threads' stacks after the timeout unless
@@ -848,11 +906,18 @@ def main(args, resume_preempt=False):
             f"[hang-watchdog] per-rank iter watchdog ON: {_iter_watchdog_s}s "
             f"(rank={rank} host={socket.gethostname()}); dumps stack if an iter stalls, "
             f"and on SIGUSR1 from the shell watchdog."
+            + (f" per-rank dumps -> {_hang_dir}/stack_rank*.txt" if _dump_fh else "")
         )
 
     def _watchdog_arm():
         if _watchdog_on:
-            _fh.dump_traceback_later(_iter_watchdog_s, repeat=False, exit=False)
+            if _dump_fh is not None:
+                _fh.dump_traceback_later(
+                    _iter_watchdog_s, repeat=False, exit=False, file=_dump_fh
+                )
+            else:
+                # file omitted -> faulthandler defaults to sys.stderr (-> job stdout)
+                _fh.dump_traceback_later(_iter_watchdog_s, repeat=False, exit=False)
 
     def _watchdog_disarm():
         if _watchdog_on:

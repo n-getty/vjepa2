@@ -1,0 +1,122 @@
+{
+  "meta": {
+    "budgets": [
+      1e+16,
+      3e+16
+    ],
+    "ladder": [
+      "vit_tiny",
+      "vit_small",
+      "vit_base"
+    ],
+    "global_batch": 24,
+    "ipe": 25,
+    "warmup_frac": 0.05,
+    "frames": 16,
+    "res": 256,
+    "patch": 16,
+    "tubelet": 2,
+    "pred_depth": 12,
+    "pred_embed": 384,
+    "pred_heads": null,
+    "use_rope": false,
+    "mask_views": [
+      {
+        "num_keep_enc": 1536,
+        "num_keep_pred": 2560
+      }
+    ]
+  },
+  "cells": [
+    {
+      "budget_flops": 1e+16,
+      "model_name": "vit_tiny",
+      "depth": 12,
+      "n_params": 27447552,
+      "train_flops_per_clip": 1748521451520.0,
+      "global_batch": 24,
+      "ipe": 25,
+      "epochs": 10,
+      "steps": 250,
+      "clips_seen_D": 6000,
+      "actual_flops": 1.049112870912e+16,
+      "warmup_epochs": 0.5,
+      "status": "ok"
+    },
+    {
+      "budget_flops": 1e+16,
+      "model_name": "vit_small",
+      "depth": 12,
+      "n_params": 44511360,
+      "train_flops_per_clip": 2275795795968.0,
+      "global_batch": 24,
+      "ipe": 25,
+      "epochs": 7,
+      "steps": 175,
+      "clips_seen_D": 4200,
+      "actual_flops": 9558342343065600.0,
+      "warmup_epochs": 0.35,
+      "status": "ok"
+    },
+    {
+      "budget_flops": 1e+16,
+      "model_name": "vit_base",
+      "depth": 12,
+      "n_params": 111374208,
+      "train_flops_per_clip": 4015257550848.0,
+      "global_batch": 24,
+      "ipe": 25,
+      "epochs": 4,
+      "steps": 100,
+      "clips_seen_D": 2400,
+      "actual_flops": 9636618122035200.0,
+      "warmup_epochs": 0.2,
+      "status": "ok"
+    },
+    {
+      "budget_flops": 3e+16,
+      "model_name": "vit_tiny",
+      "depth": 12,
+      "n_params": 27447552,
+      "train_flops_per_clip": 1748521451520.0,
+      "global_batch": 24,
+      "ipe": 25,
+      "epochs": 29,
+      "steps": 725,
+      "clips_seen_D": 17400,
+      "actual_flops": 3.0424273256448e+16,
+      "warmup_epochs": 1.45,
+      "status": "ok"
+    },
+    {
+      "budget_flops": 3e+16,
+      "model_name": "vit_small",
+      "depth": 12,
+      "n_params": 44511360,
+      "train_flops_per_clip": 2275795795968.0,
+      "global_batch": 24,
+      "ipe": 25,
+      "epochs": 22,
+      "steps": 550,
+      "clips_seen_D": 13200,
+      "actual_flops": 3.00405045067776e+16,
+      "warmup_epochs": 1.1,
+      "status": "ok"
+    },
+    {
+      "budget_flops": 3e+16,
+      "model_name": "vit_base",
+      "depth": 12,
+      "n_params": 111374208,
+      "train_flops_per_clip": 4015257550848.0,
+      "global_batch": 24,
+      "ipe": 25,
+      "epochs": 12,
+      "steps": 300,
+      "clips_seen_D": 7200,
+      "actual_flops": 2.89098543661056e+16,
+      "warmup_epochs": 0.6,
+      "status": "ok"
+    }
+  ]
+}

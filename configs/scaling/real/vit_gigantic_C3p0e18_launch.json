@@ -1,0 +1,13 @@
+{
+  "model_name": "vit_gigantic",
+  "tiles": 96,
+  "per_rank_bs": 1,
+  "accum": 1,
+  "dist_strategy": "hsdp",
+  "nodes": 8,
+  "env": {
+    "VJEPA_DIST_STRATEGY": "hsdp",
+    "VJEPA_NUM_WORKERS": "0"
+  },
+  "global_batch": 96
+}
