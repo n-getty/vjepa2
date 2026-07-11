@@ -187,21 +187,29 @@ if [ "$EP_AFTER" -gt "$EP_BEFORE" ]; then
   touch "$CTRL/HEARTBEAT_OK"
 fi
 
-# END resubmit, gated on progress (crash-loop guard). Retry the qsub a few times in case a sibling
-# job is momentarily still in Q (the per-user Q-limit is transient as other jobs start running).
+# END resubmit, gated on progress (crash-loop guard). The per-user "jobs in Q" limit is transient BUT
+# can be held by SIBLING jobs (other experiments' qsubs) for a LONG time — a 6x60s (6 min) retry is far
+# too short: on 2026-07-11 a giant-smoke + asformer + FLASH sibling set held the Q limit, all 6 retries
+# failed, and the chain dropped silently for the rest of the night. A dropped chain is catastrophic
+# (unattended, no progress until a human notices), so retry HARD: up to RESUB_TRIES attempts spaced
+# RESUB_GAP_S apart. Default 40 tries x 60s = ~40 min of retrying, which comfortably outlasts any
+# sibling job's time-in-Q (they start running and free the slot) while staying inside PBS walltime
+# (this runs after the {softlimit_s}s cell timeout, with the full 1h-softlimit headroom to spare).
 if [ ! -f "$CTRL/STOP" ] && [ ! -f "$CTRL/CHAIN_COMPLETE" ] && [ "$DEPTH" -lt {max_depth} ]; then
   if [ "$EP_AFTER" -gt "$EP_BEFORE" ] || [ "$DEPTH" -eq 1 ]; then
     ok=0
-    for attempt in 1 2 3 4 5 6; do
+    RESUB_TRIES=${{SCALING_RESUB_TRIES:-40}}
+    RESUB_GAP_S=${{SCALING_RESUB_GAP_S:-60}}
+    for attempt in $(seq 1 $RESUB_TRIES); do
       out=$(qsub "$CTRL/link.pbs" 2>&1)
       echo "$out" > "$CTRL/next_jobid_$DEPTH.txt"
       if echo "$out" | grep -q "aurora-pbs"; then
-        echo "successor queued at END (progress=$((EP_AFTER-EP_BEFORE)) depth=$DEPTH): $out"; ok=1; break
+        echo "successor queued at END (progress=$((EP_AFTER-EP_BEFORE)) depth=$DEPTH attempt=$attempt): $out"; ok=1; break
       fi
-      echo "qsub attempt $attempt failed ($out) — retrying in 60s"; sleep 60
+      echo "qsub attempt $attempt/$RESUB_TRIES failed ($out) — retrying in ${{RESUB_GAP_S}}s"; sleep $RESUB_GAP_S
     done
     if [ "$ok" -eq 0 ]; then
-      echo "SUCCESSOR QSUB FAILED after retries — chain will drop; monitor should catch it."
+      echo "SUCCESSOR QSUB FAILED after $RESUB_TRIES tries — chain dropped; liveness watchdog must catch it."
       touch "$CTRL/CHAIN_QSUB_FAILED"
     fi
   else
