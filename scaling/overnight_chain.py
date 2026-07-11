@@ -261,7 +261,15 @@ def emit_launch_block(ctrl, cpus_per_task, nodefile="nodefile.full", max_nodes=N
         cursor += nodes
         port = 29500 + i
         slug = os.path.basename(base)
-        env = "".join(f'  export {k}="{v}"\n' for k, v in (spec.get("env") or {}).items())
+        # Empty value => UNSET the var (not `export K=""`). oneCCL's env parser treats an EMPTY
+        # CCL_KVS_MODE as a fatal enum error ("unexpected value: ''") — empty != unset — which crashed
+        # every HSDP cell at the first FSDP all-gather (job 8667049). A per-cell env of "" is the
+        # intent "neutralize the global AURORA_ENV default" (e.g. the ddp CCL_KVS_MODE=mpi that the
+        # ofi/launcher=none HSDP path must not see), so emit a real `unset`.
+        env = "".join(
+            (f'  unset {k}\n' if v == "" else f'  export {k}="{v}"\n')
+            for k, v in (spec.get("env") or {}).items()
+        )
         # mpiexec flavor is dictated by the CCL transport, which differs by strategy:
         #   ddp  -> global AURORA_ENV sets CCL_PROCESS_LAUNCHER=pmix + CCL_ATL_TRANSPORT=mpi,
         #           so mpiexec MUST carry --pmi=pmix (oneCCL bootstraps its KVS over PMI/MPI).
