@@ -262,6 +262,15 @@ def emit_launch_block(ctrl, cpus_per_task, nodefile="nodefile.full", max_nodes=N
         port = 29500 + i
         slug = os.path.basename(base)
         env = "".join(f'  export {k}="{v}"\n' for k, v in (spec.get("env") or {}).items())
+        # mpiexec flavor is dictated by the CCL transport, which differs by strategy:
+        #   ddp  -> global AURORA_ENV sets CCL_PROCESS_LAUNCHER=pmix + CCL_ATL_TRANSPORT=mpi,
+        #           so mpiexec MUST carry --pmi=pmix (oneCCL bootstraps its KVS over PMI/MPI).
+        #   hsdp -> the per-cell env overrides to CCL_PROCESS_LAUNCHER=none + CCL_ATL_TRANSPORT=ofi
+        #           + CCL_KVS_IFACE=hsn0 (oneCCL brings up its OWN KVS over the CXI fabric). That
+        #           path does NOT use PMI; passing --pmi=pmix alongside launcher=none conflicts
+        #           (validated: the 2n OFI smoke used plain `mpiexec` with no --pmi). So HSDP cells
+        #           launch WITHOUT --pmi=pmix. Do not "simplify" this back to one invocation.
+        pmi = "" if str(spec.get("dist_strategy", "ddp")).lower() == "hsdp" else "--pmi=pmix "
         lines += [
             f'NF{i}="$CTRL/nf_{stem}_{i}"; sed -n "{lo},{hi}p" "$CTRL/{nodefile}" > "$NF{i}"',
             f'H{i}=$(head -1 "$NF{i}")',
@@ -270,7 +279,7 @@ def emit_launch_block(ctrl, cpus_per_task, nodefile="nodefile.full", max_nodes=N
             f'  export PBS_NODEFILE="$NF{i}"',
             f'  export MASTER_ADDR="$H{i}"; export MASTER_PORT={port}; export WORLD_SIZE={tiles}',
             (env.rstrip("\n") if env else "  :"),
-            f'  mpiexec --pmi=pmix -n {tiles} -ppn {ppn} --hostfile "$NF{i}" \\',
+            f'  mpiexec {pmi}-n {tiles} -ppn {ppn} --hostfile "$NF{i}" \\',
             f'      --cpu-bind depth --depth {cpus_per_task} \\',
             f'      python -m app.main_dist_aurora --train_mode \\',
             f'          --fname {os.path.abspath(cfg)} --params_path {os.path.abspath(cfg)} \\',
