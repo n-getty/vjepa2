@@ -237,6 +237,11 @@ def _fixed_clip_loader(data_glob, resolution, frames_per_clip, seed, batch_size=
 # General (no domain bias); loads via checkpoint_key='target_encoder'. Registry name = vit_giant.
 T_STAR_CKPT = "/flare/ModCon/ngetty/checkpoints/vjepa2_1_vitg_384.pt"
 T_STAR_MODEL = "vit_giant"
+# CANONICAL held-out set for Metric B — a FIXED 120-clip slice of K400 (extracted from shard 000778).
+# Metric B (1-R^2 of run-encoder->T* linear predictivity) is ONLY comparable across cells when the clip
+# set is byte-identical, so this is pinned as the default. The original 6 scores (07-10) used an
+# unrecorded glob and are NOT reproducible — ALL cells must be re-scored on THIS set for a valid plot.
+CANONICAL_HELDOUT_GLOB = "/flare/ModCon/ngetty/data/metricb_heldout_k400/*.mp4"
 LADDER_ORDER = ["vit_tiny", "vit_small", "vit_base", "vit_large", "vit_giant", "vit_gigantic"]
 
 
@@ -296,7 +301,10 @@ def main():
     ap.add_argument("--runs-root", help="batch: score ALL runs under this dir + ceiling gate")
     ap.add_argument("--t-star-ckpt", default=T_STAR_CKPT, help="fixed reference encoder checkpoint")
     ap.add_argument("--t-star-model", default=T_STAR_MODEL, help="T* model_name")
-    ap.add_argument("--data-glob", required=True, help="held-out clips glob (fixed eval set)")
+    ap.add_argument("--data-glob", default=CANONICAL_HELDOUT_GLOB,
+                    help="held-out clips glob (fixed eval set). Default = canonical pinned K400 held-out "
+                         "set so every cell is scored on the SAME ruler (Metric B is only comparable "
+                         "across cells when the clip set is identical).")
     ap.add_argument("--resolution", type=int, default=256)
     ap.add_argument("--frames", type=int, default=16)
     ap.add_argument("--lam", type=float, default=1.0, help="ridge regularization")
