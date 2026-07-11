@@ -100,9 +100,17 @@ def _make_tf_interp(rows):
 
 def _load(path, metric, all_status, maximize):
     rows = []
+    # The `status` column is a LOSS-stability/convergence verdict (collect.py flags a cell
+    # `unconverged` when stdev/mean of loss_main exceeds a threshold). That gate is IRRELEVANT when the
+    # y-axis is NOT loss: e.g. a short large@small-budget cell has a wobbly loss over its few steps but
+    # a perfectly valid Metric B (it completed its target steps and its frozen encoder is scored on the
+    # fixed ruler). So for a non-loss metric, accept `unconverged` cells too — they were only excluded
+    # for loss noise we don't care about. Still reject collapsed/nan/no_loss/incomplete.
+    loss_metric = metric.startswith("loss")
+    ok_status = {"done"} if loss_metric else {"done", "unconverged"}
     with open(path) as f:
         for r in csv.DictReader(f):
-            if not all_status and r.get("status") != "done":
+            if not all_status and r.get("status") not in ok_status:
                 continue
             try:
                 n = float(r["n_active_params"])
