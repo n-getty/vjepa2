@@ -71,7 +71,14 @@ def _run_folder(cfg):
 
 
 def _current_epoch(cfg):
-    """Highest epoch recorded in the run's log_r0.csv (0 if none)."""
+    """Epoch of the LAST valid row in log_r0.csv (0 if none) = real current
+    training position. NOT max(epoch): a cell that restarted from scratch (e.g.
+    after a corrupt-checkpoint recovery) has stale high-epoch rows from its prior
+    run followed by fresh low-epoch rows; max() would report the stale peak and
+    (a) mis-display progress, (b) FREEZE this cell's contribution to the crash-
+    loop guard's progress delta until real training passes the stale peak — a
+    false-stall trap when it's the sole unfinished cell. Last-row is correct for
+    monotonic runs, normal resumes, AND scratch restarts."""
     fldr = _run_folder(cfg)
     csv = os.path.join(fldr, "log_r0.csv")
     if not os.path.exists(csv):
@@ -81,9 +88,9 @@ def _current_epoch(cfg):
         next(f, None)
         for line in f:
             try:
-                last = max(last, int(line.split(",")[0]))
+                last = int(line.split(",")[0])
             except (ValueError, IndexError):
-                pass
+                pass  # skip garbled/partial line, keep prior good value
     return last
 
 
