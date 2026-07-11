@@ -102,13 +102,28 @@ LIVENESS_STALE_S = int(os.environ.get("SCALING_LIVENESS_STALE_S", "900"))  # 15 
 
 
 def _is_live(cfg, stale_s=LIVENESS_STALE_S):
-    """True if this cell's log_r0.csv was modified within stale_s (someone is training it now)."""
+    """True only if this cell's log_r0.csv is ACTIVELY GROWING right now (another
+    launcher is training it). We must NOT rely on 'mtime within stale_s': the chain
+    kills its own cells at walltime, and a fast-scheduled successor can start within
+    minutes, so the just-killed logs are still 'recent' -> every cell SKIPPED ->
+    empty link -> zero progress -> crash-loop guard false-trips (observed: a 2-sec
+    link that skipped all 6 cells 9 min after the prior link's SIGTERM). Instead
+    sample (size, mtime) twice ~probe_s apart: a genuinely training cell appends
+    iteration rows in that window; a dead/killed cell is static. Quick static check
+    first (mtime older than stale_s => definitely not live) to avoid the sleep on
+    the common case."""
     import time
     csv = os.path.join(_run_folder(cfg), "log_r0.csv")
     if not os.path.exists(csv):
         return False
     try:
-        return (time.time() - os.path.getmtime(csv)) < stale_s
+        st1 = os.stat(csv)
+        if (time.time() - st1.st_mtime) >= stale_s:
+            return False  # old enough to be certainly dead; no need to probe
+        probe_s = float(os.environ.get("SCALING_LIVENESS_PROBE_S", "3"))
+        time.sleep(probe_s)
+        st2 = os.stat(csv)
+        return (st2.st_size, st2.st_mtime) != (st1.st_size, st1.st_mtime)
     except OSError:
         return False
 
