@@ -78,7 +78,11 @@ def _current_epoch(cfg):
     (a) mis-display progress, (b) FREEZE this cell's contribution to the crash-
     loop guard's progress delta until real training passes the stale peak — a
     false-stall trap when it's the sole unfinished cell. Last-row is correct for
-    monotonic runs, normal resumes, AND scratch restarts."""
+    monotonic runs, normal resumes, AND scratch restarts.
+
+    NOTE: the log epoch is 1-INDEXED and written DURING the epoch, so a value of N
+    means "epoch N is IN PROGRESS", NOT "N epochs completed". Use this for
+    progress-delta / display only. For the DONE decision use _completed_epochs()."""
     fldr = _run_folder(cfg)
     csv = os.path.join(fldr, "log_r0.csv")
     if not os.path.exists(csv):
@@ -92,6 +96,25 @@ def _current_epoch(cfg):
             except (ValueError, IndexError):
                 pass  # skip garbled/partial line, keep prior good value
     return last
+
+
+def _completed_epochs(cfg):
+    """Number of FULLY-COMPLETED, resumable epochs — the authoritative DONE signal.
+    Uses the checkpoint's `epoch` field: the trainer calls save_checkpoint(epoch+1)
+    only AFTER an epoch's full ipe iters complete, so ckpt.epoch == count of finished
+    epochs. This is NOT the same as _current_epoch (log last-row), which counts the
+    IN-PROGRESS epoch: a single-epoch cell (target=1) writes log-epoch '1' at iter 0
+    and _current_epoch would call it done at ~30/500 iters -> a garbage 6%-trained
+    high-N point. Falls back to 0 if no/corrupt checkpoint (cell must (re)train)."""
+    import torch
+    ckpt = os.path.join(_run_folder(cfg), "latest.pth.tar")
+    if not os.path.exists(ckpt):
+        return 0
+    try:
+        d = torch.load(ckpt, map_location="cpu", weights_only=False)
+        return int(d.get("epoch", 0) or 0)
+    except Exception:
+        return 0  # corrupt/unreadable -> treat as not-done (will retrain/recover)
 
 
 # Liveness lock via log mtime: the trainer appends to log_r0.csv every iteration, so a recently-touched
@@ -230,7 +253,10 @@ def emit_launch_block(ctrl, cpus_per_task, nodefile="nodefile.full", max_nodes=N
     cells = _cells_from_cfglist(ctrl)
     todo = []
     for cfg in cells:
-        cur, tgt = _current_epoch(cfg), _target_epochs(cfg)
+        # DONE = COMPLETED epochs (ckpt.epoch), NOT in-progress log epoch. A single-epoch cell writes
+        # log-epoch '1' at iter 0; _current_epoch would drop it as done at ~30/500 iters -> garbage
+        # high-N point. _completed_epochs uses the checkpoint (saved only after a full epoch).
+        cur, tgt = _completed_epochs(cfg), _target_epochs(cfg)
         if cur >= tgt:
             continue                       # already at target -> skip
         if _is_live(cfg):
@@ -378,9 +404,10 @@ def status(ctrl):
     print(f"chain depth: {depth}  STOP={'yes' if os.path.exists(os.path.join(ctrl,'STOP')) else 'no'}"
           f"  COMPLETE={'yes' if os.path.exists(os.path.join(ctrl,'CHAIN_COMPLETE')) else 'no'}")
     for cfg in _cells_from_cfglist(ctrl):
-        cur, tgt = _current_epoch(cfg), _target_epochs(cfg)
-        mark = "DONE" if cur >= tgt else ""
-        print(f"  {os.path.basename(cfg):30s} epoch {cur}/{tgt} {mark}")
+        done_ep, tgt = _completed_epochs(cfg), _target_epochs(cfg)
+        cur = _current_epoch(cfg)  # in-progress log epoch, for display
+        mark = "DONE" if done_ep >= tgt else ""
+        print(f"  {os.path.basename(cfg):30s} epoch {cur}/{tgt} (done {done_ep}) {mark}")
 
 
 def main():
@@ -457,9 +484,10 @@ def main():
     elif args.cmd == "_progress":
         print(sum(_current_epoch(cfg) for cfg in _cells_from_cfglist(args.ctrl)))
     elif args.cmd == "_remaining":
-        # count cells not yet at target epoch (for the capacity loop's completion check)
+        # count cells not yet at target epoch (for the capacity loop's completion check).
+        # Use COMPLETED epochs (ckpt), not in-progress log epoch — same reason as the emit DONE gate.
         print(sum(1 for cfg in _cells_from_cfglist(args.ctrl)
-                  if _current_epoch(cfg) < _target_epochs(cfg)))
+                  if _completed_epochs(cfg) < _target_epochs(cfg)))
 
 
 if __name__ == "__main__":
