@@ -1,5 +1,5 @@
 {
-  "n_cells": 18,
+  "n_cells": 19,
   "parabolas": [
     {
       "budget_flops": 1e+18,
@@ -22,9 +22,18 @@
     {
       "budget_flops": 1e+19,
       "n_points": 4,
-      "a": -0.0031434951120301417,
-      "b": 0.26054486499534374,
-      "c": -1.1711700686871196,
+      "a": 0.019072035321923947,
+      "b": -0.14526341977348153,
+      "c": 0.6633574624817038,
+      "N_opt": NaN,
+      "D_opt": NaN
+    },
+    {
+      "budget_flops": 3e+19,
+      "n_points": 3,
+      "a": -0.40799785684608,
+      "b": 7.511088494779919,
+      "c": -33.64073395037305,
       "N_opt": NaN,
       "D_opt": NaN
     }
@@ -42,7 +51,7 @@
   "log_n0": -3.7783119995699845,
   "log_d0": -6.278911858070888,
   "warnings": [
-    "budget=1.000e+19: parabola inverted (a<0); N_opt rejected",
-    "budget=3.000e+19: 2 points (<3); skipped"
+    "budget=1.000e+19: N_opt vertex outside ladder [134M, 1905M] \u2014 extrapolated, rejected. Add a capacity point that brackets the optimum for this budget.",
+    "budget=3.000e+19: parabola inverted (a<0); N_opt rejected"
   ]
 }
