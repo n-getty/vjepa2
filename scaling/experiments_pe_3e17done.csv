@@ -1,0 +1,17 @@
+run_id,backbone,model_name,budget_flops,n_active_params,train_flops_per_clip,loss_main,loss_stability,loss_source,metric_a_error_f1,metric_a_error_acc,metric_b_error,clips_seen_D,global_batch,steps_done,seed,status
+vit_base_C1p0e18,vit_base,vit_base,1e+18,134443392,5464809013248,0.360668,0.026592,train_running_mean,,,0.874030,240000,96,3352,239,done
+vit_base_C3p0e17,vit_base,vit_base,3e+17,134443392,5464809013248,0.353063,0.036857,train_running_mean,,,0.913130,96000,96,1000,239,unconverged
+vit_base_C3p0e18,vit_base,vit_base,3e+18,134443392,5464809013248,0.346452,0.013570,train_running_mean,,,0.801476,768000,96,10804,239,done
+vit_giant_C1p0e18,vit_giant,vit_giant,1e+18,1068666368,29057869676544,0.470315,0.106190,train_running_mean,,,0.922530,48000,96,500,239,unconverged
+vit_giant_C3p0e18,vit_giant,vit_giant,3e+18,1068666368,29057869676544,0.284093,0.131115,train_running_mean,,,0.949234,96000,96,1000,239,unconverged
+vit_gigantic_C1p0e18,vit_gigantic,vit_gigantic,1e+18,1904647936,48784654467072,0.565607,0.105643,train_running_mean,,,0.970931,48000,96,500,239,unconverged
+vit_gigantic_C3p0e18,vit_gigantic,vit_gigantic,3e+18,1904647936,48784654467072,0.496639,0.118483,train_running_mean,,,0.975254,48000,96,500,239,unconverged
+vit_large_C1p0e18,vit_large,vit_large,1e+18,355013248,11345156112384,0.363556,0.056000,train_running_mean,,,0.900683,96000,96,1000,239,unconverged
+vit_large_C3p0e17,vit_large,vit_large,3e+17,355013248,11345156112384,0.354669,0.079768,train_running_mean,,,0.949810,48000,96,500,239,unconverged
+vit_large_C3p0e18,vit_large,vit_large,3e+18,355013248,11345156112384,0.272421,0.038743,train_running_mean,,,,288000,96,3152,239,unconverged
+vit_small_C1p0e18,vit_small,vit_small,1e+18,66693120,3725347258368,0.442611,0.023105,train_running_mean,,,,432000,96,4091,239,done
+vit_small_C3p0e17,vit_small,vit_small,3e+17,66693120,3725347258368,0.428454,0.024625,train_running_mean,,,0.936312,144000,96,2462,239,done
+vit_small_C3p0e18,vit_small,vit_small,3e+18,66693120,3725347258368,0.427507,0.016058,train_running_mean,,,,1296000,96,5171,239,incomplete
+vit_tiny_C1p0e18,vit_tiny,vit_tiny,1e+18,49185600,3198072913920,0.478151,0.029097,train_running_mean,,,,576000,96,4111,239,incomplete
+vit_tiny_C3p0e17,vit_tiny,vit_tiny,3e+17,49185600,3198072913920,0.428010,0.032927,train_running_mean,,,0.969073,192000,96,3452,239,done
+vit_tiny_C3p0e18,vit_tiny,vit_tiny,3e+18,49185600,3198072913920,0.505517,0.018123,train_running_mean,,,,1728000,96,8398,239,incomplete
