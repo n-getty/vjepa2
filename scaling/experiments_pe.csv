@@ -9,9 +9,9 @@ vit_gigantic_C3p0e18,vit_gigantic,vit_gigantic,3e+18,1904647936,48784654467072,0
 vit_large_C1p0e18,vit_large,vit_large,1e+18,355013248,11345156112384,0.363556,0.056000,train_running_mean,,,0.900683,96000,96,1000,239,unconverged
 vit_large_C3p0e17,vit_large,vit_large,3e+17,355013248,11345156112384,0.354669,0.079768,train_running_mean,,,0.949810,48000,96,500,239,unconverged
 vit_large_C3p0e18,vit_large,vit_large,3e+18,355013248,11345156112384,0.272421,0.038743,train_running_mean,,,,288000,96,3152,239,unconverged
-vit_small_C1p0e18,vit_small,vit_small,1e+18,66693120,3725347258368,0.442611,0.023105,train_running_mean,,,,432000,96,4091,239,done
+vit_small_C1p0e18,vit_small,vit_small,1e+18,66693120,3725347258368,0.433711,0.021731,train_running_mean,,,,432000,96,5872,239,done
 vit_small_C3p0e17,vit_small,vit_small,3e+17,66693120,3725347258368,0.428454,0.024625,train_running_mean,,,0.936312,144000,96,2462,239,done
-vit_small_C3p0e18,vit_small,vit_small,3e+18,66693120,3725347258368,0.427507,0.016058,train_running_mean,,,,1296000,96,5171,239,incomplete
-vit_tiny_C1p0e18,vit_tiny,vit_tiny,1e+18,49185600,3198072913920,0.478151,0.029097,train_running_mean,,,,576000,96,4111,239,incomplete
+vit_small_C3p0e18,vit_small,vit_small,3e+18,66693120,3725347258368,0.402917,0.011367,train_running_mean,,,,1296000,96,7597,239,incomplete
+vit_tiny_C1p0e18,vit_tiny,vit_tiny,1e+18,49185600,3198072913920,0.485016,0.026561,train_running_mean,,,,576000,96,5893,239,done
 vit_tiny_C3p0e17,vit_tiny,vit_tiny,3e+17,49185600,3198072913920,0.428010,0.032927,train_running_mean,,,0.969073,192000,96,3452,239,done
-vit_tiny_C3p0e18,vit_tiny,vit_tiny,3e+18,49185600,3198072913920,0.505517,0.018123,train_running_mean,,,,1728000,96,8398,239,incomplete
+vit_tiny_C3p0e18,vit_tiny,vit_tiny,3e+18,49185600,3198072913920,0.496853,0.015604,train_running_mean,,,,1728000,96,9396,239,incomplete
