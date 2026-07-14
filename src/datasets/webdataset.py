@@ -21,6 +21,10 @@ from decord import VideoReader, cpu
 _GLOBAL_SEED = 0
 logger = getLogger()
 
+# One-shot flag so the "no label member -> default 0" path (label-free corpora like PE-Video)
+# warns once per process instead of once per sample. See decode().
+_WARNED_MISSING_LABEL = False
+
 # Default per-pixel std (on the raw 0-255 uint8 buffer) below which a decoded
 # clip is treated as degenerate (e.g. a pure-black or frozen frame). ~19% of
 # surgvu24 clips are one byte-identical pure-black mp4 (decoded std == 0.0);
@@ -307,16 +311,28 @@ class VideoDecoder:
                     label_bytes = sample[key]
                     break
             if label_bytes is None:
-                available_keys = [k for k in sample.keys() if not k.startswith("__")]
-                logger.warning(
-                    f"No label for key {sample.get('__key__', 'N/A')}. Available: {available_keys}"
-                )
-                return None
-            try:
-                label = int(label_bytes.decode("utf-8").strip())
-            except (ValueError, AttributeError) as e:
-                logger.warning(f"Failed to decode label for key {sample.get('__key__', 'N/A')}: {e}")
-                return None
+                # Label-free corpora (e.g. PE-Video, which ships only .mp4/.json with no .cls) are valid
+                # for V-JEPA: SSL pretraining never reads the label (train.py's load_clips consumes only
+                # udata[0][0], the clip tensor). So default to 0 rather than DROP the sample — dropping
+                # would silently discard every PE-Video clip. Warn ONCE per process, not per sample, to
+                # flag the case without flooding logs. Datasets with real labels still carry .cls and are
+                # unaffected; downstream probes read labels via separate CSV loaders, not this path.
+                global _WARNED_MISSING_LABEL
+                if not _WARNED_MISSING_LABEL:
+                    available_keys = [k for k in sample.keys() if not k.startswith("__")]
+                    logger.warning(
+                        f"No label member for key {sample.get('__key__', 'N/A')} (available: "
+                        f"{available_keys}); defaulting label=0 (label-free corpus, expected for "
+                        f"PE-Video). Warning suppressed for subsequent samples."
+                    )
+                    _WARNED_MISSING_LABEL = True
+                label = 0
+            else:
+                try:
+                    label = int(label_bytes.decode("utf-8").strip())
+                except (ValueError, AttributeError) as e:
+                    logger.warning(f"Failed to decode label for key {sample.get('__key__', 'N/A')}: {e}")
+                    return None
 
             # 2. media (video preferred, then image)
             media_bytes = None
