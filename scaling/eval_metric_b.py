@@ -70,12 +70,64 @@ def layernorm_np(Y):
     return (Y - mu) / np.sqrt(var + 1e-6)
 
 
+def _standardize(X_train, X_test):
+    """Zero-mean/unit-std per feature, stats fit on TRAIN only (no test leakage).
+
+    CRITICAL for cross-encoder comparability: raw ViT features have scale/mean that vary
+    systematically with model size, so a FIXED ridge lambda on un-standardized X regularizes
+    different encoders by different effective amounts -> metric_b creeps with d_run as an ARTIFACT,
+    not a representation-quality signal. Standardizing makes lambda mean the same thing for every
+    encoder. (Y is separately LayerNorm'd to match forward_target.)
+    """
+    mu = X_train.mean(axis=0, keepdims=True)
+    sd = X_train.std(axis=0, keepdims=True)
+    sd = np.where(sd <= 1e-8, 1.0, sd)
+    return (X_train - mu) / sd, (X_test - mu) / sd
+
+
+def _add_intercept(X):
+    """Append a ones column so the ridge fits a bias (feature-mean offset) UNPENALIZED-ish.
+
+    Without an intercept the ridge must reconstruct Y's per-dim mean from X alone, which is
+    dimension/scale dependent. The bias column absorbs the offset so lambda only regularizes the
+    linear map, not the mean.
+    """
+    return np.concatenate([X, np.ones((X.shape[0], 1), dtype=X.dtype)], axis=1)
+
+
 def align_error(X_train, Y_train, X_test, Y_test, lam):
-    """Fit ridge on train, report normalized residual on held-out test. Y is LayerNorm'd first."""
+    """Fit ridge (standardized X + intercept) on train, report 1-R^2 on held-out test.
+
+    X is standardized (train stats) + given an intercept so `lam` is comparable ACROSS encoders of
+    different dim/scale — the fix for the d_run-confounded metric_b (see _standardize). Y is
+    LayerNorm'd over the feature dim to match the trainer's forward_target target normalization.
+    """
+    Xtr, Xte = _standardize(X_train, X_test)
+    Xtr, Xte = _add_intercept(Xtr), _add_intercept(Xte)
     Y_train = layernorm_np(Y_train)
     Y_test = layernorm_np(Y_test)
-    W = ridge_fit(X_train, Y_train, lam)
-    return normalized_residual(X_test, Y_test, W)
+    W = ridge_fit(Xtr, Y_train, lam)
+    return normalized_residual(Xte, Y_test, W)
+
+
+def align_error_cv(X_train, Y_train, X_test, Y_test, lams=None, val_frac=0.2, seed=0):
+    """Per-cell lambda selection: split train into fit/val, pick lambda minimizing val 1-R^2, then
+    report on the held-out test with that lambda. Removes the fixed-lambda-across-sizes confound.
+    Returns (test_error, best_lam)."""
+    if lams is None:
+        lams = [1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0]
+    rng = np.random.default_rng(seed)
+    n = len(X_train)
+    perm = rng.permutation(n)
+    nval = max(1, int(val_frac * n))
+    vi, fi = perm[:nval], perm[nval:]
+    Xf, Yf, Xv, Yv = X_train[fi], Y_train[fi], X_train[vi], Y_train[vi]
+    best_lam, best_err = lams[0], float("inf")
+    for lam in lams:
+        e = align_error(Xf, Yf, Xv, Yv, lam)
+        if e < best_err:
+            best_err, best_lam = e, lam
+    return align_error(X_train, Y_train, X_test, Y_test, best_lam), best_lam
 
 
 # ----------------------------------------------------------------------------
@@ -166,10 +218,18 @@ def run(run_dir, t_star_ckpt, t_star_model, resolution, frames_per_clip, data_gl
     perm = rng.permutation(n)
     ntr = int(train_frac * n)
     tr, te = perm[:ntr], perm[ntr:]
-    err = align_error(X[tr], Y[tr], X[te], Y[te], lam)
+    # lam == "cv" (or <=0) -> per-cell lambda cross-validation (removes fixed-lam-across-sizes
+    # confound); else use the fixed lam. Both paths now standardize X + add an intercept.
+    if isinstance(lam, str) and lam.lower() == "cv" or (isinstance(lam, (int, float)) and lam <= 0):
+        err, chosen_lam = align_error_cv(X[tr], Y[tr], X[te], Y[te], seed=seed)
+        lam_out = f"cv:{chosen_lam:g}"
+    else:
+        err = align_error(X[tr], Y[tr], X[te], Y[te], float(lam))
+        lam_out = float(lam)
 
     out = {"metric_b_error": err, "d_run": int(X.shape[1]), "d_tstar": int(Y.shape[1]),
-           "n_tokens": int(n), "t_star_model": t_star_model, "lam": lam, "source": "frozen_tstar_linear"}
+           "n_tokens": int(n), "t_star_model": t_star_model, "lam": lam_out,
+           "x_standardized": True, "source": "frozen_tstar_linear"}
     with open(os.path.join(run_dir, "metric_B.json"), "w") as f:
         json.dump(out, f, indent=2)
     print(f"{os.path.basename(run_dir)}: metric_b_error={err:.4f} (d_run={X.shape[1]} -> d_T*={Y.shape[1]})")
@@ -307,7 +367,9 @@ def main():
                          "across cells when the clip set is identical).")
     ap.add_argument("--resolution", type=int, default=256)
     ap.add_argument("--frames", type=int, default=16)
-    ap.add_argument("--lam", type=float, default=1.0, help="ridge regularization")
+    ap.add_argument("--lam", default="cv",
+                    help="ridge regularization: a float, or 'cv' for per-cell lambda cross-validation "
+                         "(default; removes the fixed-lambda-across-encoder-sizes confound)")
     ap.add_argument("--max-clips", type=int, default=512)
     ap.add_argument("--subsample-tokens", type=int, default=64, help="tokens kept per clip (0=all)")
     ap.add_argument("--train-frac", type=float, default=0.7)
