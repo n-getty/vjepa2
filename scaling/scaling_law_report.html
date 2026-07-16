@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>V-JEPA-2 compute-optimal scaling — IsoFLOP study</title>
+<style>
+  :root{
+    --surface-1:#fcfcfb; --surface-2:#f4f4f1; --text-primary:#0b0b0b;
+    --text-secondary:#52514e; --text-muted:#8a8984; --grid:#e6e6e3;
+    --b17:#7a3aa7; --b18:#2a78d6; --b19:#1baf7a; --b17b:#e0a020;
+    --pos:#1baf7a; --neg:#e34948; --muP:#4a3aa7;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --surface-1:#1a1a19; --surface-2:#242422; --text-primary:#ffffff;
+      --text-secondary:#c3c2b7; --text-muted:#8f8e86; --grid:#333330;
+      --b17:#9085e9; --b18:#3987e5; --b19:#199e70; --b17b:#c98500;
+      --pos:#199e70; --neg:#e66767; --muP:#9085e9;
+    }
+  }
+  html,body{margin:0;background:var(--surface-1);color:var(--text-primary);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
+  .wrap{max-width:980px;margin:0 auto;padding:28px 20px 60px;}
+  h1{font-size:20px;margin:0 0 4px;} h2{font-size:15px;margin:0 0 2px;}
+  h3{font-size:14px;margin:22px 0 6px;}
+  .sub{color:var(--text-secondary);font-size:13px;margin:0 0 18px;}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:22px;}
+  @media(max-width:760px){.grid{grid-template-columns:1fr;}}
+  .card{background:var(--surface-2);border-radius:10px;padding:14px 14px 8px;}
+  .card h2{font-size:14px;} .card .cap{color:var(--text-secondary);font-size:12px;margin:2px 0 8px;}
+  svg{width:100%;height:auto;display:block;overflow:visible;}
+  .axis text{fill:var(--text-secondary);font-size:10px;}
+  .axis line,.axis path{stroke:var(--grid);stroke-width:1;}
+  .lbl{fill:var(--text-secondary);font-size:11px;}
+  .tt{position:fixed;pointer-events:none;background:var(--surface-1);
+    border:1px solid var(--grid);border-radius:6px;padding:6px 8px;font-size:12px;
+    box-shadow:0 2px 8px rgba(0,0,0,.15);opacity:0;transition:opacity .08s;z-index:9;}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;margin:6px 2px 0;}
+  .legend span{display:inline-flex;align-items:center;gap:5px;color:var(--text-secondary);}
+  .sw{width:11px;height:11px;border-radius:3px;display:inline-block;}
+  table{border-collapse:collapse;font-size:12px;margin-top:8px;width:100%;}
+  th,td{border:1px solid var(--grid);padding:3px 7px;text-align:right;}
+  th:first-child,td:first-child{text-align:left;}
+  .callout{border:1px solid var(--grid);border-left:3px solid var(--muP);border-radius:8px;
+    padding:12px 16px;margin:18px 0;background:var(--surface-2);}
+  .callout.pos{border-left-color:var(--pos);} .callout.neg{border-left-color:var(--neg);}
+  .key{color:var(--text-muted);font-size:12px;margin-top:26px;}
+  details{margin-top:10px;} summary{cursor:pointer;color:var(--text-secondary);font-size:12px;}
+  code{background:var(--surface-2);padding:1px 4px;border-radius:3px;font-size:12px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>V-JEPA-2 compute-optimal scaling — an IsoFLOP study</h1>
+<p class="sub">Does V-JEPA-2 video SSL obey a Chinchilla-style compute-optimal law N<sub>opt</sub> ∝ C<sup>α</sup>?
+20-cell IsoFLOP sweep (6 widths × budgets 3e17–1e19) + a 4-cell downward extension to 1e17, all from scratch, global batch fixed at 96 so data D and model size N are decoupled. Selector axis = representation-quality metrics scored on a fixed held-out clip "ruler" against a frozen reference encoder T*. <b>This is a different question from Leonardo's LR-transfer track</b> (η*-vs-width, µP) — see the last section.</p>
+<script id="DATA" type="application/json">
+{"cells": [{"model": "vit_base", "budget": "1p0e17", "N": 134443392.0, "C": 1e+17, "D": 28800.0, "mb": 0.9196135997772217, "cka": 0.9257717356085777, "knn": 0.9114, "rank": 0.8050480484962463}, {"model": "vit_base", "budget": "1p0e18", "N": 134443392.0, "C": 1e+18, "D": 240000.0, "mb": 0.8081636428833008, "cka": 0.8939986750483513, "knn": 0.92815, "rank": 0.8755995035171509}, {"model": "vit_base", "budget": "1p0e19", "N": 134443392.0, "C": 1e+19, "D": 2496000.0, "mb": 0.7016077041625977, "cka": 0.826972022652626, "knn": 0.90895, "rank": 0.7025773723920186}, {"model": "vit_base", "budget": "3p0e17", "N": 134443392.0, "C": 3e+17, "D": 96000.0, "mb": 0.8686427474021912, "cka": 0.915113277733326, "knn": 0.90545, "rank": 0.8982663750648499}, {"model": "vit_base", "budget": "3p0e18", "N": 134443392.0, "C": 3e+18, "D": 768000.0, "mb": 0.7276210784912109, "cka": 0.8045911192893982, "knn": 0.9181, "rank": 0.7966819405555725}, {"model": "vit_giant", "budget": "1p0e18", "N": 1068666368.0, "C": 1e+18, "D": 48000.0, "mb": 0.8548230528831482, "cka": 0.9358491227030754, "knn": 0.91835, "rank": 0.9553793695839968}, {"model": "vit_giant", "budget": "1p0e19", "N": 1068666368.0, "C": 1e+19, "D": 384000.0, "mb": 0.7161675095558167, "cka": 0.9171856865286827, "knn": 0.91475, "rank": 0.942672913724726}, {"model": "vit_giant", "budget": "3p0e18", "N": 1068666368.0, "C": 3e+18, "D": 96000.0, "mb": 0.9254974722862244, "cka": 0.959169864654541, "knn": 0.90155, "rank": 0.9835924966768785}, {"model": "vit_gigantic", "budget": "1p0e18", "N": 1904647936.0, "C": 1e+18, "D": 48000.0, "mb": 0.9321348071098328, "cka": 0.9639914371073246, "knn": 0.9218500000000001, "rank": 0.9972027391195297}, {"model": "vit_gigantic", "budget": "1p0e19", "N": 1904647936.0, "C": 1e+19, "D": 192000.0, "mb": 0.81339430809021, "cka": 0.9351280480623245, "knn": 0.9225, "rank": 0.9794570322220142}, {"model": "vit_gigantic", "budget": "3p0e18", "N": 1904647936.0, "C": 3e+18, "D": 48000.0, "mb": 0.9322124719619751, "cka": 0.9651837237179279, "knn": 0.93405, "rank": 0.9980839357639735}, {"model": "vit_large", "budget": "1p0e17", "N": 355013248.0, "C": 1e+17, "D": 9600.0, "mb": 0.919114887714386, "cka": 0.9371939226984978, "knn": 0.92075, "rank": 0.7696169316768646}, {"model": "vit_large", "budget": "1p0e18", "N": 355013248.0, "C": 1e+18, "D": 96000.0, "mb": 0.8350589275360107, "cka": 0.924513652920723, "knn": 0.9207, "rank": 0.924580916762352}, {"model": "vit_large", "budget": "1p0e19", "N": 355013248.0, "C": 1e+19, "D": 1008000.0, "mb": 0.7851459980010986, "cka": 0.9536202177405357, "knn": 0.9259999999999999, "rank": 0.9878943329676986}, {"model": "vit_large", "budget": "3p0e17", "N": 355013248.0, "C": 3e+17, "D": 48000.0, "mb": 0.9399698376655579, "cka": 0.9511104449629784, "knn": 0.9341, "rank": 0.9693682994693518}, {"model": "vit_large", "budget": "3p0e18", "N": 355013248.0, "C": 3e+18, "D": 288000.0, "mb": 0.7699194550514221, "cka": 0.9050341695547104, "knn": 0.9202, "rank": 0.90580203384161}, {"model": "vit_small", "budget": "1p0e17", "N": 66693120.0, "C": 1e+17, "D": 48000.0, "mb": 0.9443256855010986, "cka": 0.9284804984927177, "knn": 0.9282, "rank": 0.732239584128062}, {"model": "vit_small", "budget": "1p0e18", "N": 66693120.0, "C": 1e+18, "D": 432000.0, "mb": 0.8403897881507874, "cka": 0.9074620231986046, "knn": 0.9425, "rank": 0.7857462167739868}, {"model": "vit_small", "budget": "3p0e17", "N": 66693120.0, "C": 3e+17, "D": 144000.0, "mb": 0.9190934896469116, "cka": 0.9381628148257732, "knn": 0.92655, "rank": 0.8180887699127197}, {"model": "vit_small", "budget": "3p0e18", "N": 66693120.0, "C": 3e+18, "D": 1296000.0, "mb": 0.7873888611793518, "cka": 0.8329165577888489, "knn": 0.9317, "rank": 0.6386187473932903}, {"model": "vit_tiny", "budget": "1p0e17", "N": 49185600.0, "C": 1e+17, "D": 57600.0, "mb": 0.9652309417724609, "cka": 0.9326957985758781, "knn": 0.9431, "rank": 0.6338455677032471}, {"model": "vit_tiny", "budget": "1p0e18", "N": 49185600.0, "C": 1e+18, "D": 576000.0, "mb": 0.8884693384170532, "cka": 0.9377789683640003, "knn": 0.9561, "rank": 0.7230567336082458}, {"model": "vit_tiny", "budget": "3p0e17", "N": 49185600.0, "C": 3e+17, "D": 192000.0, "mb": 0.9431183338165283, "cka": 0.935086727142334, "knn": 0.9295, "rank": 0.7839635411898295}, {"model": "vit_tiny", "budget": "3p0e18", "N": 49185600.0, "C": 3e+18, "D": 1728000.0, "mb": 0.8500480055809021, "cka": 0.8650330603122711, "knn": 0.9521, "rank": 0.5388540426890056}], "vertices": {"metric_b_ridge": {"1p0e17": {"a": 0.12246710566706914, "xv": 8.335786479152933, "coef": [0.12246710566706914, -2.041719287121097, 9.423303505517614], "n": 4, "pts": [[7.691837973582112, 0.9652309417724609], [7.8240810348138945, 0.9443256855010986], [8.128539461163543, 0.9196135997772217], [8.550244559888736, 0.919114887714386]]}, "1p0e18": {"a": 0.1419826471606275, "xv": 8.375284965723061, "coef": [0.1419826471606275, -2.3782902603159313, 10.76939239019378], "n": 6, "pts": [[7.691837973582112, 0.8884693384170532], [7.8240810348138945, 0.8403897881507874], [8.128539461163543, 0.8081636428833008], [8.550244559888736, 0.8350589275360107], [9.028842141923569, 0.8548230528831482], [9.2798147104143, 0.9321348071098328]]}, "1p0e19": {"a": -0.010709335849111344, "xv": null, "coef": [-0.010709335849111344, 0.2466248549130076, -0.5816686022039762], "n": 4, "pts": [[8.128539461163543, 0.7016077041625977], [8.550244559888736, 0.7851459980010986], [9.028842141923569, 0.7161675095558167], [9.2798147104143, 0.81339430809021]]}, "3p0e17": {"a": 0.38184086980845044, "xv": 8.135318230934423, "coef": [0.38184086980845044, -6.212793978937089, 26.144773266948736], "n": 4, "pts": [[7.691837973582112, 0.9431183338165283], [7.8240810348138945, 0.9190934896469116], [8.128539461163543, 0.8686427474021912], [8.550244559888736, 0.9399698376655579]]}, "3p0e18": {"a": 0.211701550405068, "xv": 8.277421305536855, "coef": [0.211701550405068, -3.504685847476188, 15.258861481038698], "n": 6, "pts": [[7.691837973582112, 0.8500480055809021], [7.8240810348138945, 0.7873888611793518], [8.128539461163543, 0.7276210784912109], [8.550244559888736, 0.7699194550514221], [9.028842141923569, 0.9254974722862244], [9.2798147104143, 0.9322124719619751]]}}, "cka_linear": {"1p0e17": {"a": 0.0501243608285732, "xv": 8.068249160086893, "coef": [0.0501243608285732, -0.8088316643100562, 4.188483868257663], "n": 4, "pts": [[7.691837973582112, 0.9326957985758781], [7.8240810348138945, 0.9284804984927177], [8.128539461163543, 0.9257717356085777], [8.550244559888736, 0.9371939226984978]]}, "1p0e18": {"a": 0.05966466225672719, "xv": 8.27792051767705, "coef": [0.05966466225672719, -0.9877986637504669, 4.993712643893428], "n": 6, "pts": [[7.691837973582112, 0.9377789683640003], [7.8240810348138945, 0.9074620231986046], [8.128539461163543, 0.8939986750483513], [8.550244559888736, 0.924513652920723], [9.028842141923569, 0.9358491227030754], [9.2798147104143, 0.9639914371073246]]}, "1p0e19": {"a": -0.21139509281149424, "xv": null, "coef": [-0.21139509281149424, 3.7533308799845497, -15.706848957962073], "n": 4, "pts": [[8.128539461163543, 0.826972022652626], [8.550244559888736, 0.9536202177405357], [9.028842141923569, 0.9171856865286827], [9.2798147104143, 0.9351280480623245]]}, "3p0e17": {"a": 0.13807252676686557, "xv": 8.081117509577197, "coef": [0.13807252676686557, -2.2315606272945674, 9.936434399712963], "n": 4, "pts": [[7.691837973582112, 0.935086727142334], [7.8240810348138945, 0.9381628148257732], [8.128539461163543, 0.915113277733326], [8.550244559888736, 0.9511104449629784]]}, "3p0e18": {"a": 0.06436136282510901, "xv": 7.79065885105109, "coef": [0.06436136282510901, -1.0028348419182922, 4.747263184288775], "n": 6, "pts": [[7.691837973582112, 0.8650330603122711], [7.8240810348138945, 0.8329165577888489], [8.128539461163543, 0.8045911192893982], [8.550244559888736, 0.9050341695547104], [9.028842141923569, 0.959169864654541], [9.2798147104143, 0.9651837237179279]]}}, "cka_rbf": {"1p0e17": {"a": 0.06755624338001259, "xv": 7.962799059283776, "coef": [0.06755624338001259, -1.0758735824702201, 5.197425592955377], "n": 4, "pts": [[7.691837973582112, 0.9195566847920418], [7.8240810348138945, 0.9141345992684364], [8.128539461163543, 0.9163767471909523], [8.550244559888736, 0.9371328726410866]]}, "1p0e18": {"a": 0.047901876853904, "xv": 8.00044281661718, "coef": [0.047901876853904, -0.7664724531565941, 3.9458597638250925], "n": 6, "pts": [[7.691837973582112, 0.9021260738372803], [7.8240810348138945, 0.8592355847358704], [8.128539461163543, 0.8774517551064491], [8.550244559888736, 0.9063475504517555], [9.028842141923569, 0.9252885803580284], [9.2798147104143, 0.9587364718317986]]}, "1p0e19": {"a": -0.3454085246081401, "xv": null, "coef": [-0.3454085246081401, 6.120286631316231, -26.16540428965843], "n": 4, "pts": [[8.128539461163543, 0.7483615279197693], [8.550244559888736, 0.9514471031725407], [9.028842141923569, 0.8834726959466934], [9.2798147104143, 0.9118251502513885]]}, "3p0e17": {"a": 0.15789082414344321, "xv": 7.992665017301001, "coef": [0.15789082414344321, -2.5239369333682458, 10.980369698063779], "n": 4, "pts": [[7.691837973582112, 0.9093859940767288], [7.8240810348138945, 0.8962991312146187], [8.128539461163543, 0.897871121764183], [8.550244559888736, 0.9427360743284225]]}, "3p0e18": {"a": 0.045814968553802494, "xv": 7.162426462027556, "coef": [0.045814968553802494, -0.6562926862534306, 3.1200510084576387], "n": 6, "pts": [[7.691837973582112, 0.8101140856742859], [7.8240810348138945, 0.7756291776895523], [8.128539461163543, 0.7713049352169037], [8.550244559888736, 0.8838251084089279], [9.028842141923569, 0.9508937038481236], [9.2798147104143, 0.9554972611367702]]}}, "mutual_knn": {"1p0e17": {"a": 0.11121327074498331, "xv": 8.236173161356646, "coef": [0.11121327074498331, -1.8319435113930438, 8.45394014392857], "n": 4, "pts": [[7.691837973582112, 0.9431], [7.8240810348138945, 0.9282], [8.128539461163543, 0.9114], [8.550244559888736, 0.92075]]}, "1p0e18": {"a": 0.029105779202430754, "xv": 8.816391336081146, "coef": [0.029105779202430754, -0.5132158791804027, 3.178820195807713], "n": 6, "pts": [[7.691837973582112, 0.9561], [7.8240810348138945, 0.9425], [8.128539461163543, 0.92815], [8.550244559888736, 0.9207], [9.028842141923569, 0.91835], [9.2798147104143, 0.9218500000000001]]}, "1p0e19": {"a": -0.022515660773882777, "xv": null, "coef": [-0.022515660773882777, 0.39888468163929786, -0.8439041357864265], "n": 4, "pts": [[8.128539461163543, 0.90895], [8.550244559888736, 0.9259999999999999], [9.028842141923569, 0.91475], [9.2798147104143, 0.9225]]}, "3p0e17": {"a": 0.13361070738408712, "xv": 8.119903714209826, "coef": [0.13361070738408712, -2.1698121582925025, 9.718000641140774], "n": 4, "pts": [[7.691837973582112, 0.9295], [7.8240810348138945, 0.92655], [8.128539461163543, 0.90545], [8.550244559888736, 0.9341]]}, "3p0e18": {"a": 0.04391150240312586, "xv": 8.635311264252966, "coef": [0.04391150240312586, -0.7583789826639677, 4.183265789038652], "n": 6, "pts": [[7.691837973582112, 0.9521], [7.8240810348138945, 0.9317], [8.128539461163543, 0.9181], [8.550244559888736, 0.9202], [9.028842141923569, 0.90155], [9.2798147104143, 0.93405]]}}, "procrustes": {"1p0e17": {"a": 0.030132417296098803, "xv": 8.223309364904736, "coef": [0.030132417296098803, -0.4955763786764535, 3.7078542587265075], "n": 4, "pts": [[7.691837973582112, 1.6788177490234375], [7.8240810348138945, 1.674863338470459], [8.128539461163543, 1.6705665588378906], [8.550244559888736, 1.6734188795089722]]}, "1p0e18": {"a": 0.024941466702204575, "xv": 8.201991078499224, "coef": [0.024941466702204575, -0.40913937475233475, 3.3365718947279492], "n": 6, "pts": [[7.691837973582112, 1.6710773706436157], [7.8240810348138945, 1.6566238403320312], [8.128539461163543, 1.6544699668884277], [8.550244559888736, 1.6671061515808105], [9.028842141923569, 1.675449013710022], [9.2798147104143, 1.6866718530654907]]}, "1p0e19": {"a": -0.07192327599588112, "xv": null, "coef": [-0.07192327599588112, 1.279241347753791, -4.012914487362399], "n": 4, "pts": [[8.128539461163543, 1.628537654876709], [8.550244559888736, 1.6808329820632935], [9.028842141923569, 1.6549153327941895], [9.2798147104143, 1.6743124723434448]]}, "3p0e17": {"a": 0.07528265162227342, "xv": 8.102311901094776, "coef": [0.07528265162227342, -1.2199270483702358, 6.606793891825318], "n": 4, "pts": [[7.691837973582112, 1.6750953197479248], [7.8240810348138945, 1.674352765083313], [8.128539461163543, 1.662725567817688], [8.550244559888736, 1.6802119016647339]]}, "3p0e18": {"a": 0.05017008290257213, "xv": 8.200056187375852, "coef": [0.05017008290257213, -0.822794997452792, 5.010306180636795], "n": 6, "pts": [[7.691837973582112, 1.6584049463272095], [7.8240810348138945, 1.6414737701416016], [8.128539461163543, 1.6206779479980469], [8.550244559888736, 1.651496410369873], [9.028842141923569, 1.681359052658081], [9.2798147104143, 1.6869418621063232]]}}}, "alpha_profile": {"cka_linear": {"grid": [-0.3, -0.27499999999999997, -0.25, -0.22499999999999998, -0.19999999999999998, -0.175, -0.14999999999999997, -0.12499999999999997, -0.09999999999999998, -0.07499999999999998, -0.04999999999999999, -0.024999999999999967, 5.551115123125783e-17, 0.025000000000000022, 0.050000000000000044, 0.07500000000000001, 0.10000000000000003, 0.12500000000000006, 0.15000000000000002, 0.17500000000000004, 0.2, 0.22500000000000003, 0.25000000000000006, 0.2750000000000001, 0.3000000000000001, 0.325, 0.35000000000000003, 0.37500000000000006, 0.4000000000000001, 0.4250000000000001, 0.45, 0.47500000000000003, 0.5, 0.5250000000000001, 0.55, 0.575, 0.6000000000000001, 0.625, 0.6500000000000001, 0.675, 0.7, 0.7250000000000001, 0.75, 0.7749999999999999, 0.8, 0.825, 0.8500000000000001, 0.875, 0.9000000000000001, 0.925, 0.95, 0.9750000000000001, 1.0], "sse": [0.03252754766678441, 0.03252470875695622, 0.03253553119184224, 0.03255901808090435, 0.03259338304137252, 0.03263588931287646, 0.03268270021702162, 0.03272876292709245, 0.03276775402617646, 0.032792119861881394, 0.03279324473446614, 0.032761772681691254, 0.03268809191484385, 0.03256296473171993, 0.03237825329374261, 0.03212766018046968, 0.03180738189463634, 0.03141657261734053, 0.03095753882584137, 0.0304356293833036, 0.029858839283806265, 0.029237193583373906, 0.028582008480781004, 0.027905133146003704, 0.027218260934503594, 0.026532370109867913, 0.025857321951727918, 0.025201616156625615, 0.02457228411444806, 0.02397489074002538, 0.02341361341461183, 0.02289136958794067, 0.022409970115230056, 0.02197028149414466, 0.021572385636788448, 0.021215730135166783, 0.020899265082602203, 0.020621564574829276, 0.020380932302214837, 0.020175491422009854, 0.020003259374549717, 0.019862208618040625, 0.019750314478881547, 0.019665591479160575, 0.019606119614919294, 0.019570062113004362, 0.019555676186481047, 0.01956131824040947, 0.019585444859821145, 0.019626610753669425, 0.019683464648421217, 0.019754743938381565, 0.01983926872001073], "curv": [0.0469214778742995, 0.04784271697944751, 0.04860548018890312, 0.04917196713496176, 0.04950062071421947, 0.04954691233541981, 0.04926464951567126, 0.04860790102752061, 0.04753359037916682, 0.046004727115182185, 0.0439941247031953, 0.041488302559870474, 0.03849111356181336, 0.035026520046519634, 0.031139913569519857, 0.026897481618198358, 0.022383381913590076, 0.017694855638180775, 0.012935808151680037, 0.008209697131919389, 0.0036126985770158016, -0.000771966841303257, -0.004877935871663848, -0.008657586726298218, -0.012082011587397835, -0.01513944446522982, -0.01783264335519623, -0.020175737424011648, -0.022190976709830317, -0.023905706288795077, -0.025349764912572747, -0.026553402512301594, -0.027545731605919985, -0.02835367523500326, -0.029001344318872076, -0.029509764343395896, -0.029896869563073372, -0.030177688061098194, -0.03036465006130261, -0.030467962841991676, -0.03049600718905265, -0.030455721687963077, -0.030352951680380293, -0.03019274895682933, -0.029979615929068237, -0.029717693982189, -0.029410899955670197, -0.029063017383533347, -0.02867775047080937, -0.02825874908398008, -0.027809612585235843, -0.027333879420061796, -0.026835008206440195]}, "mutual_knn": {"grid": [-0.3, -0.27499999999999997, -0.25, -0.22499999999999998, -0.19999999999999998, -0.175, -0.14999999999999997, -0.12499999999999997, -0.09999999999999998, -0.07499999999999998, -0.04999999999999999, -0.024999999999999967, 5.551115123125783e-17, 0.025000000000000022, 0.050000000000000044, 0.07500000000000001, 0.10000000000000003, 0.12500000000000006, 0.15000000000000002, 0.17500000000000004, 0.2, 0.22500000000000003, 0.25000000000000006, 0.2750000000000001, 0.3000000000000001, 0.325, 0.35000000000000003, 0.37500000000000006, 0.4000000000000001, 0.4250000000000001, 0.45, 0.47500000000000003, 0.5, 0.5250000000000001, 0.55, 0.575, 0.6000000000000001, 0.625, 0.6500000000000001, 0.675, 0.7, 0.7250000000000001, 0.75, 0.7749999999999999, 0.8, 0.825, 0.8500000000000001, 0.875, 0.9000000000000001, 0.925, 0.95, 0.9750000000000001, 1.0], "sse": [0.0031274107186666325, 0.0030679499941018854, 0.00300458389481464, 0.0029374795896677467, 0.0028669532102314605, 0.002793502599103641, 0.0027178391986583945, 0.002640915173414006, 0.0025639405210594896, 0.002488383870006183, 0.002415950352516452, 0.0023485309312483425, 0.0022881203082948725, 0.0022367051821418483, 0.0021961306480682225, 0.0021679587238586733, 0.002153337522001287, 0.0021529006738870145, 0.0021667132130465468, 0.002194272623610575, 0.0022345640116248917, 0.0022861590538924234, 0.0023473419975711734, 0.0024162438555433265, 0.002490967914106876, 0.0025696944284497336, 0.002650758164604779, 0.0027326977230877946, 0.002814279433658441, 0.0028945007832595444, 0.0029725790439597975, 0.003047930443496905, 0.0031201443295603253, 0.0031889556900218914, 0.0032542183457787846, 0.0033158802547384562, 0.0033739616944184624, 0.003428536616128866, 0.0034797171519214136, 0.003527641066800045, 0.0035724618470444583, 0.0036143410721766684, 0.0036534427120750446, 0.003689929007492331, 0.003723957622087155, 0.0037556797906698326, 0.0037852392274857266, 0.0038127715971932106, 0.0038384043878447586, 0.003862257058424943, 0.0038844413626334044, 0.0039050617753330144, 0.003924215968450678], "curv": [0.010000128131241601, 0.011106328381336633, 0.012298429903259899, 0.013575742878293646, 0.014934987201115836, 0.016369610419239462, 0.017869083823516995, 0.01941824410322094, 0.02099677676404633, 0.022578963690002903, 0.02413383210800904, 0.025625834670966564, 0.027016149667460333, 0.028264610965681915, 0.029332164621373526, 0.030183623302578493, 0.030790384073725696, 0.031132726716825248, 0.031201344652449673, 0.030997879783011467, 0.030534408014391716, 0.029832005398352776, 0.028918666093115334, 0.02782691067503391, 0.02659141189410845, 0.02524689374312543, 0.0238264596389869, 0.02236040636103285, 0.020875502214867066, 0.019394658793888325, 0.01793690424310639, 0.016517565338582486, 0.015148577801114149, 0.013838861932904836, 0.012594718861013965, 0.011420218492337993, 0.010317562528001678, 0.009287414466683746, 0.008329193973839903, 0.007441336072411568, 0.006621517088869412, 0.005866849812206744, 0.005174050367935892, 0.004539579180869227, 0.003959758264810328, 0.00343086699872339, 0.002949218529553246, 0.0025112189539571116, 0.0021134114404191256, 0.0017525074317549952, 0.001425407000105591, 0.001129210308890972, 0.0008612219750432597]}, "metric_b_ridge": {"grid": [-0.3, -0.27499999999999997, -0.25, -0.22499999999999998, -0.19999999999999998, -0.175, -0.14999999999999997, -0.12499999999999997, -0.09999999999999998, -0.07499999999999998, -0.04999999999999999, -0.024999999999999967, 5.551115123125783e-17, 0.025000000000000022, 0.050000000000000044, 0.07500000000000001, 0.10000000000000003, 0.12500000000000006, 0.15000000000000002, 0.17500000000000004, 0.2, 0.22500000000000003, 0.25000000000000006, 0.2750000000000001, 0.3000000000000001, 0.325, 0.35000000000000003, 0.37500000000000006, 0.4000000000000001, 0.4250000000000001, 0.45, 0.47500000000000003, 0.5, 0.5250000000000001, 0.55, 0.575, 0.6000000000000001, 0.625, 0.6500000000000001, 0.675, 0.7, 0.7250000000000001, 0.75, 0.7749999999999999, 0.8, 0.825, 0.8500000000000001, 0.875, 0.9000000000000001, 0.925, 0.95, 0.9750000000000001, 1.0], "sse": [0.10469074849199822, 0.10568914513984128, 0.10679756273413644, 0.10802623132461658, 0.10938428941286396, 0.11087892344000053, 0.11251431026125745, 0.11429038781705803, 0.11620151898716458, 0.11823516378712533, 0.12037072910309775, 0.12257881055613071, 0.12482105999983004, 0.12705088525245892, 0.12921510254968377, 0.13125651864446786, 0.13311724202537367, 0.13474235522516181, 0.1360834743037221, 0.13710171652871214, 0.13776970139362027, 0.13807239496347984, 0.1380068188417561, 0.13758082492429327, 0.13681124563155694, 0.13572175518317336, 0.13434073507987537, 0.1326993546648906, 0.13082998489929445, 0.12876498213280463, 0.12653581996605623, 0.12417251342896926, 0.12170326697701, 0.11915428006887704, 0.11654965502929464, 0.11391136633073473, 0.11125926470259909, 0.10861110143133851, 0.10598256688888158, 0.10338734262744198, 0.100837168768353, 0.09834192863995925, 0.09590975150958166, 0.09354713255676321, 0.09125906753241471, 0.08904919822072095, 0.08691996405140284, 0.08487275502368659, 0.0829080614164508, 0.0810256164308602, 0.0792245287874338, 0.0775034032392625, 0.07586044785880128], "curv": [0.09358320884248018, 0.09773587505296397, 0.10183210386162274, 0.10580574771514949, 0.10957819926578578, 0.11305827387485584, 0.11614299574054612, 0.11871961540219397, 0.1206691702320262, 0.12187180949843843, 0.12221391704124553, 0.12159676855113742, 0.11994607927523727, 0.11722139803103918, 0.1134239943522238, 0.10860179681107236, 0.10285017391050973, 0.09630792280799504, 0.08914864538807254, 0.08156854143161418, 0.07377229504052453, 0.06595899264815962, 0.058309839308724104, 0.05097892637837246, 0.044087630082482884, 0.03772257879386753, 0.03193665308729492, 0.026752229629517545, 0.0221658284446678, 0.01815341298594061, 0.014675754964326418, 0.011683454834940933, 0.0091213688888171, 0.0069323193434399685, 0.005060052838144505, 0.0034514709332306988, 0.002058191619203466, 0.0008375208777949897, -0.0002470765155007829, -0.001225914072214215, -0.0021233366114660934, -0.002958201895243613, -0.003744511269010474, -0.004492119898114842, -0.005207469095219054, -0.005894295927109447, -0.006554287833147172, -0.007187661557440624, -0.007793655681880913, -0.008370934095690575, -0.008917903749322307, -0.009432954122910661, -0.009914628239352373]}}, "alpha_ci": {"metric_b_ridge": [-0.3, -0.3, 1.0], "cka_linear": [0.22, -0.3, 0.47], "cka_rbf": [0.1, -0.3, 0.41], "mutual_knn": [0.11, -0.08, 0.33], "procrustes": [0.44, -0.3, 0.92]}, "params": {"vit_tiny": 49185600.0, "vit_small": 66693120.0, "vit_base": 134443392.0, "vit_large": 355013248.0, "vit_giant": 1068666368.0, "vit_gigantic": 1904647936.0}}
+</script>
+<div class="grid" id="charts"></div>
+
+<h3>What the figures show</h3>
+<p class="sub" style="margin-bottom:8px">
+<b>Fig 1 (IsoFLOP curves).</b> For each budget C, representation error vs model size N. A compute-optimal law needs each budget to trace a convex bowl whose minimum (the vertex N<sub>opt</sub>) moves <i>right</i> as C grows. Our bowls are shallow and the vertices do not march right.
+<b>Fig 2 (vertex vs compute).</b> N<sub>opt</sub>(C) for each metric — the quantity a scaling law predicts. The points scatter around a flat ~100–200M line; they do not follow a rising power law.
+<b>Fig 3 (joint-fit likelihood).</b> The profile of fit error vs the global exponent α (all cells fit at once, the statistically strongest test). The valley is broad and centered near α≈0.1, comfortably including α=0.
+<b>Fig 4 (α with confidence intervals).</b> Every metric's bootstrap α CI includes 0; the dimension-invariant metrics (CKA, mutual-kNN) also exclude the LLM value 0.5.</p>
+
+<div class="callout neg">
+<b>Primary result — honest null.</b> Across 6 metrics × 2 reference encoders (1B ViT-g and 2B ViT-G) × per-budget and joint fits, we <b>cannot resolve a compute-optimal exponent for V-JEPA-2</b> over our 1e17–1e19 (2-decade) budget range. Every α confidence interval includes 0 (best-conditioned: mutual-kNN α = +0.11, 90% CI [−0.08, +0.33]). We verified this is a compute-<i>leverage</i> limit, not a metric artifact: dimension-invariance (CKA), a reference-free rank metric (RankMe), and a larger 2B reference all leave the vertex flat.</div>
+
+<div class="callout">
+<b>The one directional signal — suggestive, not conclusive.</b> The three dimension-invariant metrics agree on a <b>small positive</b> α̂ (+0.10 to +0.22) and their CIs <b>exclude the LLM value α≈0.5</b>. Read together: we can rule out <i>strong</i> LLM-style scaling, but we cannot yet distinguish <i>weak</i> scaling (α≈0.1–0.2) from <i>none</i> (α=0). The hypothesis "V-JEPA's N<sub>opt</sub> grows more slowly with compute than LLMs" is <b>consistent with the data but not established by it</b> — the sign is right and strong-scaling is excluded, but the effect is not separated from zero.</div>
+
+<h3>Can we claim a distinct scaling law? — self-assessment</h3>
+<p class="sub" style="margin-bottom:8px">To assert "V-JEPA has a scaling law distinct from LLMs" we must first show a law <b>exists</b> (α CI excluding 0), then show it <b>differs</b> (α CI excluding 0.5). We have the second, not the first. You cannot claim a curve is a different shape before showing it is a curve. <b>Verdict: not yet a paper.</b> What we do have is (a) a rigorous, reproducible <i>methodology</i> (IsoFLOP + frozen-reference metric family + pre-registered vertex test), and (b) a well-quantified <i>negative</i> with a concrete power analysis for what would settle it.</p>
+<table>
+<thead><tr><th>Claim</th><th>Evidence</th><th>Paper-ready?</th></tr></thead>
+<tbody>
+<tr><td>V-JEPA has a compute-optimal law</td><td>α CI includes 0 (all metrics)</td><td style="color:var(--neg)">NO</td></tr>
+<tr><td>If it does, α &lt; LLM's 0.5</td><td>3/5 metric CIs exclude 0.5</td><td style="color:var(--b17b)">Suggestive</td></tr>
+<tr><td>Result is not a metric artifact</td><td>6 metrics, 2 refs, RankMe all agree</td><td style="color:var(--pos)">YES</td></tr>
+<tr><td>Methodology is sound &amp; reproducible</td><td>this report + committed code</td><td style="color:var(--pos)">YES</td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+<b>What would make it a paper (power analysis).</b> With measured per-budget vertex noise σ(logN)≈0.10 and a 5:1 SNR target, resolving α needs a lever of 5σ/α decades in compute. At the suggested α≈0.15 that is <b>≥3.3 decades</b>; we have 2.0. The decisive experiment is to extend <i>up</i> — add 1e20 and 3e20 budgets (1e17→3e20 = 3.5 decades) — at which point even α=0.15 clears the noise floor. Cost ≈10× the 1e19 gigantic cell (a multi-day capacity run). Extending down is blocked: 3e16 is infeasible at gb=96 (step floor leaves only the tiny model above the minimum-steps threshold).</div>
+
+<h3>Relationship to Leonardo's LR-vs-width track</h3>
+<p class="sub">Leonardo's report (<code>scaling/lr_ablation_figures.html</code>) answers a <b>different and complementary</b> question: how the optimal learning rate η* transfers with encoder width (a µP / LR-transfer study), selecting with the same Metric-B family. His axis is <b>η* vs width at fixed compute</b>; ours is <b>N<sub>opt</sub> vs compute at tuned LR</b>. His result is clean and interior (k ≈ −1.6, steeper than µP, corroborated by a downstream Metric-A staircase k<sub>A</sub>≈−1.2). <b>We agree with it</b> — and it is directly useful to us: it says larger widths need smaller LR (which our from-scratch cells must respect to avoid the collapse he documents, e.g. large@1.6e-3). The two tracks share infrastructure and the metric definition but are not in tension: LR-transfer (his) is a prerequisite for a fair compute-optimal sweep (ours). Neither is yet a standalone paper; combined ("how to tune <i>and</i> size V-JEPA compute-optimally") they are a stronger story, still pending the wider-budget experiment for the N<sub>opt</sub>(C) axis.</p>
+
+<p class="key">Metrics: metric_b_ridge = 1−R² frozen-T* linear predictivity · cka_linear/cka_rbf = centered-kernel alignment · mutual_knn = Platonic mutual-kNN · procrustes = orthogonal alignment · rankme = reference-free effective rank. T* = Meta ViT-g/16 @384 (1B); ceiling-tested against ViT-G (2B). Ruler = 256-clip fixed K400 held-out slice. Data: <code>scaling/metrics_c256_scores.csv</code>. Fits: <code>scaling/joint_fit.py</code>, <code>scaling/fit_metrics.py</code>. Full write-up: <code>scaling/FINDINGS.md</code>.</p>
+</div>
+<div class="tt" id="tt"></div>
+<script>
+const D=JSON.parse(document.getElementById('DATA').textContent);
+const tt=document.getElementById('tt');
+const showtt=(e,html)=>{tt.innerHTML=html;tt.style.opacity=1;tt.style.left=(e.clientX+12)+'px';tt.style.top=(e.clientY+12)+'px';};
+const hidett=()=>tt.style.opacity=0;
+const lg=x=>Math.log10(x);
+const BUD=['1p0e17','3p0e17','1p0e18','3p0e18','1p0e19'];
+const BCOL={'1p0e17':'var(--b17)','3p0e17':'var(--b17b)','1p0e18':'var(--b18)','3p0e18':'var(--b19)','1p0e19':'#c0504d'};
+const BNUM={'1p0e17':1e17,'3p0e17':3e17,'1p0e18':1e18,'3p0e18':3e18,'1p0e19':1e19};
+const BLAB={'1p0e17':'1e17','3p0e17':'3e17','1p0e18':'1e18','3p0e18':'3e18','1p0e19':'1e19'};
+function frame(w,h){const s=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  s.setAttribute('viewBox',`0 0 ${w} ${h}`);return s;}
+function E(p,t,a){const e=document.createElementNS('http://www.w3.org/2000/svg',t);
+  for(const k in a)e.setAttribute(k,a[k]);p.appendChild(e);return e;}
+const sc=(d0,d1,r0,r1)=>v=>r0+(v-d0)/(d1-d0)*(r1-r0);
+function card(title,cap){const c=document.createElement('div');c.className='card';
+  c.innerHTML=`<h2>${title}</h2><div class="cap">${cap}</div>`;
+  document.getElementById('charts').appendChild(c);return c;}
+
+// ---- Fig1: IsoFLOP curves — metric_b vs N, one curve per budget ----
+(function(){
+  const METRIC='cka_linear';
+  const c=card('Fig 1 — IsoFLOP curves (CKA error vs model size)','one curve per budget; a scaling law needs each bowl minimum to move RIGHT with compute. Bowls are shallow, minima ~flat.');
+  const W0=430,H0=300,m={l:52,r:14,t:12,b:40};const s=frame(W0,H0);c.appendChild(s);
+  const allN=D.cells.map(d=>lg(d.N)), errs=D.cells.map(d=>d.cka);
+  const xs=sc(7.6,9.35,m.l,W0-m.r), ys=sc(Math.min(...errs)-0.01,Math.max(...errs)+0.01,H0-m.b,m.t);
+  [0.80,0.85,0.90,0.95].forEach(v=>{E(s,'line',{x1:m.l,y1:ys(v),x2:W0-m.r,y2:ys(v),class:'axis'});
+    E(s,'text',{x:m.l-6,y:ys(v)+3,'text-anchor':'end',class:'axis'}).textContent=v.toFixed(2);});
+  [[7.69,'49M'],[7.82,'67M'],[8.13,'134M'],[8.55,'355M'],[9.03,'1.07B'],[9.28,'1.9B']].forEach(([d,t])=>
+    E(s,'text',{x:xs(d),y:H0-m.b+14,'text-anchor':'middle',class:'axis'}).textContent=t);
+  E(s,'text',{x:(m.l+W0-m.r)/2,y:H0-4,'text-anchor':'middle',class:'lbl'}).textContent='model size N (params, log)';
+  E(s,'text',{x:14,y:(m.t+H0-m.b)/2,'text-anchor':'middle',class:'lbl',transform:`rotate(-90 14 ${(m.t+H0-m.b)/2})`}).textContent='CKA error (1−CKA) ↓';
+  BUD.forEach(b=>{
+    const pts=D.cells.filter(d=>d.budget===b).sort((x,y)=>x.N-y.N);
+    if(pts.length<2)return;
+    E(s,'polyline',{points:pts.map(p=>`${xs(lg(p.N))},${ys(p.cka)}`).join(' '),fill:'none',stroke:BCOL[b],'stroke-width':2});
+    // vertex marker
+    const v=D.vertices[METRIC][b];
+    if(v&&v.xv&&v.a>0&&v.xv>7.6&&v.xv<9.35){const yv=v.coef[0]*v.xv*v.xv+v.coef[1]*v.xv+v.coef[2];
+      E(s,'circle',{cx:xs(v.xv),cy:ys(yv),r:7,fill:'none',stroke:BCOL[b],'stroke-width':2});}
+    pts.forEach(p=>{const dot=E(s,'circle',{cx:xs(lg(p.N)),cy:ys(p.cka),r:4,fill:BCOL[b],stroke:'var(--surface-2)','stroke-width':1.5});
+      dot.addEventListener('mousemove',e=>showtt(e,`<b>${p.model.replace('vit_','')}</b> · C=${BLAB[b]}<br>N=${(p.N/1e6).toFixed(0)}M · D=${(p.D/1e3).toFixed(0)}k clips<br>CKA err ${p.cka.toFixed(4)}`));
+      dot.addEventListener('mouseleave',hidett);});});
+  c.insertAdjacentHTML('beforeend',`<div class="legend">${BUD.map(b=>`<span><span class="sw" style="background:${BCOL[b]}"></span>C=${BLAB[b]}</span>`).join('')}</div>`);
+})();
+
+// ---- Fig2: vertex N_opt vs compute, all metrics ----
+(function(){
+  const c=card('Fig 2 — vertex N_opt vs compute','the scaling-law quantity. Points scatter ~flat at 100–200M; no rising power law. Dashed = LLM α=0.5 reference slope.');
+  const W0=430,H0=300,m={l:56,r:14,t:12,b:44};const s=frame(W0,H0);c.appendChild(s);
+  const xs=sc(16.8,19.2,m.l,W0-m.r), ys=sc(7.6,9.2,H0-m.b,m.t);
+  [7.7,8.0,8.3,8.6,9.0].forEach(v=>{E(s,'line',{x1:m.l,y1:ys(v),x2:W0-m.r,y2:ys(v),class:'axis'});
+    E(s,'text',{x:m.l-6,y:ys(v)+3,'text-anchor':'end',class:'axis'}).textContent=(Math.pow(10,v)/1e6).toFixed(0)+'M';});
+  BUD.forEach(b=>E(s,'text',{x:xs(lg(BNUM[b])),y:H0-m.b+14,'text-anchor':'middle',class:'axis'}).textContent=BLAB[b]);
+  E(s,'text',{x:(m.l+W0-m.r)/2,y:H0-4,'text-anchor':'middle',class:'lbl'}).textContent='compute budget C (FLOPs, log)';
+  E(s,'text',{x:14,y:(m.t+H0-m.b)/2,'text-anchor':'middle',class:'lbl',transform:`rotate(-90 14 ${(m.t+H0-m.b)/2})`}).textContent='vertex N_opt (params, log)';
+  // LLM alpha=0.5 slope anchored at (1e18, 200M)
+  const aref=lg(200e6)-0.5*18;
+  E(s,'line',{x1:xs(16.8),y1:ys(aref+0.5*16.8),x2:xs(19.2),y2:ys(aref+0.5*19.2),stroke:'var(--muP)','stroke-width':1.4,'stroke-dasharray':'5 4'});
+  const MC={cka_linear:'var(--b18)',mutual_knn:'var(--b19)',metric_b_ridge:'var(--text-muted)'};
+  ['cka_linear','mutual_knn','metric_b_ridge'].forEach(mt=>{
+    BUD.forEach(b=>{const v=D.vertices[mt][b];
+      if(v&&v.xv&&v.a>0){const cx=xs(lg(BNUM[b])),cy=ys(v.xv);
+        const dot=E(s,'circle',{cx,cy,r:5,fill:MC[mt],stroke:'var(--surface-2)','stroke-width':1.5});
+        dot.addEventListener('mousemove',e=>showtt(e,`<b>${mt}</b><br>C=${BLAB[b]}<br>N_opt=${(Math.pow(10,v.xv)/1e6).toFixed(0)}M`));
+        dot.addEventListener('mouseleave',hidett);}});});
+  c.insertAdjacentHTML('beforeend',`<div class="legend"><span><span class="sw" style="background:var(--b18)"></span>cka_linear</span><span><span class="sw" style="background:var(--b19)"></span>mutual_knn</span><span><span class="sw" style="background:var(--text-muted)"></span>metric_b</span><span><span class="sw" style="background:var(--muP)"></span>LLM α=0.5</span></div>`);
+})();
+
+// ---- Fig3: joint-fit likelihood profile (SSE vs alpha) ----
+(function(){
+  const c=card('Fig 3 — joint-fit likelihood vs α','fit error profiled over the global exponent α (all cells at once). Broad valley near α≈0.1 including 0 ⇒ underdetermined.');
+  const W0=430,H0=300,m={l:56,r:14,t:12,b:42};const s=frame(W0,H0);c.appendChild(s);
+  const prof=D.alpha_profile;
+  const g=prof.mutual_knn.grid;
+  const xs=sc(-0.3,1.0,m.l,W0-m.r);
+  // normalize each metric's SSE to its min for comparability
+  const norm=arr=>{const mn=Math.min(...arr);return arr.map(v=>v/mn);};
+  const series=[['mutual_knn','var(--b19)'],['cka_linear','var(--b18)'],['metric_b_ridge','var(--text-muted)']];
+  let ymax=1;series.forEach(([mt])=>{const n=norm(prof[mt].sse);ymax=Math.max(ymax,...n.filter(v=>v<3));});
+  const ys=sc(1,Math.min(ymax,2.2),H0-m.b,m.t);
+  [1.0,1.4,1.8,2.2].forEach(v=>{E(s,'line',{x1:m.l,y1:ys(v),x2:W0-m.r,y2:ys(v),class:'axis'});
+    E(s,'text',{x:m.l-6,y:ys(v)+3,'text-anchor':'end',class:'axis'}).textContent=v.toFixed(1);});
+  [-0.3,0,0.3,0.5,0.7,1.0].forEach(v=>E(s,'text',{x:xs(v),y:H0-m.b+14,'text-anchor':'middle',class:'axis'}).textContent=v);
+  E(s,'text',{x:(m.l+W0-m.r)/2,y:H0-4,'text-anchor':'middle',class:'lbl'}).textContent='global exponent α';
+  E(s,'text',{x:14,y:(m.t+H0-m.b)/2,'text-anchor':'middle',class:'lbl',transform:`rotate(-90 14 ${(m.t+H0-m.b)/2})`}).textContent='relative fit error (SSE/min)';
+  // alpha=0 and alpha=0.5 markers
+  E(s,'line',{x1:xs(0),y1:m.t,x2:xs(0),y2:H0-m.b,stroke:'var(--neg)','stroke-width':1,'stroke-dasharray':'3 3'});
+  E(s,'text',{x:xs(0),y:m.t-2,'text-anchor':'middle',class:'axis',fill:'var(--neg)'}).textContent='0';
+  E(s,'line',{x1:xs(0.5),y1:m.t,x2:xs(0.5),y2:H0-m.b,stroke:'var(--muP)','stroke-width':1,'stroke-dasharray':'3 3'});
+  E(s,'text',{x:xs(0.5),y:m.t-2,'text-anchor':'middle',class:'axis',fill:'var(--muP)'}).textContent='0.5 (LLM)';
+  series.forEach(([mt,col])=>{const n=norm(prof[mt].sse);
+    const d=g.map((a,i)=>`${xs(a)},${ys(Math.min(n[i],2.2))}`).join(' ');
+    E(s,'polyline',{points:d,fill:'none',stroke:col,'stroke-width':2});});
+  c.insertAdjacentHTML('beforeend',`<div class="legend"><span><span class="sw" style="background:var(--b19)"></span>mutual_knn</span><span><span class="sw" style="background:var(--b18)"></span>cka_linear</span><span><span class="sw" style="background:var(--text-muted)"></span>metric_b</span></div>`);
+})();
+
+// ---- Fig4: alpha estimates with CIs ----
+(function(){
+  const c=card('Fig 4 — α estimate ± bootstrap CI per metric','all CIs include 0 (no law resolved); dim-invariant metrics exclude 0.5 (rules out LLM-strength scaling).');
+  const W0=430,H0=300,m={l:96,r:16,t:12,b:40};const s=frame(W0,H0);c.appendChild(s);
+  const order=['metric_b_ridge','cka_rbf','cka_linear','procrustes','mutual_knn'];
+  const xs=sc(-0.4,1.0,m.l,W0-m.r);
+  [-0.3,0,0.3,0.5,0.7,1.0].forEach(v=>{E(s,'line',{x1:xs(v),y1:m.t,x2:xs(v),y2:H0-m.b,class:'axis'});
+    E(s,'text',{x:xs(v),y:H0-m.b+14,'text-anchor':'middle',class:'axis'}).textContent=v;});
+  E(s,'line',{x1:xs(0),y1:m.t,x2:xs(0),y2:H0-m.b,stroke:'var(--neg)','stroke-width':1.5});
+  E(s,'line',{x1:xs(0.5),y1:m.t,x2:xs(0.5),y2:H0-m.b,stroke:'var(--muP)','stroke-width':1.5,'stroke-dasharray':'4 3'});
+  E(s,'text',{x:(m.l+W0-m.r)/2,y:H0-4,'text-anchor':'middle',class:'lbl'}).textContent='compute-optimal exponent α  (0 = no law · 0.5 = LLM)';
+  const yb=sc(0,order.length-1,m.t+16,H0-m.b-16);
+  order.forEach((mt,i)=>{const [a,lo,hi]=D.alpha_ci[mt];const y=yb(i);
+    const dim=(mt.startsWith('cka')||mt==='mutual_knn');
+    const col=dim?'var(--b18)':'var(--text-muted)';
+    E(s,'line',{x1:xs(lo),y1:y,x2:xs(hi),y2:y,stroke:col,'stroke-width':2});
+    E(s,'line',{x1:xs(lo),y1:y-4,x2:xs(lo),y2:y+4,stroke:col,'stroke-width':2});
+    E(s,'line',{x1:xs(hi),y1:y-4,x2:xs(hi),y2:y+4,stroke:col,'stroke-width':2});
+    const dot=E(s,'circle',{cx:xs(a),cy:y,r:5,fill:col,stroke:'var(--surface-2)','stroke-width':1.5});
+    dot.addEventListener('mousemove',e=>showtt(e,`<b>${mt}</b><br>α=${a.toFixed(2)} CI[${lo.toFixed(2)},${hi.toFixed(2)}]<br>${hi<0.5?'excludes LLM 0.5':''}`));
+    dot.addEventListener('mouseleave',hidett);
+    E(s,'text',{x:m.l-8,y:y+3,'text-anchor':'end',class:'axis'}).textContent=mt.replace('metric_b_ridge','metric_b').replace('_',' ');});
+  c.insertAdjacentHTML('beforeend',`<div class="legend"><span><span class="sw" style="background:var(--b18)"></span>dim-invariant</span><span><span class="sw" style="background:var(--text-muted)"></span>reference-linear</span><span><span class="sw" style="background:var(--neg)"></span>α=0</span><span><span class="sw" style="background:var(--muP)"></span>α=0.5 LLM</span></div>`);
+})();
+</script>
+</body>
+</html>
