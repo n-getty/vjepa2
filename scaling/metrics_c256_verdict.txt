@@ -1,0 +1,65 @@
+PRE-REGISTERED METRIC SELECTION VERDICT
+============================================================
+
+### metric_b_ridge   fails
+  crit1 precision (>=3 budgets, boot half-width<0.08): False  (n_precise=2)
+  crit2 monotone vertices 3e17->1e18->3e18: False  (logN_opt ordered = [8.336, 8.135, 8.375, 8.277])
+  per-budget:
+    1e+17: n=4 a=+0.122 rmse=0.0009 depth=0.0508 BDNR=57.7 Nopt=    217M  bootCI-hw=0.069 conv=0.66
+    3e+17: n=4 a=+0.382 rmse=0.0057 depth=0.0751 BDNR=13.3 Nopt=    137M  bootCI-hw=1.058 conv=0.66
+    1e+18: n=6 a=+0.142 rmse=0.0138 depth=0.1162 BDNR=8.4 Nopt=    237M  bootCI-hw=0.074 conv=0.97
+    3e+18: n=6 a=+0.212 rmse=0.0303 depth=0.2127 BDNR=7.0 Nopt=    189M  bootCI-hw=0.092 conv=0.93
+    1e+19: n=4 a=-0.011 rmse=0.0381 depth=0.0693 BDNR=1.8 Nopt=    nanM  bootCI-hw=0.167 conv=0.28
+
+### cka_linear   fails
+  crit1 precision (>=3 budgets, boot half-width<0.08): False  (n_precise=2)
+  crit2 monotone vertices 3e17->1e18->3e18: False  (logN_opt ordered = [8.068, 8.081, 8.278, 7.791])
+  per-budget:
+    1e+17: n=4 a=+0.050 rmse=0.0000 depth=0.0116 BDNR=284.9 Nopt=    117M  bootCI-hw=0.004 conv=0.66
+    3e+17: n=4 a=+0.138 rmse=0.0060 depth=0.0304 BDNR=5.1 Nopt=    121M  bootCI-hw=0.044 conv=0.39
+    1e+18: n=6 a=+0.060 rmse=0.0103 depth=0.0599 BDNR=5.8 Nopt=    190M  bootCI-hw=0.181 conv=0.95
+    3e+18: n=6 a=+0.064 rmse=0.0257 depth=0.1427 BDNR=5.5 Nopt=     62M  bootCI-hw=0.772 conv=0.82
+    1e+19: n=4 a=-0.211 rmse=0.0213 depth=0.1186 BDNR=5.6 Nopt=    nanM  bootCI-hw=0.000 conv=0.13
+
+### cka_rbf   fails
+  crit1 precision (>=3 budgets, boot half-width<0.08): False  (n_precise=2)
+  crit2 monotone vertices 3e17->1e18->3e18: False  (logN_opt ordered = [7.963, 7.993, 8.0, 7.162])
+  per-budget:
+    1e+17: n=4 a=+0.068 rmse=0.0007 depth=0.0233 BDNR=32.9 Nopt=     92M  bootCI-hw=0.044 conv=0.66
+    3e+17: n=4 a=+0.158 rmse=0.0013 depth=0.0491 BDNR=37.2 Nopt=     98M  bootCI-hw=0.030 conv=0.66
+    1e+18: n=6 a=+0.048 rmse=0.0128 depth=0.0784 BDNR=6.1 Nopt=    100M  bootCI-hw=0.739 conv=0.91
+    3e+18: n=6 a=+0.046 rmse=0.0264 depth=0.1926 BDNR=7.3 Nopt=     15M  bootCI-hw=1.263 conv=0.72
+    1e+19: n=4 a=-0.345 rmse=0.0359 depth=0.1845 BDNR=5.1 Nopt=    nanM  bootCI-hw=0.000 conv=0.13
+
+### mutual_knn   fails
+  crit1 precision (>=3 budgets, boot half-width<0.08): True  (n_precise=3)
+  crit2 monotone vertices 3e17->1e18->3e18: False  (logN_opt ordered = [8.236, 8.12, 8.816, 8.635])
+  per-budget:
+    1e+17: n=4 a=+0.111 rmse=0.0003 depth=0.0330 BDNR=98.4 Nopt=    172M  bootCI-hw=0.027 conv=0.66
+    3e+17: n=4 a=+0.134 rmse=0.0040 depth=0.0247 BDNR=6.3 Nopt=    132M  bootCI-hw=0.054 conv=0.52
+    1e+18: n=6 a=+0.029 rmse=0.0020 depth=0.0368 BDNR=18.0 Nopt=    655M  bootCI-hw=0.062 conv=0.98
+    3e+18: n=6 a=+0.044 rmse=0.0084 depth=0.0391 BDNR=4.6 Nopt=    432M  bootCI-hw=0.121 conv=0.91
+    1e+19: n=4 a=-0.023 rmse=0.0050 depth=0.0120 BDNR=2.4 Nopt=    nanM  bootCI-hw=0.260 conv=0.28
+
+### procrustes   fails
+  crit1 precision (>=3 budgets, boot half-width<0.08): False  (n_precise=1)
+  crit2 monotone vertices 3e17->1e18->3e18: False  (logN_opt ordered = [8.223, 8.102, 8.202, 8.2])
+  per-budget:
+    1e+17: n=4 a=+0.030 rmse=0.0001 depth=0.0085 BDNR=86.2 Nopt=    167M  bootCI-hw=0.027 conv=0.66
+    3e+17: n=4 a=+0.075 rmse=0.0025 depth=0.0151 BDNR=6.1 Nopt=    127M  bootCI-hw=0.108 conv=0.52
+    1e+18: n=6 a=+0.025 rmse=0.0044 depth=0.0290 BDNR=6.6 Nopt=    159M  bootCI-hw=0.279 conv=0.95
+    3e+18: n=6 a=+0.050 rmse=0.0099 depth=0.0585 BDNR=5.9 Nopt=    159M  bootCI-hw=0.130 conv=0.90
+    1e+19: n=4 a=-0.072 rmse=0.0130 depth=0.0420 BDNR=3.2 Nopt=    nanM  bootCI-hw=0.356 conv=0.28
+
+### rankme   fails
+  crit1 precision (>=3 budgets, boot half-width<0.08): False  (n_precise=0)
+  crit2 monotone vertices 3e17->1e18->3e18: False  (logN_opt ordered = [])
+  per-budget:
+    1e+17: n=4 a=-0.578 rmse=0.0095 depth=0.1784 BDNR=18.8 Nopt=    nanM  bootCI-hw=inf conv=0.00
+    3e+17: n=4 a=-0.104 rmse=0.0019 depth=0.1875 BDNR=98.6 Nopt=    nanM  bootCI-hw=0.000 conv=0.14
+    1e+18: n=6 a=-0.099 rmse=0.0156 depth=0.2433 BDNR=15.6 Nopt=    nanM  bootCI-hw=2.230 conv=0.06
+    3e+18: n=6 a=-0.208 rmse=0.0126 depth=0.4407 BDNR=35.1 Nopt=    nanM  bootCI-hw=inf conv=0.00
+    1e+19: n=4 a=-0.461 rmse=0.0408 depth=0.2904 BDNR=7.1 Nopt=    nanM  bootCI-hw=0.000 conv=0.13
+
+============================================================
+WINNER(S): NONE — all metrics fail; compute (budget) is the binding constraint

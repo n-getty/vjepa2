@@ -156,9 +156,33 @@ def procrustes_error(X, Y, train_frac=0.7, seed=0):
     return float(np.nanmean(resid / total))
 
 
+def rankme(X, eps=1e-7):
+    """RankMe (Garrido et al. 2023): smooth effective rank of the feature matrix — a REFERENCE-FREE,
+    LABEL-FREE unsupervised proxy for representation quality. RankMe = exp(-sum p_k log p_k) where
+    p_k = sigma_k / sum(sigma) are the L1-normalized singular values of X.
+
+    CRITICAL for this study: unlike every T*-referenced metric (ridge/CKA/kNN/procrustes), RankMe has
+    NO ceiling at the reference size — it measures the encoder's OWN feature-space dimensionality, so a
+    1.9B encoder is not penalized for exceeding T*'s 1B. At fixed IsoFLOP budget it still trades off
+    capacity (rank up with N) against undertraining (rank down when data-starved), so it can define a
+    genuine vertex free of the saturation confound. Higher = better, so we return ERROR = -RankMe/d
+    (normalized by feature dim, negated so down=better matches the parabola fitter)."""
+    Xc = X - X.mean(axis=0, keepdims=True)
+    # singular values of the (n x d) feature matrix
+    s = np.linalg.svd(Xc, compute_uv=False)
+    p = s / (s.sum() + eps)
+    p = p[p > 0]
+    entropy = -(p * np.log(p)).sum()
+    rm = float(np.exp(entropy))
+    d = X.shape[1]
+    # normalize by dim so cross-encoder comparison isn't dominated by raw dim; error = 1 - RankMe/d
+    return 1.0 - rm / d
+
+
 def score_all(X, Y, seed=239):
     """Compute every candidate metric as an ERROR (down=better) for one cell's cached features."""
     out = {}
+    out["rankme"] = rankme(X)
     # ridge baseline (train/test split inside)
     n = min(len(X), len(Y))
     Xn, Yn = X[:n], Y[:n]

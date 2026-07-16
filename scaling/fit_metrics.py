@@ -22,7 +22,7 @@ import numpy as np
 
 from scaling.metrics_zoo import score_all
 
-METRICS = ["metric_b_ridge", "cka_linear", "cka_rbf", "mutual_knn", "procrustes"]
+METRICS = ["metric_b_ridge", "cka_linear", "cka_rbf", "mutual_knn", "procrustes", "rankme"]
 LADDER = ["vit_tiny", "vit_small", "vit_base", "vit_large", "vit_giant", "vit_gigantic"]
 
 

@@ -77,6 +77,58 @@ So the resolution floor is not a ruler-sampling problem.
    the true N_opt spread may only exceed noise over ≥2 decades. Would need larger budgets and (for
    bracketing the top) either a bigger corpus or accepting the top-budget right-arm-only.
 
+## UPDATE 2026-07-16 — multi-metric selection + budget widening (autonomous overnight)
+
+Tested whether a cheaper/sharper metric or a wider compute lever resolves the vertex-ordering failure,
+entirely on the EXISTING checkpoints (features cached once per cell → pure-numpy metric sweep) plus a
+half-decade downward budget extension. Pre-registered success test: ≥3 budgets with bootstrap vertex
+CI half-width <0.08 log10(N) AND monotone compute-ordered vertices across the bracketable budgets.
+
+**What ran:** 6 metrics × 24 cells. Metrics: metric_b_ridge (baseline 1−R²), cka_linear, cka_rbf,
+mutual_knn (Platonic), procrustes, rankme (Garrido 2023, reference-free effective rank). Cells: the 20
+original + **4 new 1e17 cells** (tiny/small/base/large). NOTE: **3e16 is infeasible at gb=96** — the
+per-cell step floor leaves only vit_tiny above min-steps, so 1e17 (ipe=100) is the lowest bracketable
+downward extension. giant/gigantic can't bracket at ≤1e17.
+
+**Verdict: NONE of the 6 metrics passed.** But the *robustness checks explain why*, and the reason is
+not simply "too little compute":
+
+1. **T\* saturation ceiling (the dominant confound).** T\* = Meta ViT-g = **1B params**; our ladder
+   tops at gigantic = **1.9B**. In ALL 3 budgets × ALL 5 T\*-referenced metrics, gigantic scores WORSE
+   than giant — a 1.9B encoder structurally cannot align-to a 1B reference better than a 1B encoder can.
+   This corrupts the right arm of every high-budget parabola. Re-fitting with gigantic (and giant)
+   excluded does NOT restore ordering: N_opt stays pinned at ~100–200M with no compute trend. So the
+   ceiling is real but removing it doesn't rescue the law — the whole T\*-alignment axis is size-capped.
+2. **RankMe is deep but monotone, not bowl-shaped.** rankme has by far the deepest curves (BDNR 15–98,
+   vs ≤13 for the T\* metrics) — but they are CONCAVE (a<0): effective rank rises with N at every budget
+   with no undertraining penalty, so it measures capacity but defines no vertex. A reference-free metric
+   removes the ceiling but loses the compute-vs-capacity tradeoff that makes a vertex.
+3. **Best-resolved single-decade slope is positive but tiny.** 1e17→1e18 (the two best-converged
+   budgets, full decade): cka_linear α̂=+0.21, mutual_knn α̂=+0.58, but ridge/rbf/procrustes ≈0. The
+   signal exists and points the right way; it is just below the metric's noise over our C-range.
+
+**Honest bottom line (unchanged headline, sharper mechanism):** with a fixed pretrained reference T\*,
+the IsoFLOP vertex is not resolvable on this ladder because (a) the alignment metric saturates at the
+reference's parameter count, capping the usable N-range at ~T\* size, and (b) reference-free rank has no
+vertex. This is a METRIC-STRUCTURE limit, not merely a point-count limit.
+
+A ceiling-free + vertex-forming y-axis would need to be BOTH label-based (no reference to saturate) AND
+sensitive at these budgets. Two paths were checked and BOTH are dead as cheap tests:
+- **Linear-probe on the ruler: impossible.** The K400 ruler `.cls` members are all class 0 (placeholder
+  labels; the ruler is effectively label-less, confirming the earlier finding). No class diversity → no
+  probe. A class-diverse labeled eval set would require new GPU feature extraction, not a numpy re-score.
+- **Downstream probe (SSv2 / Metric A): already abandoned for the SAME reason.** At IsoFLOP budgets the
+  encoders are too under-pretrained for a downstream probe to discriminate (converged large_C1e19 SSv2
+  = 11% vs Meta ViT-L ~69.5%). A supervised probe hits the identical under-pretraining wall — CONVERGENT
+  evidence that the constraint is genuinely compute, not the metric family.
+
+**Net:** the pure-numpy metric space is exhausted (6 metrics, ceiling-exclusion refits, 1e17 lever). The
+two remaining levers both cost real compute and are morning decisions: (1) a **larger T\*** (≥2B) to lift
+the alignment ceiling above our ladder, or (2) **more compute per cell** (higher budgets / longer
+training) so encoders are pretrained enough for a downstream probe to discriminate AND the vertex drift
+exceeds noise. Both point the same way: the study is compute-bound, and the fixed-T\* metric family
+cannot substitute for it.
+
 ## Artifacts (committed)
 - `scaling/eval_metric_b.py` — metric + std/intercept/CV fix (ce09617)
 - `scaling/experiments_pe_FIXED.csv`, `scaling/fit_pe_FIXED.json`, `scaling/isoflop_pe_FIXED.png`
