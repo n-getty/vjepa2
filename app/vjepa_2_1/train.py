@@ -407,6 +407,19 @@ def main(args, resume_preempt=False):
             load_path = None
             load_model = False
 
+    # -- ensure the run folder exists before ANY rank opens its log_r<rank>.csv. With large worlds
+    #    (e.g. 1536-rank HSDP) all ranks reach CSVLogger simultaneously; if the folder is fresh, the
+    #    non-zero ranks race ahead of whoever would create it and die with FileNotFoundError. Rank 0
+    #    makedirs, then a barrier holds the others until the directory is visible. (Observed: a fresh
+    #    gigantic 1e20 cell crashed at startup this way while giant on the same job won the race.)
+    if rank == 0:
+        os.makedirs(folder, exist_ok=True)
+    if world_size > 1:
+        try:
+            torch.distributed.barrier()
+        except Exception:
+            pass
+
     # -- make csv_logger
     csv_logger = CSVLogger(
         log_file,
