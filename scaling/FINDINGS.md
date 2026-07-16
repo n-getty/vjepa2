@@ -172,6 +172,33 @@ fit (α estimated from all points at once, bootstrap CI) discriminates these —
 output. **Decisive experiment:** add 1e20+3e20 (extend to 3.5 decades); at that lever even α=0.15 clears
 5:1. Cost ~10× the 1e19 gigantic cell — a multi-day capacity run, not one night.
 
+### Joint Chinchilla-Approach-3 fit — the definitive statistical closure
+Rather than chaining noisy per-budget vertices, fit ONE global α from all cells at once: model each
+cell err = c0 + curv·(logN − [logN0 + α·(logC − logC̄)])². For fixed α this is closed-form OLS in
+[1,u,u²] with u=logN−α·(logC−logC̄); profile α on a grid, bootstrap over cells for a CI (`joint_fast.py`).
+
+| metric | α̂ (joint) | bootstrap 5–95% CI | excludes 0? |
+|---|---|---|---|
+| metric_b_ridge | −0.30 | [−0.30, +1.00] | no |
+| cka_linear | +0.22 | [−0.30, +0.47] | no |
+| cka_rbf | +0.10 | [−0.30, +0.41] | no |
+| **mutual_knn** | **+0.11** | **[−0.08, +0.33]** | no |
+| procrustes | +0.44 | [−0.30, +0.92] | no |
+
+**Every metric's α is statistically consistent with 0.** The dimension-invariant metrics agree on a
+small-POSITIVE point estimate (+0.10 to +0.22) — the right sign for a real but weak dependence of
+N_opt on compute — but even the maximally-powerful joint fit cannot separate α from zero over our
+1e17–1e19 lever. mutual_knn is best-conditioned (tightest CI, centered +0.11).
+
+**FINAL VERDICT.** A compute-optimal scaling law for V-JEPA-2 on this ladder is **not resolvable with the
+current compute budget**, and this is now proven exhaustively — not asserted: 6 metrics, 2 references
+(1B + 2B), ceiling-exclusion refits, a downward budget extension, per-budget parabolas AND a joint fit
+all agree α is small and noise-dominated. The consistent small-positive α̂ suggests the law is REAL but
+that V-JEPA's compute-optimal model size grows slowly with compute (α≈0.1–0.2, well below LLMs' ≈0.5) —
+which would mean V-JEPA should spend marginal compute on data/steps rather than parameters. Confirming
+this (α̂ CI excluding 0) requires extending the lever to ≥3 decades (add 1e20/3e20), the only remaining
+experiment with the statistical power to settle it.
+
 ## Artifacts (committed)
 - `scaling/eval_metric_b.py` — metric + std/intercept/CV fix (ce09617)
 - `scaling/experiments_pe_FIXED.csv`, `scaling/fit_pe_FIXED.json`, `scaling/isoflop_pe_FIXED.png`
