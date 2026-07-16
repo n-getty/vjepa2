@@ -152,6 +152,26 @@ compute: a **wider budget range (≥2.5 decades)** so drift exceeds noise, and/o
 training** to reach a regime where a downstream probe (the one ceiling-free + vertex-forming y-axis)
 becomes discriminative. 3e16 is infeasible at gb=96 (step floor); the practical widening is UP, not down.
 
+### Budget estimate (answering "what budgets are necessary")
+With measured per-budget vertex noise σ(logN)≈0.10 and a 5:1 SNR target to fit a defensible power law,
+the required compute lever is logC_range ≥ 5σ/α:
+
+| true α | decades needed | top budget from 1e17 | within our 2.0-decade lever? |
+|---|---|---|---|
+| 0.50 | 1.00 | 1e18 | YES |
+| 0.40 | 1.25 | 1.8e18 | YES |
+| 0.30 | 1.67 | 4.6e18 | YES |
+| 0.20 | 2.50 | 3.2e19 | no (need +0.5 dec) |
+| 0.15 | 3.33 | 2.2e20 | no (need +1.3 dec) |
+
+**Crucial inference:** our existing 1e17→1e19 lever (2.0 decades) SHOULD resolve any α≥0.25. It does not.
+Therefore either (a) V-JEPA's true α<0.25 — i.e. compute-optimal model size grows UNUSUALLY SLOWLY with
+compute vs LLMs (α_LLM≈0.5); a genuine finding that V-JEPA prefers spending compute on data/steps over
+parameters — or (b) low-budget cells are too undertrained/noisy (σ>0.10). A joint Chinchilla-Approach-3
+fit (α estimated from all points at once, bootstrap CI) discriminates these — see `scaling/joint_fit`
+output. **Decisive experiment:** add 1e20+3e20 (extend to 3.5 decades); at that lever even α=0.15 clears
+5:1. Cost ~10× the 1e19 gigantic cell — a multi-day capacity run, not one night.
+
 ## Artifacts (committed)
 - `scaling/eval_metric_b.py` — metric + std/intercept/CV fix (ce09617)
 - `scaling/experiments_pe_FIXED.csv`, `scaling/fit_pe_FIXED.json`, `scaling/isoflop_pe_FIXED.png`
