@@ -1,7 +1,14 @@
 # JEPA scaling-law pipeline (`scaling/`)
 
 Compute-optimal (IsoFLOP) scaling-law tooling for V-JEPA 2.1. See `docs/JEPA_SCALING_LAWS_DESIGN.md`
-for the why (loss-based law is ill-posed; fit a downstream/common-space metric instead).
+for the why (loss-based law is ill-posed; fit a downstream/common-space metric instead) — but note that
+doc is a SUPERSEDED design spec.
+
+> **Results source of truth (2026-07-16):** `scaling/FINDINGS.md` (technical) and
+> `scaling/scaling_law_report.html` (figures + assessment). The "current status" section near the
+> bottom of THIS readme and the design doc's results are **stale**: the corpus is now PE-Video (not
+> K400), Metric B has the std/intercept/CV-λ fix, we tried 6 metrics (CKA/kNN/Procrustes/RankMe), and
+> the headline is a **null** — α consistent with 0 over 1e17–1e19; a 1e20 tier at gb=3072 is running.
 
 **Everything runs under `module load frameworks`.** The FLOP/param/plan/gen/collect/fit/plot stages
 are CPU/meta-device only; the two evaluators and training are GPU/MPI.
@@ -87,7 +94,10 @@ Trainer touchpoint (NOT in `scaling/`): `app/vjepa_2_1/train.py` writes a rank-0
 sidecar when a config carries a `scaling:` stamp, and resolves `embed_dim_encoder` for any ladder
 size. Corpus ingest: `scripts/ingest_k400full_{to_wds.py,pbs.sh}` (raw K400 → WebDataset, lossless).
 
-## Status (2026-07-10 — LIVE)
+## Status (2026-07-10) — ⚠️ STALE, see FINDINGS.md
+> The block below is the initial (mistaken) read. The clean 1e18 vertex did NOT survive the full study
+> (wrong corpus + un-fixed metric). **Current status: `scaling/FINDINGS.md`.**
+
 Pipeline validated end-to-end on synthetic data (fit recovers planted α=β=0.5) AND now on **real
 Aurora runs**. Calibration complete (sweep ≈202 node-h; strong batch-amortization). Full-K400 corpus
 ingested (241,258 clips). The DDP ladder is training via `overnight_chain` (self-resubmitting). First
@@ -96,7 +106,15 @@ disagrees with raw loss (confirming the design thesis). Remaining: more budgets 
 α/β exponent fit; Metric A (SSv2, staged at `/flare/ModCon/ngetty/data/ssv2_eval/`) needs a GPU slot;
 HSDP giant/gigantic pending a smoke gate.
 
-## The real study (current invocation)
+## The actual study as run (2026-07-16) — supersedes "The real study" below
+- corpus: **PE-Video** `/flare/ModCon/ngetty/data/pe_video_wds/pe_video` (984K), NOT K400.
+- configs: `configs/scaling/pe/*.yaml`; outputs `/flare/ModCon/ngetty/experiments/scaling_pe/<slug>/`.
+- metric: Metric B with std+intercept+CV-λ fix, plus `metrics_zoo.py` (CKA/kNN/Procrustes/RankMe),
+  fit + pre-registered vertex test in `fit_metrics.py`, joint-α fit in `joint_fit.py`.
+- budgets 1e17–1e19 (gb=96) done; **1e20 tier at gb=3072** (large/giant/gigantic) running as a
+  standalone anchor. Result: α consistent with 0 — see FINDINGS.md / scaling_law_report.html.
+
+## The original K400 invocation (STALE — for reference only)
 - corpus: `/flare/ModCon/ngetty/data/kinetics400_full_wds/kinetics400` (241K clips)
 - configs: `configs/scaling/real/*.yaml` (+ `_launch.json` per cell)
 - outputs: `/flare/ModCon/ngetty/experiments/scaling_real/<slug>/`

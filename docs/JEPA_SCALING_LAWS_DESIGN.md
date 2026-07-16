@@ -1,7 +1,35 @@
 # Neural Scaling Laws for V-JEPA 2.1 — Experimental Design Spec
 
-**Status:** LIVE — pipeline built + validated; real sweep TRAINING on Aurora (updated 2026-07-10).
-**Date:** 2026-07-09 (rev 2026-07-10)
+> ## ⚠️ SUPERSEDED (2026-07-16) — DESIGN/MOTIVATION ONLY
+> This is the **pre-sweep design spec** (frozen 2026-07-10). Its *motivation and design* are still
+> valid (§1 why loss-based law is ill-posed, §0a code map, §10 data audit), but **all results,
+> decisions, and status below are OUT OF DATE** and in several cases refuted. Do NOT cite results from
+> this file.
+>
+> **Current sources of truth:**
+> - **`scaling/scaling_law_report.html`** — polished report with figures + paper-readiness assessment.
+> - **`scaling/FINDINGS.md`** — detailed running lab notebook (the authoritative technical record).
+>
+> **What changed since this spec (see FINDINGS.md for detail):**
+> - **Corpus:** K400 (this doc) → **PE-Video (984K)** — K400 too small (replay saturated the vertices).
+> - **Metric B:** raw fixed-λ ridge (this doc) → **standardized X + intercept + CV-λ** (fixed a
+>   dimension confound where score crept with encoder width independent of quality).
+> - **More metrics tried (all fail to resolve a vertex):** linear CKA, RBF CKA, mutual-kNN (Platonic),
+>   orthogonal Procrustes, and **RankMe** (reference-free) — not just Metric A/B.
+> - **T\* ceiling:** the open question in §7 was tested — re-scoring against a **2B ViT-G** reference
+>   (above the whole ladder) barely moved the vertices, **refuting** T\*-size saturation as the cause.
+> - **The "first real result" below (N_opt ≈ base @1e18) does NOT hold** across budgets — the vertex
+>   floats within metric noise; per-budget vertices do not order with compute.
+> - **Result:** across 6 metrics × 2 references × per-budget and joint IsoFLOP fits, the compute-optimal
+>   exponent **α is statistically consistent with 0** over our 1e17–1e19 range (best: mutual-kNN
+>   α=+0.11, CI [−0.08, +0.33]); dim-invariant metrics exclude the LLM value 0.5. Not resolvable at
+>   this compute — needs ≥3 decades. A **1e20 tier at gb=3072** (large/giant/gigantic) is now running
+>   as a standalone high-fidelity anchor; **3e20 is corpus-blocked** (replay = C/corpus, GB-independent).
+> - **Global batch:** this doc's gb=96 is 32× below the real V-JEPA 2.1 recipe (gb=3072).
+
+**Status:** SUPERSEDED design spec — see banner above. (Original: LIVE, pipeline built + validated,
+sweep training on Aurora, updated 2026-07-10.)
+**Date:** 2026-07-09 (rev 2026-07-10; superseded 2026-07-16)
 **Owner:** Neil Getty
 **Code:** all tooling under `scaling/` (see `scaling/README.md`); configs `configs/scaling/real/`;
 outputs `/flare/ModCon/ngetty/experiments/scaling_real/`.
@@ -58,7 +86,13 @@ additive `scaling.json` sidecar in `app/vjepa_2_1/train.py`. Read `scaling/READM
 SSv2 eval `data/ssv2_eval/{webm,labels}`; T\* `checkpoints/vjepa2_1_vitg_384.pt`; run outputs
 `experiments/scaling_real/<slug>/`.
 
-## 0b. First real result (2026-07-10)
+## 0b. First real result (2026-07-10) — ⚠️ SUPERSEDED, DOES NOT HOLD
+
+> **This result did not survive the full study.** The N_opt≈base vertex shown here is from a single
+> budget (1e18) on the old K400 corpus with the un-fixed Metric B. With the corrected metric, the
+> PE-Video corpus, and all budgets, the per-budget vertices do NOT order with compute and α is
+> consistent with 0. See `scaling/FINDINGS.md`. Kept below only as a record of the initial (mistaken)
+> read.
 
 The 1e18-FLOP IsoFLOP row, scored on **Metric B** (frozen-T\* linear-predictivity error, lower=better),
 over the complete DDP ladder:
