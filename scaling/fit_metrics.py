@@ -43,8 +43,13 @@ def _bnum(tag):
     return float(tag.replace("p", ".").replace("e", "e"))
 
 
-def load_scores(runs_root, feat_tag, seed):
-    """For each cell with cached feats_X/Y_<tag>.npy, compute all metrics + read n_params, budget."""
+def load_scores(runs_root, feat_tag, seed, tstar_override=None):
+    """For each cell with cached feats_X/Y_<tag>.npy, compute all metrics + read n_params, budget.
+
+    tstar_override: path to a single .npy of ALTERNATE T* ruler features (same ruler/order) to use in
+    place of every cell's cached Y. Used to test a larger reference (2B ViT-G) that lifts the alignment
+    saturation ceiling above our ladder — X is T*-independent so only Y changes, no per-cell GPU re-run."""
+    Y_over = np.load(tstar_override) if tstar_override else None
     rows = []
     for rd in sorted(glob.glob(os.path.join(runs_root, "*"))):
         if not os.path.isdir(rd):
@@ -53,11 +58,13 @@ def load_scores(runs_root, feat_tag, seed):
         xp = os.path.join(rd, f"feats_X_{feat_tag}.npy")
         yp = os.path.join(rd, f"feats_Y_{feat_tag}.npy")
         sj = os.path.join(rd, "scaling.json")
-        if not (os.path.exists(xp) and os.path.exists(yp) and os.path.exists(sj)):
+        if not (os.path.exists(xp) and os.path.exists(sj)):
+            continue
+        if Y_over is None and not os.path.exists(yp):
             continue
         sc = json.load(open(sj))
         X = np.load(xp)
-        Y = np.load(yp)
+        Y = Y_over if Y_over is not None else np.load(yp)
         scores = score_all(X, Y, seed=seed)
         row = {"cell": name, "model": _model_of(name), "budget": _budget_of(name),
                "n_params": sc.get("n_params_measured", sc.get("n_params")),
@@ -150,9 +157,12 @@ def main():
     ap.add_argument("--feat-tag", default="c512")
     ap.add_argument("--out-prefix", default="scaling/metrics_c512")
     ap.add_argument("--seed", type=int, default=239)
+    ap.add_argument("--tstar-override", default=None,
+                    help="path to alternate T* ruler-feature .npy (e.g. 2B ViT-G) to re-score all cells "
+                         "against, replacing each cell's cached Y (lifts the saturation ceiling)")
     args = ap.parse_args()
 
-    rows = load_scores(args.runs_root, args.feat_tag, args.seed)
+    rows = load_scores(args.runs_root, args.feat_tag, args.seed, tstar_override=args.tstar_override)
     if not rows:
         raise SystemExit(f"no cached features found under {args.runs_root} (tag {args.feat_tag})")
 

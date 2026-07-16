@@ -291,6 +291,25 @@ def dump_features(run_dir, t_star_ckpt, t_star_model, resolution, frames_per_cli
     return xp, yp
 
 
+def dump_tstar_only(t_star_ckpt, t_star_model, resolution, frames_per_clip, data_glob,
+                    max_clips, subsample_tokens, seed, out_path):
+    """Extract ONLY the T* reference features on the fixed ruler and save to out_path.
+
+    The run-encoder features X are T*-independent and already cached per cell; Y (T* on the ruler) is
+    IDENTICAL across all cells. So to test an alternate reference (e.g. the 2B ViT-G that lifts the
+    saturation ceiling above our ladder) we extract that reference ONCE here, then re-score every cell's
+    cached X against this single new Y in pure numpy — no per-cell GPU re-run."""
+    import torch  # noqa: F401
+    device = "xpu" if _has_xpu() else "cpu"
+    enc = _build_encoder(t_star_model, t_star_ckpt, "target_encoder", resolution, frames_per_clip, device)
+    max_files = int(max_clips * 1.3) + 8 if max_clips else None
+    loader = _fixed_clip_loader(data_glob, resolution, frames_per_clip, seed, max_files=max_files)
+    Y = _extract_features(enc, loader, device, max_clips, subsample_tokens)
+    np.save(out_path, Y.astype(np.float32))
+    print(f"T*={t_star_model}: dumped Y{Y.shape} -> {out_path}")
+    return out_path
+
+
 def _has_xpu():
     try:
         import torch
@@ -434,8 +453,16 @@ def main():
                          "cheap pure-numpy multi-metric analysis on cached arrays")
     ap.add_argument("--feat-tag", default=None,
                     help="tag for cached feature files (default derived from max-clips, e.g. c120)")
+    ap.add_argument("--dump-tstar-only", default=None, metavar="OUT_NPY",
+                    help="extract ONLY the T* reference features on the ruler to this .npy (for testing "
+                         "an alternate/larger reference against already-cached run features)")
     args = ap.parse_args()
     feat_tag = args.feat_tag or f"c{args.max_clips}"
+    if args.dump_tstar_only:
+        dump_tstar_only(args.t_star_ckpt, args.t_star_model, args.resolution, args.frames,
+                        args.data_glob, args.max_clips, args.subsample_tokens, args.seed,
+                        args.dump_tstar_only)
+        return
     if args.dump_features:
         if args.runs_root:
             runs = sorted(d for d in glob.glob(os.path.join(args.runs_root, "*")) if os.path.isdir(d))
