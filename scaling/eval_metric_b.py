@@ -236,6 +236,61 @@ def run(run_dir, t_star_ckpt, t_star_model, resolution, frames_per_clip, data_gl
     return out
 
 
+def dump_features(run_dir, t_star_ckpt, t_star_model, resolution, frames_per_clip, data_glob,
+                  max_clips, subsample_tokens, seed, feat_tag):
+    """Extract run-encoder features X and T* features Y on the fixed ruler and SAVE to .npy.
+
+    This is the enabler for cheap multi-metric analysis: extraction is the only GPU-bound step, so we
+    pay it ONCE per cell here, then every candidate metric (CKA, mutual-kNN, ridge, ...) is pure-numpy
+    post-hoc on the cached arrays. Features are byte-identical to what run() would extract (same loader,
+    same seed, same subsample) so cached-metric scores match a live re-score exactly.
+
+    Writes:  <run_dir>/feats_X_<tag>.npy      (n, d_run)   run encoder
+             <run_dir>/feats_Y_<tag>.npy      (n, d_tstar) T* encoder (redundant per cell but cheap;
+                                              keeps each cell self-contained + guards ruler drift)
+             <run_dir>/feats_<tag>.meta.json  provenance
+    """
+    import torch  # noqa: F401
+
+    sc = json.load(open(os.path.join(run_dir, "scaling.json")))
+    run_model = sc["model_name"]
+    ckpt = None
+    for name in ("latest.pt", "latest.pth.tar"):
+        if os.path.exists(os.path.join(run_dir, name)):
+            ckpt = os.path.join(run_dir, name)
+            break
+    if ckpt is None:
+        cands = sorted(glob.glob(os.path.join(run_dir, "*.pt")))
+        ckpt = cands[-1] if cands else None
+    if ckpt is None:
+        raise SystemExit(f"no checkpoint in {run_dir}")
+
+    device = "xpu" if _has_xpu() else "cpu"
+    enc_run = _build_encoder(run_model, ckpt, "target_encoder", resolution, frames_per_clip, device)
+    enc_tst = _build_encoder(t_star_model, t_star_ckpt, "target_encoder", resolution, frames_per_clip, device)
+
+    max_files = int(max_clips * 1.3) + 8 if max_clips else None
+    loader = _fixed_clip_loader(data_glob, resolution, frames_per_clip, seed, max_files=max_files)
+    X = _extract_features(enc_run, loader, device, max_clips, subsample_tokens)
+    loader = _fixed_clip_loader(data_glob, resolution, frames_per_clip, seed, max_files=max_files)
+    Y = _extract_features(enc_tst, loader, device, max_clips, subsample_tokens)
+    n = min(len(X), len(Y))
+    X, Y = X[:n], Y[:n]
+
+    xp = os.path.join(run_dir, f"feats_X_{feat_tag}.npy")
+    yp = os.path.join(run_dir, f"feats_Y_{feat_tag}.npy")
+    np.save(xp, X.astype(np.float32))
+    np.save(yp, Y.astype(np.float32))
+    meta = {"n_tokens": int(n), "d_run": int(X.shape[1]), "d_tstar": int(Y.shape[1]),
+            "max_clips": max_clips, "subsample_tokens": subsample_tokens, "seed": seed,
+            "data_glob": data_glob, "t_star_model": t_star_model, "resolution": resolution,
+            "frames": frames_per_clip}
+    with open(os.path.join(run_dir, f"feats_{feat_tag}.meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"{os.path.basename(run_dir)}: dumped X{X.shape} Y{Y.shape} -> {feat_tag}")
+    return xp, yp
+
+
 def _has_xpu():
     try:
         import torch
@@ -374,7 +429,32 @@ def main():
     ap.add_argument("--subsample-tokens", type=int, default=64, help="tokens kept per clip (0=all)")
     ap.add_argument("--train-frac", type=float, default=0.7)
     ap.add_argument("--seed", type=int, default=239)
+    ap.add_argument("--dump-features", action="store_true",
+                    help="extract + SAVE ruler features (X,Y) to .npy instead of scoring; enables "
+                         "cheap pure-numpy multi-metric analysis on cached arrays")
+    ap.add_argument("--feat-tag", default=None,
+                    help="tag for cached feature files (default derived from max-clips, e.g. c120)")
     args = ap.parse_args()
+    feat_tag = args.feat_tag or f"c{args.max_clips}"
+    if args.dump_features:
+        if args.runs_root:
+            runs = sorted(d for d in glob.glob(os.path.join(args.runs_root, "*")) if os.path.isdir(d))
+            for rd in runs:
+                sj = os.path.join(rd, "scaling.json")
+                has_ckpt = os.path.exists(os.path.join(rd, "latest.pth.tar")) or glob.glob(os.path.join(rd, "*.pth.tar"))
+                if not (os.path.exists(sj) and has_ckpt):
+                    continue
+                try:
+                    dump_features(rd, args.t_star_ckpt, args.t_star_model, args.resolution, args.frames,
+                                  args.data_glob, args.max_clips, args.subsample_tokens, args.seed, feat_tag)
+                except Exception as e:
+                    print(f"  SKIP {os.path.basename(rd)}: {e}")
+        elif args.run_dir:
+            dump_features(args.run_dir, args.t_star_ckpt, args.t_star_model, args.resolution, args.frames,
+                          args.data_glob, args.max_clips, args.subsample_tokens, args.seed, feat_tag)
+        else:
+            ap.error("need --run-dir or --runs-root")
+        return
     if args.runs_root:
         run_all(args.runs_root, args.t_star_ckpt, args.t_star_model, args.data_glob,
                 args.resolution, args.frames, args.lam, args.max_clips, args.subsample_tokens,
