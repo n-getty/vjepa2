@@ -129,6 +129,29 @@ training) so encoders are pretrained enough for a downstream probe to discrimina
 exceeds noise. Both point the same way: the study is compute-bound, and the fixed-T\* metric family
 cannot substitute for it.
 
+### UPDATE 2026-07-16 (later) — the T\*=2B test REFUTES the ceiling as the binding cause
+Found `vjepa2_1_vitG_384.pt` = Meta ViT-**G** 2B (embed_dim 1664) on disk — a reference ABOVE our whole
+ladder — and re-scored all 24 cached cells against it (X is T\*-independent, so one GPU extraction of the
+new Y + pure-numpy re-score). Result (`scaling/metrics_c256_tstarG_*`):
+- **Vertices barely moved** vs T\*=g(1B): cka_linear 8.07→8.01, mutual_knn essentially identical
+  ([8.24,8.11,8.76,8.61]). Same zigzag, same non-monotonicity, 0/6 pass.
+- **gigantic STILL scores worse than giant** in every budget×metric even under the 2B reference. So that
+  gap is NOT a "1.9B exceeds a 1B reference" saturation artifact — it is a genuine representation
+  difference (the bigger model is more undertrained at fixed IsoFLOP). The ceiling hypothesis, though
+  mechanically real (a same-size target IS harder to beat), is **not the binding constraint**.
+- **Therefore reference size is irrelevant to the vertex**, and the flat ~100–200M N_opt across the whole
+  2-decade budget range is INTRINSIC, not a metric/reference confound.
+
+**Final, robust conclusion.** Across 6 metrics × 2 references × 24 cells (incl. the 1e17 downward
+extension) and every re-fit variant, the fixed-reference linear-alignment IsoFLOP vertex does not order
+with compute. This is now demonstrated to be **compute-leverage-bound**: over our 1e17–1e19 range the
+true N_opt drift is smaller than the per-budget vertex noise (best single-decade slope α̂≈0.2–0.6 for the
+dimension-invariant metrics, but swamped by σ(logN)≈0.1). The metric family is not the culprit — we ruled
+out dimension, kernel choice, reference-free rank, AND reference size. The only remaining levers are real
+compute: a **wider budget range (≥2.5 decades)** so drift exceeds noise, and/or **longer per-cell
+training** to reach a regime where a downstream probe (the one ceiling-free + vertex-forming y-axis)
+becomes discriminative. 3e16 is infeasible at gb=96 (step floor); the practical widening is UP, not down.
+
 ## Artifacts (committed)
 - `scaling/eval_metric_b.py` — metric + std/intercept/CV fix (ce09617)
 - `scaling/experiments_pe_FIXED.csv`, `scaling/fit_pe_FIXED.json`, `scaling/isoflop_pe_FIXED.png`
