@@ -51,6 +51,23 @@ SHARD_FLOOR=${VJEPA_SHARD_FLOOR:-48}
 CFG_NAME=${VJEPA_CFG_NAME:-vitG384_lbA8}
 BASE_CFG=$ROOT/configs/vitg16_surg_vid_webdataset_single4/${CFG_NAME}.yaml
 CKPT_DIR=/flare/ModCon/ngetty/checkpoints/shakeout_256n/${CFG_NAME}
+# Iterations to execute. ~50 is plenty to read a per-iter time; the point is the
+# mechanics, not the training.
+SHAKE_IPE=${VJEPA_SHAKE_IPE:-50}
+# STAGING BUDGET. This is the one thing that can eat the whole 1h slice. Measured
+# on a real 16n run (job 8729208): 205 GB/node in 474 s = 0.43 GB/s/node, i.e.
+# ~6.9 GB/s aggregate off Lustre. At 256 nodes the full corpus at floor 48 is
+# 265 GB/node = 66 TB aggregate -- ~10 min if per-node bandwidth holds, but ~2.7 h
+# if Lustre saturates near that 16n aggregate. We cannot know which until we try,
+# and losing the slot to a half-finished copy proves nothing.
+#
+# So the shakeout stages a SUBSET of sources by default. Rank/rendezvous/iteration
+# behaviour at 3072 ranks does not depend on how many distinct datasets are mixed,
+# and the partition math is already unit-tested and dry-run verified against the
+# full corpus. Set VJEPA_SHAKE_ALL_SOURCES=1 to stage everything once the timing
+# is known.
+SHAKE_ALL=${VJEPA_SHAKE_ALL_SOURCES:-0}
+SHAKE_KEEP=${VJEPA_SHAKE_KEEP:-4}
 PARAMS=$CKPT_DIR/params-pretrain.yaml
 PY=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python
 mkdir -p "$CKPT_DIR" /flare/ModCon/ngetty/logs
@@ -119,13 +136,51 @@ $PY $ROOT/scripts/prepare_runtime_config.py \
     echo "FATAL: prepare_runtime_config failed"; exit 1; }
 RUNTIME_CFG=$ROOT/.runtime_configs/n${NNODES}g${PPN}_weak/configs/vitg16_surg_vid_webdataset_single4/${CFG_NAME}.yaml
 cp "$RUNTIME_CFG" "$PARAMS" || { echo "FATAL: no runtime config at $RUNTIME_CFG"; exit 1; }
-$PY - "$PARAMS" "$CKPT_DIR" <<'PY'
+$PY - "$PARAMS" "$CKPT_DIR" "$SHAKE_IPE" <<'PY'
 import sys, yaml
-p, d = sys.argv[1], sys.argv[2]
-c = yaml.safe_load(open(p)); c["folder"] = d
+p, d, ipe = sys.argv[1], sys.argv[2], int(sys.argv[3])
+c = yaml.safe_load(open(p))
+c["folder"] = d
+# Shakeout, not training: cap iterations so the run ends on its own inside the
+# 1h slice instead of being cut mid-epoch. Schedules stay as-derived; only the
+# number of steps we bother to execute changes.
+c["optimization"]["ipe"] = ipe
+c["optimization"]["epochs"] = 1
 yaml.safe_dump(c, open(p, "w"), sort_keys=False)
-print(f"folder pinned to {d}")
+print(f"folder pinned to {d}; ipe={ipe} epochs=1 (shakeout)")
 PY
+
+if [[ "$SHAKE_ALL" != "1" ]]; then
+  $PY - "$PARAMS" "$SHAKE_KEEP" <<'PY'
+import sys, yaml, os
+p, keep = sys.argv[1], int(sys.argv[2])
+c = yaml.safe_load(open(p))
+d = c["data"]
+ds = d["datasets"]
+# Keep the SMALLEST-on-disk sources: they exercise the identical code path at a
+# fraction of the bytes. Size is approximated by shard count x mean shard size.
+def nbytes(path):
+    try:
+        tars = [f for f in os.listdir(path) if f.endswith(".tar")]
+        if not tars:
+            return 0
+        sample = tars[: min(5, len(tars))]
+        mean = sum(os.stat(os.path.join(path, f)).st_size for f in sample) / len(sample)
+        return mean * len(tars)
+    except OSError:
+        return 0
+order = sorted(range(len(ds)), key=lambda i: nbytes(ds[i]))[:keep]
+order.sort()
+d["datasets"] = [ds[i] for i in order]
+for k in ("datasets_weights", "dataset_fpcs"):
+    if isinstance(d.get(k), list) and len(d[k]) == len(ds):
+        d[k] = [d[k][i] for i in order]
+yaml.safe_dump(c, open(p, "w"), sort_keys=False)
+print(f"SHAKEOUT SUBSET: {len(ds)} -> {len(d['datasets'])} sources "
+      f"({', '.join(os.path.basename(x) for x in d['datasets'])})")
+print("  set VJEPA_SHAKE_ALL_SOURCES=1 to stage the full corpus instead")
+PY
+fi
 
 # ---- QUESTION 1: staging.
 export LOCAL_DATA_ROOT=/tmp/vjepa_data/${PBS_JOBID%%.*}
