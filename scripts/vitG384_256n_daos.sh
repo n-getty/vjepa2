@@ -154,10 +154,10 @@ export WORLD_SIZE=$WORLD
 echo "MASTER_ADDR=$MASTER_ADDR WORLD_SIZE=$WORLD_SIZE WDS_LOCAL_SLICING=$WDS_LOCAL_SLICING"
 
 # Mount the container on every node.
-launch-dfuse.sh ${POOL}:${MODELS_CONT} || { echo "FATAL: launch-dfuse (models) failed"; exit 1; }
+timeout 600 launch-dfuse.sh ${POOL}:${MODELS_CONT} || { echo "FATAL: launch-dfuse (models) failed"; exit 1; }
 timeout 60 ls "$MODELS_MNT" >/dev/null 2>&1 || { echo "FATAL: $MODELS_MNT unresponsive"; exit 1; }
 echo "models container mounted: $(ls "$MODELS_MNT" 2>/dev/null | tr '\n' ' ')"
-launch-dfuse.sh ${POOL}:${CONT} || { echo "FATAL: launch-dfuse failed"; exit 1; }
+timeout 600 launch-dfuse.sh ${POOL}:${CONT} || { echo "FATAL: launch-dfuse failed"; exit 1; }
 mount | grep -q "$CONT" || { echo "FATAL: not mounted at $DAOS_MNT"; exit 1; }
 # A hung dfuse presents as a hang much later, in the loader, on one rank. Catch
 # it here where the message is unambiguous.

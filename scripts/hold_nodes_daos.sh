@@ -109,8 +109,19 @@ export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
 export MASTER_PORT=29500
 export WORLD_SIZE=$WORLD
 
-launch-dfuse.sh ${POOL}:${MODELS_CONT} || echo "WARN: launch-dfuse models failed"
-launch-dfuse.sh ${POOL}:${CONT}        || echo "WARN: launch-dfuse corpus failed"
+# TIMEOUT these. launch-dfuse.sh fans out over clush and can block indefinitely;
+# job 8731135 ran for 2 minutes, emitted only Lmod warnings, and never reached the
+# self-test -- the log simply stopped after `module load`, which reads as "the
+# script died at module load" and is not. The prologue itself takes 2 s (verified
+# on a login node). Bound it and keep going: a hold that reports a broken mount is
+# far more useful than one that hangs holding an allocation.
+echo "[$(date +%T)] mounting DAOS containers (timeout 300s each)..."
+timeout 300 launch-dfuse.sh ${POOL}:${MODELS_CONT} \
+  && echo "[$(date +%T)] models dfuse launched" \
+  || echo "WARN: launch-dfuse models failed/timed out (rc=$?)"
+timeout 300 launch-dfuse.sh ${POOL}:${CONT} \
+  && echo "[$(date +%T)] corpus dfuse launched" \
+  || echo "WARN: launch-dfuse corpus failed/timed out (rc=$?)"
 timeout 60 ls "$DAOS_MNT" >/dev/null 2>&1 && echo "DAOS corpus mounted: $DAOS_MNT" \
   || echo "WARN: $DAOS_MNT unresponsive"
 timeout 60 ls "$MODELS_MNT" >/dev/null 2>&1 && echo "DAOS models mounted: $MODELS_MNT" \
