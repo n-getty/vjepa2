@@ -80,16 +80,30 @@ fi
 export MASTER_PORT=29613
 export WORLD_SIZE=12
 
-# Per-leg config: override batch_size without editing the shared SMOKE yaml.
+# Per-leg config: batch_size AND folder, both baked into the YAML.
+#
+# `folder` must be written into the config, not passed as --folder: that flag is
+# only honored in app/main_dist_aurora.py's submit() (the login-node path), while
+# --train_mode reads params["folder"] straight from the YAML. Passing --folder to
+# a --train_mode run is silently ignored, so both legs would share the SMOKE
+# config's folder -- and since meta.load_checkpoint is true, leg 2 would RESUME
+# leg 1's latest.pth.tar instead of starting clean, invalidating the gate.
+# (The production launcher patches the YAML for the same reason.)
+#
+# load_checkpoint is also forced off: each leg must start from
+# meta.pretrain_checkpoint so a stale latest.pth.tar in a reused folder cannot
+# make a leg look healthy (or crash) for reasons unrelated to what we're testing.
 make_cfg () {
-  local bs=$1 out=$2
-  $PY - "$CFG" "$bs" "$out" <<'PY'
+  local bs=$1 out=$2 folder=$3
+  $PY - "$CFG" "$bs" "$out" "$folder" <<'PY'
 import sys, yaml
-src, bs, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+src, bs, out, folder = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 c = yaml.safe_load(open(src))
 c["data"]["batch_size"] = bs
+c["folder"] = folder
+c.setdefault("meta", {})["load_checkpoint"] = False
 yaml.safe_dump(c, open(out, "w"), sort_keys=False)
-print(f"wrote {out} (batch_size={bs})")
+print(f"wrote {out} (batch_size={bs}, folder={folder}, load_checkpoint=False)")
 PY
 }
 
@@ -97,16 +111,16 @@ run_leg () {
   local name=$1 bs=$2 accum=$3
   local folder=$OUTDIR/$name log=$OUTDIR/${name}.log cfg=$OUTDIR/${name}.yaml
   mkdir -p "$folder"
-  make_cfg "$bs" "$cfg" || { echo "[$name] config gen FAILED"; return 1; }
+  make_cfg "$bs" "$cfg" "$folder" || { echo "[$name] config gen FAILED"; return 1; }
   echo "===== LEG $name  (batch_size=$bs  VJEPA_TRUE_ACCUM=$accum) ====="
   local t0=$(date +%s)
-  timeout 3600 mpiexec --pmi=pmix -n 12 -ppn 12 --cpu-bind depth --depth 8 \
+  timeout 1500 mpiexec --pmi=pmix -n 12 -ppn 12 --cpu-bind depth --depth 8 \
     env VJEPA_TRUE_ACCUM=$accum \
     python -m app.main_dist_aurora --train_mode \
-      --fname "$cfg" --params_path "$cfg" --folder "$folder" \
+      --fname "$cfg" --params_path "$cfg" \
       2>&1 | tee "$log"
   local rc=$? dt=$(( $(date +%s) - t0 ))
-  if (( rc == 124 )); then
+  if (( rc == 124 )); then   # timeout(1)
     echo "[$name] VERDICT: TIMEOUT after ${dt}s -- treat as a HANG, not a slow run."
     return 1
   fi
