@@ -44,7 +44,11 @@ SHARD_FLOOR=${VJEPA_SHARD_FLOOR:-48}
 # Config: the large-batch arm, whose EMA/warmup/lambda are already derived for a
 # 16x batch. At 256n x 12 x bs2 the batch is REAL (6144), so TRUE_ACCUM stays 1 --
 # accum was only the 16n emulation of this.
-CFG_NAME=${VJEPA_CFG_NAME:-vitG384_lbA}
+# Default to the bs=1 arm: job 8730000 validated per-rank batch_size=1, so the
+# real 256n target is gb 3072 (3072 ranks x bs1), not 6144. lbA8's EMA/warmup/
+# lambda are derived for exactly that. Override with VJEPA_CFG_NAME=vitG384_lbA
+# to shake out the bs=2 fallback instead.
+CFG_NAME=${VJEPA_CFG_NAME:-vitG384_lbA8}
 BASE_CFG=$ROOT/configs/vitg16_surg_vid_webdataset_single4/${CFG_NAME}.yaml
 CKPT_DIR=/flare/ModCon/ngetty/checkpoints/shakeout_256n/${CFG_NAME}
 PARAMS=$CKPT_DIR/params-pretrain.yaml
