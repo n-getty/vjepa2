@@ -18,12 +18,22 @@
 #
 # Both legs are ~40 iters on the SMOKE config, same node, sequential.
 #
-# Run INSIDE a held 1-node allocation (see scripts/hold_node_1n.sh), from the
-# compute node -- not via qsub, so a failure is inspectable immediately:
+# Submit directly (self-contained, ~1h):
+#   qsub scripts/large_batch_smoke_1n.sh
+# or run inside an existing held 1-node allocation:
 #   bash scripts/large_batch_smoke_1n.sh
 #
 # NOTE: no `set -u` -- Aurora's lmod init references unbound vars and would abort
 # the script at `module load` (memory set-u-module-load-trap).
+#
+#PBS -N lbgate
+#PBS -A AuroraGPT
+#PBS -q debug
+#PBS -l select=1
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -o /flare/ModCon/ngetty/logs/
 set -o pipefail
 
 REPO=/lus/flare/projects/ModCon/ngetty/vjepa2
@@ -59,7 +69,14 @@ export VJEPA_DIST_STRATEGY=hsdp
 export LOCAL_WORLD_SIZE=12
 export FSDP_SHARDING=shard_grad_op
 export VJEPA_NUM_WORKERS=0
-export MASTER_ADDR=$(hostname)
+# Under qsub the script starts on the head compute node, but read the nodefile
+# when present so MASTER_ADDR is the allocated host rather than wherever this
+# shell happens to be.
+if [[ -n "${PBS_NODEFILE:-}" && -r "${PBS_NODEFILE}" ]]; then
+  export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
+else
+  export MASTER_ADDR=$(hostname)
+fi
 export MASTER_PORT=29613
 export WORLD_SIZE=12
 
