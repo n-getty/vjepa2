@@ -195,7 +195,18 @@ RC=$?
 DT=$(( $(date +%s) - T0 ))
 
 CSV=$CKPT_DIR/log_r0.csv
-ROWS=$(awk -F, '$2 ~ /^[0-9]+$/ {n++} END{print n+0}' "$CSV" 2>/dev/null || echo 0)
+# Count only rows THIS job wrote. Successive runs share $CKPT_DIR, so a CSV left
+# by a previous job is read as the current run's result: the 16n validation
+# (8730846) found rows=4/loss=0.33922 that were verbatim the killed 256n run's
+# output from 27 minutes earlier. That is a false PASS waiting to happen, and it
+# is exactly the class of "plausible number instead of an error" this whole
+# effort keeps tripping over. $T0 is the pre-mpiexec timestamp.
+if [[ -f "$CSV" ]] && [[ $(stat -c %Y "$CSV") -ge $T0 ]]; then
+  ROWS=$(awk -F, '$2 ~ /^[0-9]+$/ {n++} END{print n+0}' "$CSV")
+else
+  ROWS=0
+  [[ -f "$CSV" ]] && echo "NOTE: $CSV predates this job ($(stat -c %y "$CSV" | cut -d. -f1)) -- ignoring as stale"
+fi
 {
   echo "================ DAOS 256n ================"
   echo "job ${PBS_JOBID:-interactive}  $(date)"
