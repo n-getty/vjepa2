@@ -69,6 +69,29 @@ VERDICT=/flare/ModCon/ngetty/logs/daos_ingest_VERDICT.txt
 
 echo "JOB START $(date) PBS_JOBID=$PBS_JOBID  nodes=$NODES ppn=$PPN"
 
+# SINGLE-WRITER LOCK. dsync has no cross-job locking, so two ingests running at
+# once can copy the SAME source simultaneously -- two writers on the same
+# destination files, which can corrupt sources that were already complete. It is
+# an easy mistake to make: the natural instinct when one ingest is running slow
+# is to queue a faster one behind it, and if the first is still going when the
+# second starts, they overlap. Refuse instead.
+LOCKF=/flare/ModCon/ngetty/logs/.daos_ingest.lock
+if [[ -f "$LOCKF" ]]; then
+  HOLDER=$(cat "$LOCKF" 2>/dev/null)
+  # State is field 5 in `qstat -x` output (jobid name user time S queue) --
+  # NOT field 10, which is where `qstat -u` puts it. Getting this wrong makes
+  # the lock silently never fire, which is worse than having no lock.
+  if [[ -n "$HOLDER" ]] && qstat -x "$HOLDER" 2>/dev/null | awk 'NR>2{print $5}' | grep -qE "^[QRH]$"; then
+    echo "ABORT: ingest $HOLDER is still active and holds $LOCKF."
+    echo "  Two dsync jobs on one container can write the same files concurrently."
+    echo "  Wait for it, or qdel it first."
+    exit 1
+  fi
+  echo "stale lock from $HOLDER (no longer queued/running) -- taking over"
+fi
+echo "${PBS_JOBID:-interactive}" > "$LOCKF"
+trap 'rm -f "$LOCKF"' EXIT
+
 module use /soft/modulefiles
 module load daos
 module load mpifileutils
