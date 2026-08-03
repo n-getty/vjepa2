@@ -1,0 +1,127 @@
+#!/bin/bash
+# ONE-TIME: copy the WebDataset corpus from Lustre into the DAOS container
+# AuroraGPT/vjepa_surg_wds, so training reads from DAOS instead of staging to /tmp.
+#
+# WHY THIS EXISTS
+# ---------------
+# Per-node /tmp staging does not survive scale-out. Measured on a real 16n run
+# (job 8729208): 0.43 GB/s/node, ~6.9 GB/s aggregate off Lustre. At 256 nodes the
+# corpus at shard-floor 48 is 265 GB/node = 66 TB aggregate -- ~10 min if per-node
+# bandwidth scales, ~2.7 HOURS if Lustre saturates near that aggregate. Either way
+# it is 66 TB of copying to deliver 15 TB of reads (each node stages 265 GB but the
+# whole run only reads ~58 GB/node): we move 4.6x more than we ever touch.
+#
+# DAOS removes the staging step entirely. The corpus lives once in the container
+# (4.5 TB against 259 TB free in the AuroraGPT pool) and every node reads it
+# directly over the fabric. The run's actual streaming demand is only ~1.5-3 GB/s
+# aggregate -- it spreads 15 TB over hours instead of minutes -- which is well
+# inside what DAOS delivers, and there is no per-job copy at all.
+#
+# Also removes two second-order problems: the shard-floor tradeoff (per-worker
+# variety no longer costs disk) and the 4.6x write amplification.
+#
+# PREREQ: container already created (done 2026-08-03):
+#   daos container create --type=POSIX --chunk-size=2097152 \
+#     --properties=rd_fac:3,ec_cell_sz:131072,cksum:crc32,srv_cksum:on \
+#     --file-oclass=EC_16P3GX --dir-oclass=RP_4G1 AuroraGPT vjepa_surg_wds
+#
+#   qsub scripts/daos_ingest_corpus.sh
+#
+# Idempotent: dsync only transfers differences, so a re-run after a partial or
+# interrupted copy resumes rather than starting over.
+#
+# NOTE: no `set -u` (memory set-u-module-load-trap).
+#
+#PBS -N daosing
+#PBS -A AuroraGPT
+#PBS -q debug-scaling
+#PBS -l select=8
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare:daos_user_fs
+#PBS -j oe
+#PBS -o /flare/ModCon/ngetty/logs/
+set -o pipefail
+
+POOL=${DAOS_POOL:-AuroraGPT}
+CONT=${DAOS_CONT:-vjepa_surg_wds}
+SRC_ROOT=/flare/ModCon/ngetty/data/surg_vid_webdataset_resharded
+PE_SRC=/flare/ModCon/ngetty/data/pe_video_wds/pe_video
+MNT=/tmp/${POOL}/${CONT}          # launch-dfuse.sh mounts here on every node
+PPN=${INGEST_PPN:-12}
+NODES=$(sort -u "${PBS_NODEFILE:-/dev/null}" 2>/dev/null | wc -l); NODES=${NODES:-1}
+VERDICT=/flare/ModCon/ngetty/logs/daos_ingest_VERDICT.txt
+
+echo "JOB START $(date) PBS_JOBID=$PBS_JOBID  nodes=$NODES ppn=$PPN"
+
+module use /soft/modulefiles
+module load daos
+module load mpifileutils
+
+# Mount the container on EVERY node in the allocation (clush wrapper).
+launch-dfuse.sh ${POOL}:${CONT} || { echo "FATAL: launch-dfuse failed"; exit 1; }
+mount | grep -q "$CONT" || { echo "FATAL: container not mounted at $MNT"; exit 1; }
+echo "mounted $POOL:$CONT at $MNT"
+
+# The 16 sources of the live corpus. pe_video lives outside SRC_ROOT and is a
+# symlink tree, so dsync must dereference (-L) or it copies dangling links.
+SOURCES=(small_surg sitl surgenet_robotic_clean surgtoolloc2022 surgvu24_clean
+         grasp_noleak cholec80 sitl_2026 lemon heichole_512 multibypass140
+         gynsurg lapgyn6_events surgenet_lap openh)
+
+T0=$(date +%s)
+FAILED=0
+for s in "${SOURCES[@]}"; do
+  src=$SRC_ROOT/$s
+  [[ -d "$src" ]] || { echo "SKIP $s (missing)"; continue; }
+  echo "=== $s ==="
+  t=$(date +%s)
+  mpiexec -n $((NODES * PPN)) -ppn $PPN --cpu-bind none \
+      dsync --progress 30 --bufsize 64MB "$src" "$MNT/$s" \
+    || { echo "  DSYNC FAILED for $s"; FAILED=1; }
+  echo "  $s done in $(( $(date +%s) - t ))s"
+done
+
+# pe_video: dereference symlinks so real bytes land in the container.
+if [[ -d "$PE_SRC" ]]; then
+  echo "=== pe_video (deref symlinks) ==="
+  t=$(date +%s)
+  mpiexec -n $((NODES * PPN)) -ppn $PPN --cpu-bind none \
+      dsync --progress 30 --bufsize 64MB --dereference "$PE_SRC" "$MNT/pe_video" \
+    || { echo "  DSYNC FAILED for pe_video"; FAILED=1; }
+  echo "  pe_video done in $(( $(date +%s) - t ))s"
+fi
+
+DT=$(( $(date +%s) - T0 ))
+
+# Verify: every source must have its metadata.json and a plausible .tar count.
+# A silently short copy is the failure that would poison training later, so this
+# compares against the Lustre original rather than just checking for existence.
+{
+  echo "================ DAOS INGEST ================"
+  echo "job ${PBS_JOBID:-interactive}  $(date)"
+  echo "elapsed ${DT}s on ${NODES} nodes x ${PPN} ranks"
+  echo
+  bad=0
+  for s in "${SOURCES[@]}" pe_video; do
+    d=$MNT/$s
+    [[ -d "$d" ]] || { echo "  MISSING  $s"; bad=1; continue; }
+    src=$SRC_ROOT/$s; [[ "$s" == "pe_video" ]] && src=$PE_SRC
+    [[ -d "$src" ]] || continue
+    n_dst=$(ls "$d"/*.tar 2>/dev/null | wc -l)
+    n_src=$(ls "$src"/*.tar 2>/dev/null | wc -l)
+    meta=$([[ -f "$d/metadata.json" ]] && echo yes || echo NO)
+    if [[ "$n_dst" -ne "$n_src" || "$meta" == "NO" ]]; then
+      echo "  MISMATCH $s: tars $n_dst/$n_src metadata=$meta"; bad=1
+    else
+      echo "  ok       $s: $n_dst tars, metadata present"
+    fi
+  done
+  echo
+  if (( bad || FAILED )); then
+    echo "INGEST VERDICT: INCOMPLETE -- re-run this job (dsync resumes)."
+  else
+    echo "INGEST VERDICT: COMPLETE. Point configs at $MNT/<source> and drop staging."
+  fi
+} | tee "$VERDICT"
+
+echo "JOB END $(date)"
