@@ -44,9 +44,30 @@ mount | grep -q "$CONT" || { echo "FATAL: not mounted at $MNT"; exit 1; }
 
 # Also time the equivalent read straight off Lustre, so the comparison is
 # same-hardware / same-hour rather than against a number from a different day.
-LUSTRE_SRC=/flare/ModCon/ngetty/data/surg_vid_webdataset_resharded
+#
+# The Lustre leg MUST be restricted to the same sources the container holds.
+# surg_vid_webdataset_resharded has 61 dirs (…_bak_under192, …_staging, …_clean,
+# superseded segmentations) against the 16 in the mix, so pointing the benchmark
+# at the root would have each leg reading a DIFFERENT set of files at different
+# sizes -- not a comparison. Build a symlink farm of exactly what DAOS has.
+LUSTRE_ROOT=/flare/ModCon/ngetty/data/surg_vid_webdataset_resharded
+PE_SRC=/flare/ModCon/ngetty/data/pe_video_wds/pe_video
 
 SCRATCH=${SCRATCH_DIR:-/flare/ModCon/ngetty/logs}
+
+# Mirror the container's sources into a symlink farm so the Lustre leg reads the
+# SAME set of files. Derived from what the container actually holds, so a partial
+# ingest still yields a fair comparison over whatever is present.
+LUSTRE_SRC=$SCRATCH/_bench_farm_${PBS_JOBID%%.*}
+rm -rf "$LUSTRE_SRC"; mkdir -p "$LUSTRE_SRC"
+for s in $(ls -A "$MNT" 2>/dev/null); do
+  if [[ -d "$LUSTRE_ROOT/$s" ]]; then
+    ln -s "$LUSTRE_ROOT/$s" "$LUSTRE_SRC/$s"
+  elif [[ "$s" == "pe_video" && -d "$PE_SRC" ]]; then
+    ln -s "$PE_SRC" "$LUSTRE_SRC/pe_video"
+  fi
+done
+echo "Lustre leg mirrors $(ls -A "$LUSTRE_SRC" | wc -l) of $(ls -A "$MNT" | wc -l) container sources"
 PYSRC=$SCRATCH/_daos_rd_$$.py
 cat > "$PYSRC" <<'PY'
 import os, sys, time
@@ -131,5 +152,5 @@ PY
   echo "DAOS only has to clear that bar, not win a peak-bandwidth contest."
 } | tee "$OUT"
 
-rm -f "$PYSRC"
+rm -f "$PYSRC"; rm -rf "$LUSTRE_SRC"
 echo "JOB END $(date)"
