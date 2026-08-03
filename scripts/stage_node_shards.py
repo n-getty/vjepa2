@@ -48,8 +48,23 @@ def _node_rank():
     )
 
 
+# Minimum shards a node keeps per source under --partition-mode nodes. The
+# loader slices the node's staged dir by LOCAL rank (12) and then again by
+# DataLoader worker (num_workers=2), so a node needs >= 12*2 shards for every
+# worker to get a non-degenerate pool. Below that, workers re-read one tar.
+SHARDS_PER_NODE_MIN = 24
+
+
 def _shards_for_node(num_shards, node_rank, num_nodes, local_world_size):
-    """Indices of shards this node should hold given the loader's slicing."""
+    """Indices of shards this node should hold given the loader's slicing.
+
+    Legacy (default) partition: disjoint slice keyed on the GLOBAL world size.
+    A source with fewer shards than world_size is replicated in full on every
+    node -- which is what makes this mode unusable past ~32 nodes (at 256n,
+    world_size=3072 exceeds every source's shard count, so the whole corpus
+    lands on every node's /tmp). Kept as the default so the in-flight 16n
+    chains keep staging byte-identical shard sets across resumes.
+    """
     world_size = num_nodes * local_world_size
     if num_shards < world_size:
         return list(range(num_shards))
@@ -57,6 +72,39 @@ def _shards_for_node(num_shards, node_rank, num_nodes, local_world_size):
         i for i in range(num_shards)
         if (i % world_size) // local_world_size == node_rank
     ]
+
+
+def _shards_for_node_bynode(num_shards, node_rank, num_nodes,
+                            min_shards=SHARDS_PER_NODE_MIN):
+    """Indices of shards this node holds, partitioned by NODE COUNT.
+
+    Each node takes a contiguous wraparound window of
+    ``max(ceil(S/N), min_shards)`` shards starting at ``floor(n*S/N)``.
+
+    Why this is correct, and why the global-world_size math was never needed:
+    every production launcher sets ``WDS_LOCAL_SLICING=1``, so
+    ``src/datasets/webdataset.py:_make_stream`` slices the URL list by LOCAL
+    rank/world (12) -- never by the 3072-rank global world. And
+    ``_load_or_build_metadata`` re-lists the node's local dir and overwrites
+    ``shard_urls`` with whatever is actually present, keeping ``sample_count``
+    from the copied metadata.json (so the ipe math is unaffected). The loader
+    therefore consumes whatever subset a node holds: the staging partition is a
+    free parameter, and the "source needs >= nodes*12 shards" threshold was an
+    artifact of this function rather than a property of the data path.
+
+    Windows are sized >= the S/N stride, so their union covers every shard.
+    Windows OVERLAP between nodes once ``min_shards`` binds (small sources) --
+    that is intended and harmless: distinct nodes holding the same shard still
+    draw different clips from it (``resampled=True`` + per-rank shuffle), and
+    cross-node sample overlap is already the norm for any source the mixer
+    revisits within an epoch.
+    """
+    if num_shards <= 0:
+        return []
+    stride = -(-num_shards // num_nodes)  # ceil(S/N)
+    take = min(max(stride, min_shards), num_shards)
+    start = (node_rank * num_shards) // num_nodes
+    return sorted({(start + k) % num_shards for k in range(take)})
 
 
 def _copy_one(src, dst):
@@ -68,12 +116,23 @@ def _copy_one(src, dst):
     return dst, True
 
 
+def _choose_shards(num_shards, node_rank, num_nodes, local_world_size,
+                   partition_mode="world", min_shards=SHARDS_PER_NODE_MIN):
+    """Dispatch to the legacy or by-node partition."""
+    if partition_mode == "nodes":
+        return _shards_for_node_bynode(num_shards, node_rank, num_nodes,
+                                       min_shards=min_shards)
+    return _shards_for_node(num_shards, node_rank, num_nodes, local_world_size)
+
+
 def stage_dataset(src_dir, dst_dir, node_rank, num_nodes, local_world_size,
-                  num_workers=8):
+                  num_workers=8, partition_mode="world",
+                  min_shards=SHARDS_PER_NODE_MIN):
     """Stage this node's slice of src_dir into dst_dir. Returns counts."""
     os.makedirs(dst_dir, exist_ok=True)
     shards = sorted(f for f in os.listdir(src_dir) if f.endswith(".tar"))
-    chosen_idx = _shards_for_node(len(shards), node_rank, num_nodes, local_world_size)
+    chosen_idx = _choose_shards(len(shards), node_rank, num_nodes,
+                                local_world_size, partition_mode, min_shards)
     chosen = [shards[i] for i in chosen_idx]
     if not chosen:
         return 0, 0
@@ -107,6 +166,18 @@ def main():
                    help="Ranks per node (ppn passed to trainer)")
     p.add_argument("--workers", type=int, default=8,
                    help="Parallel copies per dataset")
+    p.add_argument("--partition-mode", choices=("world", "nodes"),
+                   default="world",
+                   help="'world' (default, legacy): disjoint slice keyed on "
+                        "num_nodes*local_world_size; replicates any source with "
+                        "fewer shards than that -- unusable past ~32 nodes. "
+                        "'nodes': wraparound window keyed on node count with a "
+                        "--min-shards-per-node floor; required for >=64 nodes.")
+    p.add_argument("--min-shards-per-node", type=int,
+                   default=SHARDS_PER_NODE_MIN,
+                   help="Floor on shards/node under --partition-mode nodes. "
+                        "Should be >= local_world_size * dataloader workers so "
+                        "every worker gets a distinct shard.")
     args = p.parse_args()
 
     node_rank = _node_rank()
@@ -135,8 +206,9 @@ def main():
             shards = sorted(f for f in os.listdir(src) if f.endswith(".tar"))
         except FileNotFoundError:
             continue
-        idx = _shards_for_node(len(shards), node_rank, args.num_nodes,
-                               args.local_world_size)
+        idx = _choose_shards(len(shards), node_rank, args.num_nodes,
+                             args.local_world_size, args.partition_mode,
+                             args.min_shards_per_node)
         for i in idx:
             try:
                 need_bytes += os.path.getsize(os.path.join(src, shards[i]))
@@ -152,12 +224,25 @@ def main():
     print(f"[node {node_rank}] preflight: need ~{need_gb:.1f} GiB, "
           f"/tmp free ~{free_gb:.1f} GiB", flush=True)
     if free_bytes >= 0 and need_bytes > free_bytes * 0.95:
+        if args.partition_mode == "world":
+            hint = (
+                f"Likely a non-resharded dataset "
+                f"(<{args.num_nodes * args.local_world_size} shards) being "
+                f"copied in full per node. Use the _resharded dataset paths, "
+                f"reduce the dataset set, or switch to "
+                f"--partition-mode nodes (required past ~32 nodes)."
+            )
+        else:
+            hint = (
+                f"Under --partition-mode nodes each node takes "
+                f"max(ceil(S/{args.num_nodes}), {args.min_shards_per_node}) "
+                f"shards per source, so the floor dominates for small sources. "
+                f"Lower --min-shards-per-node (>= local_world_size * dataloader "
+                f"workers) or drop the largest sources."
+            )
         raise SystemExit(
             f"[node {node_rank}] ABORT: staging needs ~{need_gb:.1f} GiB but "
-            f"/tmp has ~{free_gb:.1f} GiB free. Likely a non-resharded dataset "
-            f"(<{args.num_nodes * args.local_world_size} shards) being copied "
-            f"in full per node. Use the _resharded dataset paths, or reduce the "
-            f"dataset set."
+            f"/tmp has ~{free_gb:.1f} GiB free. {hint}"
         )
 
     total_chosen = 0
@@ -170,6 +255,8 @@ def main():
             n_chosen, n_copied = stage_dataset(
                 src, dst, node_rank, args.num_nodes, args.local_world_size,
                 num_workers=args.workers,
+                partition_mode=args.partition_mode,
+                min_shards=args.min_shards_per_node,
             )
         except FileNotFoundError as e:
             print(f"[node {node_rank}] SKIP {name}: {e}", flush=True)
