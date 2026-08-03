@@ -139,8 +139,18 @@ echo "HOLD READY: ${NNODES} nodes, ${WORLD} ranks, jobid=$PBS_JOBID"
 echo "CMD_DIR=$CMD_DIR"
 echo "  drop run_*.sh there; output -> run_*.out, rc -> run_*.done; touch STOP to release"
 
-# Poll loop. Each injected script runs in the BACKGROUND so a hung command never
-# blocks the hold or the queue behind it.
+# Poll loop. Injected scripts run SEQUENTIALLY (a lock, not '&').
+#
+# The first version backgrounded each script so a hang could not block the hold.
+# That made run_2 and run_3 launch 55 s after run_1 and all three raced for the
+# rendezvous port: "EADDRINUSE ... port: 29500". Two validations died at startup
+# for a reason that had nothing to do with what they were testing.
+#
+# Distributed runs are not concurrency-safe on one allocation -- they contend for
+# the port AND for all 24 tiles. Serialize instead, and give each script its own
+# MASTER_PORT so a leftover socket from a previous run cannot poison the next.
+# HANG PROTECTION now comes from the per-script `timeout` (each run_N.sh wraps its
+# own mpiexec), not from backgrounding.
 seen=""
 end=$(( $(date +%s) + ${HOLD_SECONDS:-1700} ))
 while [ "$(date +%s)" -lt "$end" ]; do
@@ -149,8 +159,11 @@ while [ "$(date +%s)" -lt "$end" ]; do
         [ -e "$c" ] || continue
         case " $seen " in *" $c "*) continue;; esac
         seen="$seen $c"
-        echo "=== LAUNCH $(basename $c) @ $(date) ==="
-        ( bash "$c" > "${c%.sh}.out" 2>&1; echo "rc=$?" > "${c%.sh}.done" ) &
+        port=$(( 29500 + RANDOM % 500 ))
+        echo "=== LAUNCH $(basename $c) @ $(date)  MASTER_PORT=$port ==="
+        MASTER_PORT=$port bash "$c" > "${c%.sh}.out" 2>&1
+        echo "rc=$?" > "${c%.sh}.done"
+        echo "=== DONE $(basename $c) rc=$(cat ${c%.sh}.done) @ $(date) ==="
     done
     sleep 5
 done
