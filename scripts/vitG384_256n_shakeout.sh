@@ -159,20 +159,26 @@ TRAIN_DT=$(( $(date +%s) - TRAIN_T0 ))
 # fine until the hour expired" from "died at rank 0".
 CSV=$CKPT_DIR/log_r0.csv
 ROWS=$(awk -F, '$2 ~ /^[0-9]+$/ {n++} END{print n+0}' "$CSV" 2>/dev/null || echo 0)
-echo
-echo "================ SHAKEOUT SUMMARY ================"
-echo "train rc=$TRAIN_RC  elapsed=${TRAIN_DT}s  csv rows=$ROWS"
-if [[ -f "$CSV" ]]; then
-  echo "--- CSV header + first/last rows (PhaseTimer breakdown) ---"
-  head -1 "$CSV"; sed -n '2p' "$CSV"; tail -2 "$CSV"
-fi
-if (( ROWS >= 20 )); then
-  echo "SHAKEOUT VERDICT: PASS -- $ROWS iters at $WORLD ranks."
-  echo "  Staging, rendezvous and the training loop all work at 256 nodes."
-  echo "  Next: read the per-iter time above against the 16n baseline before prod."
-else
-  echo "SHAKEOUT VERDICT: FAIL -- only $ROWS iters logged."
-  echo "  Staging passed (Q1), so look at rendezvous/first-iter: grep the log for"
-  echo "  DistStoreError, timeout, or a rank stack dump."
-fi
-echo "JOB END: $(date)"
+# Verdict also to a DETERMINISTIC path -- PBS names its own log
+# <jobid>.<server>.OU, which no watcher can predict.
+VERDICT_FILE=/flare/ModCon/ngetty/logs/shake256_VERDICT.txt
+{
+  echo
+  echo "================ SHAKEOUT SUMMARY ================"
+  echo "job: ${PBS_JOBID:-interactive}  $(date)"
+  echo "train rc=$TRAIN_RC  elapsed=${TRAIN_DT}s  csv rows=$ROWS  ranks=$WORLD"
+  if [[ -f "$CSV" ]]; then
+    echo "--- CSV header + first/last rows (PhaseTimer breakdown) ---"
+    head -1 "$CSV"; sed -n '2p' "$CSV"; tail -2 "$CSV"
+  fi
+  if (( ROWS >= 20 )); then
+    echo "SHAKEOUT VERDICT: PASS -- $ROWS iters at $WORLD ranks."
+    echo "  Staging, rendezvous and the training loop all work at 256 nodes."
+    echo "  Next: read the per-iter time above against the 16n baseline before prod."
+  else
+    echo "SHAKEOUT VERDICT: FAIL -- only $ROWS iters logged."
+    echo "  Staging passed (Q1), so look at rendezvous/first-iter: grep the log for"
+    echo "  DistStoreError, timeout, or a rank stack dump."
+  fi
+  echo "JOB END: $(date)"
+} | tee "$VERDICT_FILE"

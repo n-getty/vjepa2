@@ -127,14 +127,23 @@ FAILED=0
 run_leg bs1     1 1  || FAILED=1
 run_leg accum16 2 16 || FAILED=1
 
-echo
-echo "================ SUMMARY ================"
-echo "logs: $OUTDIR"
-if (( FAILED )); then
-  echo "GATE FAILED -- do NOT submit the 16n arms yet."
-  echo "  bs1 fail     -> keep per-rank bs=2; 256n global batch is 6144, not 3072."
-  echo "  accum16 fail -> the arms cannot emulate the 256n batch this way;"
-  echo "                  bisect accum (2,4,8) before spending 16n time."
-  exit 1
-fi
-echo "GATE PASSED -- ./scripts/submit_large_batch_arm.sh lbA (and lbB)"
+# Verdict also goes to a DETERMINISTIC path. PBS names its own log
+# <jobid>.<server>.OU, which nothing downstream can predict, so a watcher has to
+# guess the filename. This file is always here.
+VERDICT_FILE=/flare/ModCon/ngetty/logs/lbgate_VERDICT.txt
+{
+  echo
+  echo "================ SUMMARY ================"
+  echo "job:  ${PBS_JOBID:-interactive}   $(date)"
+  echo "logs: $OUTDIR"
+  if (( FAILED )); then
+    echo "GATE FAILED -- do NOT submit the 16n arms yet."
+    echo "  bs1 fail     -> keep per-rank bs=2; 256n global batch is 6144, not 3072."
+    echo "  accum16 fail -> the arms cannot emulate the 256n batch this way;"
+    echo "                  bisect accum (2,4,8) before spending 16n time."
+  else
+    echo "GATE PASSED -- ./scripts/submit_large_batch_arm.sh lbA (and lbB)"
+  fi
+} | tee "$VERDICT_FILE"
+(( FAILED )) && exit 1
+exit 0
