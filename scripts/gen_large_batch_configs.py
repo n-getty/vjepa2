@@ -195,6 +195,7 @@ def main():
 
     if not os.path.exists(BASE):
         sys.exit(f"missing base config: {BASE}")
+    os.makedirs(args.outdir, exist_ok=True)
     with open(BASE) as f:
         base_lines = f.read().splitlines()
 
@@ -245,18 +246,20 @@ def main():
             "",
         ]
 
-        in_opt = in_model = False
+        in_opt = in_model = in_data = False
         for line in base_lines:
             if line.startswith("folder:"):
                 out.append("folder: /flare/ModCon/ngetty/checkpoints/"
                            f"surg_2_1_vitG384_{arm}/vitG384_n16g12_{arm}")
                 continue
             if line.startswith("optimization:"):
-                in_opt, in_model = True, False
+                in_opt, in_model, in_data = True, False, False
             elif line.startswith("model:"):
-                in_model, in_opt = True, False
+                in_model, in_opt, in_data = True, False, False
+            elif line.startswith("data:"):
+                in_data, in_opt, in_model = True, False, False
             elif line and not line.startswith((" ", "-")):
-                in_opt = in_model = False
+                in_opt = in_model = in_data = False
 
             s = line.strip()
             indent = line[: len(line) - len(line.lstrip())]
@@ -278,6 +281,13 @@ def main():
                     continue
                 if s.startswith("lambda_end_iter:"):
                     out.append(f"{indent}lambda_end_iter: {d['lambda_end']}")
+                    continue
+            if in_data:
+                # Without this, --per-rank-bs was accepted, reported, and then
+                # silently dropped -- emitting a bs=2 config while the printed
+                # derivation claimed bs=1, i.e. half the intended global batch.
+                if s.startswith("batch_size:"):
+                    out.append(f"{indent}batch_size: {d['per_rank_bs']}")
                     continue
             out.append(line)
 
