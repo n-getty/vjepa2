@@ -74,10 +74,23 @@ BASE_WARMUP_EPOCHS = 33.3
 BASE_LAMBDA = (500, 1500)
 BASE_GLOBAL_BATCH = 384  # 16 nodes x 12 tiles x bs2
 
+# LR haircut applied to the sqrt rule. sqrt(mult) is the textbook scaling when the
+# gradient is a batch MEAN, but it assumes a well-conditioned objective and this one
+# collapses when hot (train.py:176-177), so arm A takes ~0.7x of sqrt. Derived from
+# --batch-mult rather than hardcoded: at mult 16 this gives 2.1e-4 and at mult 8
+# 1.5e-4, whereas a fixed value would silently be the wrong scaling for the other.
+BASE_LR = 7.5e-5
+SQRT_HAIRCUT = 0.70
+
+
+def _arm_lr(batch_mult):
+    return BASE_LR * (batch_mult ** 0.5) * SQRT_HAIRCUT
+
+
 ARMS = {
     "lbA": {
-        "lr": 2.0e-4,
-        "role": "sqrt-scaled LR (haircut from 3.0e-4)",
+        "lr": None,  # filled from --batch-mult by _arm_lr()
+        "role": "sqrt-scaled LR (haircut from the full sqrt rule)",
         "why": (
             "sqrt(mult) is the standard rule when the gradient is a MEAN over the\n"
             "batch (it is: train.py:1076,1104,1115) and batch growth cuts gradient\n"
@@ -200,6 +213,12 @@ def main():
         base_lines = f.read().splitlines()
 
     d = derive(args.batch_mult, args.per_rank_bs)
+    if ARMS["lbA"]["lr"] is None:
+        ARMS["lbA"]["lr"] = _arm_lr(args.batch_mult)
+        print(f"arm lbA lr = {BASE_LR:.2e} x sqrt({args.batch_mult}) x "
+              f"{SQRT_HAIRCUT} = {ARMS['lbA']['lr']:.2e}  "
+              f"(full sqrt {BASE_LR * args.batch_mult**0.5:.2e}, "
+              f"linear {BASE_LR * args.batch_mult:.2e})")
 
     print(f"Derived large-batch recipe ({args.batch_mult}x):")
     for k in ("global_batch", "true_accum", "ipe", "epochs", "total_steps",
