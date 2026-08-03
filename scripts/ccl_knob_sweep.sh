@@ -93,8 +93,12 @@ export MPICH_GPU_SUPPORT_ENABLED=1
 export CCL_PROCESS_LAUNCHER=none
 export CCL_ATL_TRANSPORT=ofi
 export CCL_KVS_IFACE=hsn0
-export CCL_KVS_MODE=
-export CCL_KVS_USE_MPI_RANKS=
+# UNSET, not empty. oneCCL validates this enum and rejects '': it raised
+# "CCL_KVS_MODE: unexpected value: , expected values: pmi, mpi, pmix_ofi,
+# pmix_ofi_shm" and killed the accum=2 arm of job 8731004 at iter 0. findings 5a
+# literally says 'CCL_KVS_MODE=   # NEUTRALIZE (empty string)' -- that guidance is
+# wrong for this oneCCL build. Removing the vars is what neutralizes them.
+unset CCL_KVS_MODE CCL_KVS_USE_MPI_RANKS
 export CCL_OP_SYNC=1
 export CCL_LOG_LEVEL=${CCL_LOG_LEVEL:-error}
 export CCL_WORKER_COUNT=1

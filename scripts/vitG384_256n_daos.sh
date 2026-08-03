@@ -108,8 +108,12 @@ export CCL_KVS_IFACE=hsn0
 # OWN KVS over CXI, which is what launcher=none + ofi requires (findings 5a).
 # Free insurance -- this script does not inherit that global today, but a future
 # wrapper might.
-export CCL_KVS_MODE=
-export CCL_KVS_USE_MPI_RANKS=
+# UNSET, not empty. oneCCL validates this enum and rejects '': it raised
+# "CCL_KVS_MODE: unexpected value: , expected values: pmi, mpi, pmix_ofi,
+# pmix_ofi_shm" and killed the accum=2 arm of job 8731004 at iter 0. findings 5a
+# literally says 'CCL_KVS_MODE=   # NEUTRALIZE (empty string)' -- that guidance is
+# wrong for this oneCCL build. Removing the vars is what neutralizes them.
+unset CCL_KVS_MODE CCL_KVS_USE_MPI_RANKS
 export CCL_OP_SYNC=1
 # CCL_WARN emitted 10,900 lines at 3072 ranks (device-uuid vector warnings that
 # are expected under HSDP). Not actionable, and they were a tenth of the funnel.
