@@ -48,6 +48,19 @@ ROOT=/lus/flare/projects/ModCon/ngetty/vjepa2
 POOL=${DAOS_POOL:-AuroraGPT}
 CONT=${DAOS_CONT:-vjepa_surg_wds}
 DAOS_MNT=/tmp/${POOL}/${CONT}
+# Model weights live in their OWN container. Job 8730487 died learning why:
+# the corpus was on DAOS but `pretrain_checkpoint` was still a 28.2 GB file on
+# Lustre, and all 3072 ranks read it independently -- up to 85 TB against a
+# filesystem measured at 2.71 GB/s. Ranks cleared the checkpoint load at only
+# ~69/min, so the job would have spent its whole hour loading and never reached
+# an iteration. Invisible at 16n (192 ranks x 28 GB is tolerable); fatal at 3072.
+#
+# Note the oclass differs from the corpus container ON PURPOSE: vjepa_models uses
+# EC_16P3GX (stripe each file across ALL servers -- right for ONE big file every
+# rank reads), while vjepa_surg_wds uses EC_16P3G32 (right for thousands of
+# independent shards). Same reasoning, opposite answer.
+MODELS_CONT=${DAOS_MODELS_CONT:-vjepa_models}
+MODELS_MNT=/tmp/${POOL}/${MODELS_CONT}
 PPN=12
 NNODES=$(sort -u "${PBS_NODEFILE:-/dev/null}" 2>/dev/null | wc -l); NNODES=${NNODES:-256}
 WORLD=$(( NNODES * PPN ))
@@ -114,6 +127,9 @@ export WORLD_SIZE=$WORLD
 echo "MASTER_ADDR=$MASTER_ADDR WORLD_SIZE=$WORLD_SIZE WDS_LOCAL_SLICING=$WDS_LOCAL_SLICING"
 
 # Mount the container on every node.
+launch-dfuse.sh ${POOL}:${MODELS_CONT} || { echo "FATAL: launch-dfuse (models) failed"; exit 1; }
+timeout 60 ls "$MODELS_MNT" >/dev/null 2>&1 || { echo "FATAL: $MODELS_MNT unresponsive"; exit 1; }
+echo "models container mounted: $(ls "$MODELS_MNT" 2>/dev/null | tr '\n' ' ')"
 launch-dfuse.sh ${POOL}:${CONT} || { echo "FATAL: launch-dfuse failed"; exit 1; }
 mount | grep -q "$CONT" || { echo "FATAL: not mounted at $DAOS_MNT"; exit 1; }
 # A hung dfuse presents as a hang much later, in the loader, on one rank. Catch
@@ -126,13 +142,26 @@ $PY $ROOT/scripts/prepare_runtime_config.py \
     echo "FATAL: prepare_runtime_config failed"; exit 1; }
 RUNTIME_CFG=$ROOT/.runtime_configs/n${NNODES}g${PPN}_weak/configs/vitg16_surg_vid_webdataset_single4/${CFG_NAME}.yaml
 cp "$RUNTIME_CFG" "$PARAMS" || { echo "FATAL: no runtime config"; exit 1; }
-$PY - "$PARAMS" "$CKPT_DIR" "$SHAKE_IPE" <<'PY'
-import sys, yaml
-p, d, ipe = sys.argv[1], sys.argv[2], int(sys.argv[3])
+$PY - "$PARAMS" "$CKPT_DIR" "$SHAKE_IPE" "$MODELS_MNT" <<'PY'
+import sys, yaml, os
+p, d, ipe, models = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 c = yaml.safe_load(open(p))
 c["folder"] = d
 c["optimization"]["ipe"] = ipe
 c["optimization"]["epochs"] = 1
+# Repoint the init checkpoint at DAOS. Leaving it on Lustre is what killed job
+# 8730487: 3072 ranks each pulling 28.2 GB off a 2.71 GB/s filesystem.
+meta = c.setdefault("meta", {})
+ck = meta.get("pretrain_checkpoint")
+if ck:
+    cand = os.path.join(models, os.path.basename(ck))
+    if os.path.exists(cand):
+        meta["pretrain_checkpoint"] = cand
+        print(f"pretrain_checkpoint -> {cand} (DAOS)")
+    else:
+        # Do not silently fall back to Lustre: that is precisely the failure we
+        # are fixing, and at 3072 ranks it burns the whole allocation.
+        sys.exit(f"FATAL: {cand} missing -- stage the checkpoint into DAOS first")
 yaml.safe_dump(c, open(p, "w"), sort_keys=False)
 print(f"folder={d} ipe={ipe} epochs=1")
 PY
