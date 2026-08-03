@@ -31,6 +31,14 @@
 # Injected scripts inherit the full HSDP+DAOS env below, plus $WORLD, $DAOS_MNT,
 # $MODELS_MNT, $NNODES, $PPN, $CMD_DIR.
 #
+# WRITE YOUR run_N.sh SO ITS EXIT CODE MEANS SOMETHING. A script ending in
+# `mpiexec ... | tail -12` returns tail's status, and one ending in an awk
+# summary returns awk's -- both are 0 even when the run produced no iterations.
+# run_2/run_3 of job 8731170 reported rc=0 while dying on EADDRINUSE with no CSV.
+# End the script with an explicit check, e.g.:
+#     n=$(awk -F, '$2~/^[0-9]+$/{c++} END{print c+0}' $OUT/log_r0.csv 2>/dev/null)
+#     [ "${n:-0}" -ge 1 ] || { echo "FAIL: no iterations"; exit 1; }
+#
 # NOTE: no `set -u` (memory set-u-module-load-trap).
 #
 #PBS -N holddaos
