@@ -91,6 +91,23 @@ export VJEPA_TRUE_ACCUM=1   # the 256n batch is real, not emulated
 # here on purpose -- a timeout would be indistinguishable from a real hang.
 export TORCH_DIST_TIMEOUT_SECONDS=${TORCH_DIST_TIMEOUT_SECONDS:-3600}
 
+# RENDEZVOUS IDENTITY. WORLD_SIZE must be exported explicitly: PMI/PMIx SIZE is
+# unreliable across hosts of one multi-host task (different hosts report
+# different values, silently breaking every collective), so
+# src/utils/distributed.py:157 deliberately PREFERS an orchestrator-supplied
+# WORLD_SIZE over PMI SIZE. Omitting it is the documented
+# aurora-multi-mpi-per-pbs-worldsize failure, and it would be far worse at 3072
+# ranks than at the 192 where it was found.
+if [[ -n "${PBS_NODEFILE:-}" && -r "${PBS_NODEFILE}" ]]; then
+  MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
+else
+  MASTER_ADDR=$(hostname)
+fi
+export MASTER_ADDR
+export MASTER_PORT=29500
+export WORLD_SIZE=$WORLD
+echo "MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT WORLD_SIZE=$WORLD_SIZE"
+
 # Runtime config for THIS topology. --weak-scale keeps per-rank bs at 2, so the
 # global batch is 6144 -- exactly what the lbA schedule was derived for.
 $PY $ROOT/scripts/prepare_runtime_config.py \
