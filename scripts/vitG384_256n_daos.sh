@@ -68,7 +68,20 @@ SHAKE_IPE=${VJEPA_SHAKE_IPE:-50}
 
 CFG_NAME=${VJEPA_CFG_NAME:-vitG384_lbA8}
 BASE_CFG=$ROOT/configs/vitg16_surg_vid_webdataset_single4/${CFG_NAME}.yaml
-CKPT_DIR=${VJEPA_CKPT_DIR:-/flare/ModCon/ngetty/checkpoints/daos_256n/${CFG_NAME}}
+# PER-JOB output dir. This is a shakeout, not a resumable production run, so
+# every job gets its own directory keyed by jobid and node count.
+#
+# Sharing one dir across runs is what made log_r0.csv a cross-job append target,
+# and that single fact produced three separate false readings today: a verdict
+# crediting this job with the previous run's 4 iterations, an mtime-based guard
+# that could not fix it (appending refreshes mtime), and a monitor reporting a
+# queued 64n job as "11 iters" from the finished 16n run's tail. Isolating the
+# directory removes the root cause instead of teaching every consumer to parse
+# around it.
+#
+# Set VJEPA_CKPT_DIR explicitly for a run that is meant to resume.
+_TAG="${PBS_JOBID%%.*}"; _TAG="${_TAG:-manual}"
+CKPT_DIR=${VJEPA_CKPT_DIR:-/flare/ModCon/ngetty/checkpoints/daos_shakeout/${CFG_NAME}_n${NNODES}_${_TAG}}
 PARAMS=$CKPT_DIR/params-pretrain.yaml
 PY=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python
 VERDICT=/flare/ModCon/ngetty/logs/daos256_VERDICT.txt
