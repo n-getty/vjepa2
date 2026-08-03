@@ -1,0 +1,123 @@
+#!/bin/bash
+# 1-NODE GATE for the 256-node plan. Two things it must clear before any 16n
+# arm (let alone prod time) is worth submitting:
+#
+#   leg bs1     -- per-rank batch_size=1 on the weight_distance_loss path.
+#                  This is the documented "bs>=2" landmine (d_ij.unsqueeze(2)
+#                  IndexError). masks_dist.py's squeeze(1) fix makes it legal and
+#                  tests/models/test_masks_dist_batch1.py covers the tensor math,
+#                  but it has NEVER been run end-to-end through the trainer.
+#                  If it passes, 256n global batch is 3072 instead of 6144 --
+#                  halving every large-batch recipe delta.
+#
+#   leg accum16 -- VJEPA_TRUE_ACCUM=16, the mechanism the 16n arms use to emulate
+#                  the 256n batch. accum=2 is the ONLY value ever tried at scale
+#                  and it HUNG at 16n (memory ga2-not-validated-16n). accum=16 is
+#                  untested at any scale. A 1-node hang here costs an hour; the
+#                  same hang at 16n costs 16 node-hours and a queue slot.
+#
+# Both legs are ~40 iters on the SMOKE config, same node, sequential.
+#
+# Run INSIDE a held 1-node allocation (see scripts/hold_node_1n.sh), from the
+# compute node -- not via qsub, so a failure is inspectable immediately:
+#   bash scripts/large_batch_smoke_1n.sh
+#
+# NOTE: no `set -u` -- Aurora's lmod init references unbound vars and would abort
+# the script at `module load` (memory set-u-module-load-trap).
+set -o pipefail
+
+REPO=/lus/flare/projects/ModCon/ngetty/vjepa2
+PY=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python
+CFG=$REPO/configs/vitg16_surg_vid_webdataset_single4/SMOKE_vitG384.yaml
+OUTDIR=/flare/ModCon/ngetty/logs/lb_smoke_$(date +%y%m%d_%H%M%S)
+mkdir -p "$OUTDIR"
+cd "$REPO"
+
+module load frameworks 2>/dev/null
+export PYTHONNOUSERSITE=1
+source /flare/ModCon/ngetty/venvs/torchtune-pt213-xpu/bin/activate 2>/dev/null
+export PYTHONPATH=$REPO:$PYTHONPATH
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export MPICH_GPU_SUPPORT_ENABLED=1
+# Single-node interactive: the pmix/mpi transport is fine here (the ofi/none
+# combination is only required for multi-node HSDP subgroup collectives).
+export CCL_PROCESS_LAUNCHER=pmix
+export CCL_ATL_TRANSPORT=mpi
+export CCL_KVS_MODE=mpi
+export CCL_KVS_USE_MPI_RANKS=1
+export CCL_OP_SYNC=1
+export CCL_WORKER_COUNT=1
+export CCL_ALLREDUCE=ring
+export FI_PROVIDER=cxi
+export PYTHONFAULTHANDLER=1
+export TMPDIR=/tmp
+export OMP_NUM_THREADS=8
+export http_proxy="http://proxy.alcf.anl.gov:3128"
+export https_proxy="http://proxy.alcf.anl.gov:3128"
+export ftp_proxy="http://proxy.alcf.anl.gov:3128"
+export VJEPA_DIST_STRATEGY=hsdp
+export LOCAL_WORLD_SIZE=12
+export FSDP_SHARDING=shard_grad_op
+export VJEPA_NUM_WORKERS=0
+export MASTER_ADDR=$(hostname)
+export MASTER_PORT=29613
+export WORLD_SIZE=12
+
+# Per-leg config: override batch_size without editing the shared SMOKE yaml.
+make_cfg () {
+  local bs=$1 out=$2
+  $PY - "$CFG" "$bs" "$out" <<'PY'
+import sys, yaml
+src, bs, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+c = yaml.safe_load(open(src))
+c["data"]["batch_size"] = bs
+yaml.safe_dump(c, open(out, "w"), sort_keys=False)
+print(f"wrote {out} (batch_size={bs})")
+PY
+}
+
+run_leg () {
+  local name=$1 bs=$2 accum=$3
+  local folder=$OUTDIR/$name log=$OUTDIR/${name}.log cfg=$OUTDIR/${name}.yaml
+  mkdir -p "$folder"
+  make_cfg "$bs" "$cfg" || { echo "[$name] config gen FAILED"; return 1; }
+  echo "===== LEG $name  (batch_size=$bs  VJEPA_TRUE_ACCUM=$accum) ====="
+  local t0=$(date +%s)
+  timeout 3600 mpiexec --pmi=pmix -n 12 -ppn 12 --cpu-bind depth --depth 8 \
+    env VJEPA_TRUE_ACCUM=$accum \
+    python -m app.main_dist_aurora --train_mode \
+      --fname "$cfg" --params_path "$cfg" --folder "$folder" \
+      2>&1 | tee "$log"
+  local rc=$? dt=$(( $(date +%s) - t0 ))
+  if (( rc == 124 )); then
+    echo "[$name] VERDICT: TIMEOUT after ${dt}s -- treat as a HANG, not a slow run."
+    return 1
+  fi
+  # A leg only passes if it actually produced finite losses, not merely exited 0.
+  local rows
+  rows=$(awk -F, '$2 ~ /^[0-9]+$/ {n++} END{print n+0}' "$folder/log_r0.csv" 2>/dev/null || echo 0)
+  local nan
+  nan=$(grep -ciE "nan|inf" "$log" 2>/dev/null || echo 0)
+  echo "[$name] rc=$rc  ${dt}s  csv_rows=$rows  nan/inf_mentions=$nan"
+  if (( rc != 0 )); then echo "[$name] VERDICT: FAIL (rc=$rc)"; return 1; fi
+  if (( rows < 5 ));  then echo "[$name] VERDICT: FAIL (only $rows iters logged)"; return 1; fi
+  echo "[$name] VERDICT: PASS ($rows iters)"
+  grep -iE "loss" "$log" | tail -3
+  return 0
+}
+
+FAILED=0
+run_leg bs1     1 1  || FAILED=1
+run_leg accum16 2 16 || FAILED=1
+
+echo
+echo "================ SUMMARY ================"
+echo "logs: $OUTDIR"
+if (( FAILED )); then
+  echo "GATE FAILED -- do NOT submit the 16n arms yet."
+  echo "  bs1 fail     -> keep per-rank bs=2; 256n global batch is 6144, not 3072."
+  echo "  accum16 fail -> the arms cannot emulate the 256n batch this way;"
+  echo "                  bisect accum (2,4,8) before spending 16n time."
+  exit 1
+fi
+echo "GATE PASSED -- ./scripts/submit_large_batch_arm.sh lbA (and lbB)"
