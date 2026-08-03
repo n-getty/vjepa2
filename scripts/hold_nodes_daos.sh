@@ -43,7 +43,14 @@
 #
 #PBS -N holddaos
 #PBS -A AuroraGPT
-#PBS -q debug-scaling
+# capacity, not debug-scaling. Measured at 2 nodes (job 8731170): startup
+# -- rendezvous + 28 GB checkpoint load + 2B model build -- is ~22 min, and the
+# 6 iterations after it are ~3 min. Startup is ~88% of a validation run, so three
+# serialized arms need ~75 min and cannot fit debug-scaling's 1 h cap. capacity
+# allows 1-16 nodes for up to 7 days, and does not consume the single
+# debug-scaling slot that the real 64n/256n measurements need.
+# A 2-node 2-hour hold costs 4 node-hours against a 512 node-hour budget.
+#PBS -q capacity
 #PBS -l select=2
 # 30 min keeps this well inside the 1 h cap and is plenty for env checks.
 #
@@ -53,7 +60,7 @@
 # gets BOTH terminated with a bare "Insufficient amount of resource: at_queue"
 # and NO log file, which looks like a resource/walltime problem and is not.
 # Check `qstat -u $USER | grep debug-s` before submitting.
-#PBS -l walltime=00:30:00
+#PBS -l walltime=02:00:00
 #PBS -l filesystems=home:flare:daos_user_fs
 #PBS -j oe
 #PBS -o /flare/ModCon/ngetty/logs/
@@ -160,7 +167,7 @@ echo "  drop run_*.sh there; output -> run_*.out, rc -> run_*.done; touch STOP t
 # HANG PROTECTION now comes from the per-script `timeout` (each run_N.sh wraps its
 # own mpiexec), not from backgrounding.
 seen=""
-end=$(( $(date +%s) + ${HOLD_SECONDS:-1700} ))
+end=$(( $(date +%s) + ${HOLD_SECONDS:-7000} ))
 while [ "$(date +%s)" -lt "$end" ]; do
     [ -f "$CMD_DIR/STOP" ] && { echo "STOP seen, releasing hold."; break; }
     for c in "$CMD_DIR"/run_*.sh; do
