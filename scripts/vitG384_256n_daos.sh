@@ -103,6 +103,13 @@ export MPICH_GPU_SUPPORT_ENABLED=1
 export CCL_PROCESS_LAUNCHER=none
 export CCL_ATL_TRANSPORT=ofi
 export CCL_KVS_IFACE=hsn0
+# Neutralize the DDP-oriented globals in case an outer AURORA_ENV sets them:
+# CCL_KVS_MODE=mpi / CCL_KVS_USE_MPI_RANKS=1 conflict with oneCCL bringing up its
+# OWN KVS over CXI, which is what launcher=none + ofi requires (findings 5a).
+# Free insurance -- this script does not inherit that global today, but a future
+# wrapper might.
+export CCL_KVS_MODE=
+export CCL_KVS_USE_MPI_RANKS=
 export CCL_OP_SYNC=1
 # CCL_WARN emitted 10,900 lines at 3072 ranks (device-uuid vector warnings that
 # are expected under HSDP). Not actionable, and they were a tenth of the funnel.
