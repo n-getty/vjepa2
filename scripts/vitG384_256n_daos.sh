@@ -195,17 +195,24 @@ RC=$?
 DT=$(( $(date +%s) - T0 ))
 
 CSV=$CKPT_DIR/log_r0.csv
-# Count only rows THIS job wrote. Successive runs share $CKPT_DIR, so a CSV left
-# by a previous job is read as the current run's result: the 16n validation
-# (8730846) found rows=4/loss=0.33922 that were verbatim the killed 256n run's
-# output from 27 minutes earlier. That is a false PASS waiting to happen, and it
-# is exactly the class of "plausible number instead of an error" this whole
-# effort keeps tripping over. $T0 is the pre-mpiexec timestamp.
-if [[ -f "$CSV" ]] && [[ $(stat -c %Y "$CSV") -ge $T0 ]]; then
-  ROWS=$(awk -F, '$2 ~ /^[0-9]+$/ {n++} END{print n+0}' "$CSV")
+# Count only rows THIS job wrote. CSVLogger APPENDS across jobs sharing
+# $CKPT_DIR, and each run writes its own header line -- so the file interleaves
+# runs: header, header, 4 rows from the killed 256n job, then this job's header.
+#
+# mtime-gating does NOT work here (my first attempt): appending refreshes the
+# whole file's mtime, so a stale run's rows look current. The header lines are
+# the real run delimiter, so count data rows AFTER THE LAST header.
+#
+# This matters concretely: the 16n validation reported rows=4, loss=0.33922 --
+# verbatim the previous run's numbers -- before writing a single iteration.
+# (It also explains the "duplicate header" I mistook for a rank-0 race at 3072
+# ranks. It was never a race; it is just append mode.)
+if [[ -f "$CSV" ]]; then
+  ROWS=$(awk -F, '$1=="epoch"{n=0; next} $2 ~ /^[0-9]+$/ {n++} END{print n+0}' "$CSV")
+  PRIOR=$(grep -c "^epoch," "$CSV" 2>/dev/null)
+  (( PRIOR > 1 )) && echo "NOTE: $CSV has $PRIOR run headers; counting only rows after the last"
 else
   ROWS=0
-  [[ -f "$CSV" ]] && echo "NOTE: $CSV predates this job ($(stat -c %y "$CSV" | cut -d. -f1)) -- ignoring as stale"
 fi
 {
   echo "================ DAOS 256n ================"
