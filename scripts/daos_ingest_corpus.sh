@@ -79,26 +79,29 @@ SOURCES=(small_surg sitl surgenet_robotic_clean surgtoolloc2022 surgvu24_clean
 
 T0=$(date +%s)
 FAILED=0
-for s in "${SOURCES[@]}"; do
-  src=$SRC_ROOT/$s
-  [[ -d "$src" ]] || { echo "SKIP $s (missing)"; continue; }
-  echo "=== $s ==="
-  t=$(date +%s)
-  mpiexec -n $((NODES * PPN)) -ppn $PPN --cpu-bind none \
-      dsync --progress 30 --bufsize 64MB "$src" "$MNT/$s" \
-    || { echo "  DSYNC FAILED for $s"; FAILED=1; }
-  echo "  $s done in $(( $(date +%s) - t ))s"
-done
 
-# pe_video: dereference symlinks so real bytes land in the container.
-if [[ -d "$PE_SRC" ]]; then
-  echo "=== pe_video (deref symlinks) ==="
-  t=$(date +%s)
-  mpiexec -n $((NODES * PPN)) -ppn $PPN --cpu-bind none \
-      dsync --progress 30 --bufsize 64MB --dereference "$PE_SRC" "$MNT/pe_video" \
-    || { echo "  DSYNC FAILED for pe_video"; FAILED=1; }
-  echo "  pe_video done in $(( $(date +%s) - t ))s"
-fi
+# --dereference on EVERY source, not just the ones known to be symlink trees.
+# The first attempt (job 8730269) only dereferenced pe_video and small_surg came
+# through as 413 bytes of DANGLING symlinks: it is a bundle of links into
+# ../crcd/, ../endovis15/ etc., and those relative targets do not exist inside
+# the container. That is a silent corpus corruption -- dsync exits 0, the tar
+# COUNT matches, and training only discovers it when a shard fails to open.
+# Currently small_surg and pe_video are the symlink trees, but deref is a no-op
+# for regular files, so applying it everywhere removes the whole class of bug
+# rather than maintaining a list that will drift.
+copy_one () {
+  local name=$1 src=$2
+  [[ -d "$src" ]] || { echo "SKIP $name (missing)"; return 0; }
+  echo "=== $name ==="
+  local t=$(date +%s)
+  mpiexec -n $((NODES * PPN)) -ppn $PPN --cpu-bind none --no-vni \
+      dsync --progress 30 --bufsize 64MB --dereference "$src" "$MNT/$name" \
+    || { echo "  DSYNC FAILED for $name"; FAILED=1; }
+  echo "  $name done in $(( $(date +%s) - t ))s"
+}
+
+for s in "${SOURCES[@]}"; do copy_one "$s" "$SRC_ROOT/$s"; done
+copy_one pe_video "$PE_SRC"
 
 DT=$(( $(date +%s) - T0 ))
 
@@ -119,10 +122,22 @@ DT=$(( $(date +%s) - T0 ))
     n_dst=$(ls "$d"/*.tar 2>/dev/null | wc -l)
     n_src=$(ls "$src"/*.tar 2>/dev/null | wc -l)
     meta=$([[ -f "$d/metadata.json" ]] && echo yes || echo NO)
+    # BYTES, not just counts. The symlink failure produced a matching tar count
+    # with 413 bytes of dangling links behind it -- counts alone call that "ok".
+    # -L follows links on the source so we compare real bytes to real bytes.
+    b_dst=$(du -sbL "$d" 2>/dev/null | cut -f1); b_dst=${b_dst:-0}
+    b_src=$(du -sbL "$src" 2>/dev/null | cut -f1); b_src=${b_src:-1}
+    # Any surviving symlink in the destination is a copy that did not dereference.
+    n_link=$(find "$d" -maxdepth 1 -type l 2>/dev/null | wc -l)
+    pct=$(( 100 * b_dst / (b_src > 0 ? b_src : 1) ))
     if [[ "$n_dst" -ne "$n_src" || "$meta" == "NO" ]]; then
       echo "  MISMATCH $s: tars $n_dst/$n_src metadata=$meta"; bad=1
+    elif (( n_link > 0 )); then
+      echo "  SYMLINKS $s: $n_link unresolved links -- re-run with --dereference"; bad=1
+    elif (( pct < 99 )); then
+      echo "  SHORT    $s: ${pct}% of source bytes ($b_dst/$b_src)"; bad=1
     else
-      echo "  ok       $s: $n_dst tars, metadata present"
+      echo "  ok       $s: $n_dst tars, ${pct}% bytes, metadata present"
     fi
   done
   echo
