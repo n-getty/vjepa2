@@ -38,6 +38,13 @@ OUT=/flare/ModCon/ngetty/logs/daos_read_bench_VERDICT.txt
 
 module use /soft/modulefiles
 module load daos
+# `module load daos` alone leaves no python on PATH -- job 8730443 ran both legs
+# straight into "python: command not found" and produced a verdict with headers
+# and no measurements. Load frameworks too, and use an absolute interpreter for
+# the MPI-launched ranks so a PATH difference on compute nodes cannot repeat it.
+module load frameworks
+PY=${BENCH_PY:-/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python}
+command -v "$PY" >/dev/null 2>&1 || { echo "FATAL: no python at $PY"; exit 1; }
 
 launch-dfuse.sh ${POOL}:${CONT} || { echo "FATAL: launch-dfuse failed"; exit 1; }
 mount | grep -q "$CONT" || { echo "FATAL: not mounted at $MNT"; exit 1; }
@@ -121,9 +128,9 @@ run () {
   WORLD_SIZE=$((NODES * PPN)) \
   mpiexec -n $((NODES * PPN)) -ppn $PPN --cpu-bind none --no-vni \
       --env WORLD_SIZE=$((NODES * PPN)) \
-      python "$PYSRC" "$root" "$PER_RANK" "$tag" 2>&1 | grep -a "^RESULT" \
+      "$PY" "$PYSRC" "$root" "$PER_RANK" "$tag" 2>&1 | grep -a "^RESULT" \
     > "$SCRATCH/_res_${tag}_$$.txt"
-  python - "$tag" "$SCRATCH/_res_${tag}_$$.txt" <<'PY'
+  "$PY" - "$tag" "$SCRATCH/_res_${tag}_$$.txt" <<'PY'
 import sys
 tag, path = sys.argv[1], sys.argv[2]
 tot=n=0; secs=[]
@@ -151,6 +158,17 @@ PY
   echo "(1248 steps x gb 3072 x ~4 MB/clip spread over hours)."
   echo "DAOS only has to clear that bar, not win a peak-bandwidth contest."
 } | tee "$OUT"
+
+# Fail loudly on a measurement-free run. Job 8730443 emitted a verdict file with
+# both headers, no numbers, and exit 0 -- every rank had died on "python: command
+# not found". A benchmark that cannot distinguish "measured nothing" from
+# "measured something" is worse than no benchmark, because the artifact it leaves
+# behind looks like a result.
+if ! grep -qE "GB/s aggregate" "$OUT"; then
+  echo "BENCH FAILED: no measurements in $OUT -- check the job log for rank errors." | tee -a "$OUT"
+  rm -f "$PYSRC"; rm -rf "$LUSTRE_SRC"
+  exit 1
+fi
 
 rm -f "$PYSRC"; rm -rf "$LUSTRE_SRC"
 echo "JOB END $(date)"
