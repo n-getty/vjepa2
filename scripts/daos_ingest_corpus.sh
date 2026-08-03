@@ -34,7 +34,14 @@
 # (they were copied from an older revision of the same doc); do not copy GX from
 # them without re-reading that section.
 #
-#   qsub scripts/daos_ingest_corpus.sh
+#   qsub scripts/daos_ingest_corpus.sh                       # debug-scaling, 1 h
+#   qsub -q capacity -l walltime=04:00:00 \
+#        scripts/daos_ingest_corpus.sh                       # capacity, 4 h
+#
+# Queue note: debug-scaling allows ONE job queued-or-running per user, so a
+# follow-up cannot be pre-queued behind a running ingest. capacity has no such
+# limit (up to 16 nodes, 5 jobs) and a longer walltime, which suits the full
+# ingest better -- the 1 h slice is marginal for 4.5 TB across 16 sources.
 #
 # Idempotent: dsync only transfers differences, so a re-run after a partial or
 # interrupted copy resumes rather than starting over.
