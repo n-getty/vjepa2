@@ -37,10 +37,14 @@
 #PBS -A AuroraGPT
 #PBS -q debug-scaling
 #PBS -l select=2
-# 30 min, not 60: debug-scaling rejected a 2-node 60-min request outright
-# ("Insufficient amount of resource: at_queue", jobs 8731089/8731106 died with no
-# log at all) while the identical script at 30 min was accepted immediately. A
-# 64-node 30-min job also ran fine, so the limit tracks WALLTIME here, not size.
+# 30 min keeps this well inside the 1 h cap and is plenty for env checks.
+#
+# NOTE on a failure mode that cost three submissions: debug-scaling enforces
+# ONE QUEUED JOB PER USER ("qsub: would exceed queue generic's per-user limit of
+# jobs in 'Q' state"). Submitting a second hold while the first is still queued
+# gets BOTH terminated with a bare "Insufficient amount of resource: at_queue"
+# and NO log file, which looks like a resource/walltime problem and is not.
+# Check `qstat -u $USER | grep debug-s` before submitting.
 #PBS -l walltime=00:30:00
 #PBS -l filesystems=home:flare:daos_user_fs
 #PBS -j oe
