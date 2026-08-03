@@ -21,9 +21,18 @@ set -o pipefail
 ARM="${1:-}"
 ROOT=/lus/flare/projects/ModCon/ngetty/vjepa2
 
+# Each arm's accum MUST match the multiplier its config was generated for: the
+# EMA/warmup/lambda constants baked into the YAML are only correct at that batch.
+# Pairing lbA8 (derived for 8x) with accum=16 would run a recipe tuned for the
+# wrong horizon and look like a large-batch failure.
 case "$ARM" in
-  lbA|lbB) ;;
-  *) echo "usage: $0 {lbA|lbB}"; exit 1 ;;
+  lbA|lbB)   ACCUM=16 ;;   # per-rank bs=2 -> 3072 ranks x 2 = gb 6144
+  lbA8|lbB8) ACCUM=8  ;;   # per-rank bs=1 -> 3072 ranks x 1 = gb 3072 (preferred:
+                           # bs=1 validated by job 8730000, gentler batch)
+  *) echo "usage: $0 {lbA8|lbB8|lbA|lbB}"
+     echo "  lbA8/lbB8 = bs1, gb 3072, accum 8  (recommended)"
+     echo "  lbA /lbB  = bs2, gb 6144, accum 16 (fallback)"
+     exit 1 ;;
 esac
 
 CFG="$ROOT/configs/vitg16_surg_vid_webdataset_single4/vitG384_${ARM}.yaml"
@@ -32,9 +41,7 @@ if [[ ! -f "$CFG" ]]; then
   exit 1
 fi
 
-# Must match VJEPA_TRUE_ACCUM to the multiplier the config was generated for --
-# the EMA/warmup/lambda constants in the YAML are only correct at that batch.
-ACCUM=16
+# ACCUM comes from the arm table above.
 CKPT_DIR="/flare/ModCon/ngetty/checkpoints/surg_2_1_vitG384_${ARM}/vitG384_n16g12_${ARM}"
 
 echo "arm      : $ARM"
