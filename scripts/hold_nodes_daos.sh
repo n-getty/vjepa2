@@ -37,7 +37,11 @@
 #PBS -A AuroraGPT
 #PBS -q debug-scaling
 #PBS -l select=2
-#PBS -l walltime=01:00:00
+# 30 min, not 60: debug-scaling rejected a 2-node 60-min request outright
+# ("Insufficient amount of resource: at_queue", jobs 8731089/8731106 died with no
+# log at all) while the identical script at 30 min was accepted immediately. A
+# 64-node 30-min job also ran fine, so the limit tracks WALLTIME here, not size.
+#PBS -l walltime=00:30:00
 #PBS -l filesystems=home:flare:daos_user_fs
 #PBS -j oe
 #PBS -o /flare/ModCon/ngetty/logs/
@@ -123,7 +127,7 @@ echo "  drop run_*.sh there; output -> run_*.out, rc -> run_*.done; touch STOP t
 # Poll loop. Each injected script runs in the BACKGROUND so a hung command never
 # blocks the hold or the queue behind it.
 seen=""
-end=$(( $(date +%s) + ${HOLD_SECONDS:-3400} ))
+end=$(( $(date +%s) + ${HOLD_SECONDS:-1700} ))
 while [ "$(date +%s)" -lt "$end" ]; do
     [ -f "$CMD_DIR/STOP" ] && { echo "STOP seen, releasing hold."; break; }
     for c in "$CMD_DIR"/run_*.sh; do
