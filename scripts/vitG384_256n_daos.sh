@@ -91,6 +91,9 @@ export CCL_PROCESS_LAUNCHER=none
 export CCL_ATL_TRANSPORT=ofi
 export CCL_KVS_IFACE=hsn0
 export CCL_OP_SYNC=1
+# CCL_WARN emitted 10,900 lines at 3072 ranks (device-uuid vector warnings that
+# are expected under HSDP). Not actionable, and they were a tenth of the funnel.
+export CCL_LOG_LEVEL=${CCL_LOG_LEVEL:-error}
 export CCL_WORKER_COUNT=1
 export CCL_ALLREDUCE=ring
 export CCL_CHUNK_SIZE=16777216
@@ -170,7 +173,21 @@ PY
 # (app/main_dist_aurora.py:366-370), so pointing it at the DAOS mount is a
 # drop-in -- no config edit, no trainer change.
 T0=$(date +%s)
+# PER-RANK OUTPUT, not one funnel. Job 8730678 pushed 442,649 stdout lines from
+# 3072 ranks through the head node's PBS log while that same node served the
+# rendezvous store and answered DAOS agent keepalives -- and it was the head node
+# whose DAOS agent then missed a 120 s ping and killed the run. `--outfile-pattern`
+# writes each rank's stdout ON THE NODE WHERE THAT RANK RUNS (per the mpiexec man
+# page), so the funnel disappears rather than merely shrinking.
+#
+# Rank 0's file is the one to read; the rest exist for post-mortems. The PBS log
+# keeps the launcher's own output (mount checks, verdict), which is what makes
+# the job diagnosable at a glance.
+RANKLOG=${VJEPA_RANKLOG_DIR:-/flare/ModCon/ngetty/logs/ranklogs_${PBS_JOBID%%.*}}
+mkdir -p "$RANKLOG"
+echo "per-rank stdout -> $RANKLOG/rank.<N>.out (rank 0 is the one to read)"
 mpiexec -n $WORLD -ppn $PPN --cpu-bind depth --depth 16 --no-vni \
+    -o "$RANKLOG/rank.%r.out" -e "$RANKLOG/rank.%r.err" \
     python -m app.main_dist_aurora --train_mode \
         --fname $PARAMS --params_path $PARAMS \
         --local_data_root $DAOS_MNT
@@ -184,11 +201,25 @@ ROWS=$(awk -F, '$2 ~ /^[0-9]+$/ {n++} END{print n+0}' "$CSV" 2>/dev/null || echo
   echo "job ${PBS_JOBID:-interactive}  $(date)"
   echo "rc=$RC elapsed=${DT}s rows=$ROWS ranks=$WORLD  (NO staging step)"
   [[ -f "$CSV" ]] && { echo "--- CSV ---"; head -1 "$CSV"; sed -n '2p' "$CSV"; tail -2 "$CSV"; }
+  # Surface the actual failure instead of guessing. The previous verdict said
+  # "check dfuse mount, rendezvous, NA_HOSTUNREACH" when all three were fine and
+  # the real cause -- a DAOS agent ping timeout on the head node -- was sitting
+  # in the log unmentioned. Rank stdout now lives in $RANKLOG, so grep there too.
+  echo "--- failure signals (rank logs + PBS log) ---"
+  grep -ahoE "ping RPC timeout from [^ ]+|DistStoreError|NA_HOSTUNREACH|CUDA out of memory|Killed|signal 9" \
+       "$RANKLOG"/rank.*.err "$RANKLOG"/rank.*.out 2>/dev/null | sort | uniq -c | sort -rn | head -5
+  echo "  (none listed above = no known failure signature)"
   if (( ROWS >= 20 )); then
     echo "VERDICT: PASS -- $ROWS iters at $WORLD ranks reading DAOS."
     echo "  Compare per-iter time against the 16n baseline (~8 s) before prod."
+  elif (( ROWS > 0 )); then
+    echo "VERDICT: PARTIAL -- reached training ($ROWS iters) then stopped."
+    echo "  The data path WORKED; this is a survivability problem, not a scaling one."
+    echo "  Read the signals above and $RANKLOG/rank.0.out."
   else
-    echo "VERDICT: FAIL -- only $ROWS iters. Check dfuse mount, rendezvous, NA_HOSTUNREACH."
+    echo "VERDICT: FAIL -- no iterations. Check the signals above, then"
+    echo "  $RANKLOG/rank.0.out for where startup stalled."
   fi
+  echo "per-rank logs: $RANKLOG"
 } | tee "$VERDICT"
 echo "JOB END $(date)"

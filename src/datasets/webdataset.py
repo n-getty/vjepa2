@@ -66,6 +66,26 @@ def _is_canonical_worker():
     return info is None or info.id == 0
 
 
+def _is_rank0():
+    """True on global rank 0 (any worker). For setup-time logging only.
+
+    Loader-construction logging was emitted by EVERY rank. At 16 nodes that is
+    228 lines and nobody notices; at 3072 ranks it is ~58,000 lines funnelled
+    into one PBS log on the head node -- which is also serving the rendezvous
+    store and answering DAOS agent keepalives. Job 8730678 lost that node to a
+    120 s DAOS ping timeout mid-run, and MASTER_ADDR being the affected host is
+    unlikely to be coincidence.
+
+    The diagnostics themselves are worth keeping (the mixing table is how the
+    oversampling regression stays visible), so gate them to rank 0 rather than
+    delete them. Distinct from _is_canonical_worker, which also requires worker
+    0 -- that matters for per-sample paths, not for one-shot setup logging.
+    """
+    rank = os.environ.get("RANK", os.environ.get("PMI_RANK",
+           os.environ.get("PALS_RANKID", "0")))
+    return str(rank) == "0"
+
+
 def _record_kept_clip(source_name, clip_std):
     src = source_name or "?"
     _clip_diag["kept"][src] = _clip_diag["kept"].get(src, 0) + 1
@@ -646,10 +666,11 @@ def make_webdataset(
         per_dataset_counts.append(int(meta.get("sample_count", 0)))
         summary.append((meta["name"], meta.get("shard_count"), meta.get("sample_count")))
 
-    logger.info(
-        f"WebDataset: {len(streams)} stream(s), {total_shards} shards, "
-        f"~{total_samples} samples; per-dataset: {summary}"
-    )
+    if _is_rank0():
+        logger.info(
+            f"WebDataset: {len(streams)} stream(s), {total_shards} shards, "
+            f"~{total_samples} samples; per-dataset: {summary}"
+        )
 
     if len(streams) == 1:
         mixed = streams[0]
@@ -664,10 +685,12 @@ def make_webdataset(
         # oversampling regression (like the old uniform-per-source default that
         # gave an 8-clip set 9% of all training) is visible on iteration 0.
         total = float(sum(sample_counts)) or 1.0
-        logger.info(
-            "WebDataset mixing (temperature=%.3f): realized per-source sample "
-            "fractions vs true corpus fractions:", sampling_temperature
-        )
+        _log0 = _is_rank0()
+        if _log0:
+            logger.info(
+                "WebDataset mixing (temperature=%.3f): realized per-source sample "
+                "fractions vs true corpus fractions:", sampling_temperature
+            )
         # Tripwire: expected #times each *individual* clip is shown per epoch =
         # (samples drawn from this source per epoch) / (unique clips it has).
         # This is the quantity that maps directly to memorization, independent
@@ -680,11 +703,15 @@ def make_webdataset(
         for name, cnt, p in zip(names, sample_counts, probs):
             reps = (p * epoch_samples / cnt) if cnt > 0 else float("inf")
             reps_per_clip.append((name, cnt, p, reps))
-            logger.info(
-                "  %-24s n=%-8d true=%6.2f%%  realized=%6.2f%%  "
-                "reps/clip/epoch=%.2f",
-                name, cnt, 100.0 * cnt / total, 100.0 * p, reps,
-            )
+            # The per-source table is the bulk of the volume: one line per
+            # source per rank. reps_per_clip is still built on EVERY rank so the
+            # tripwire below stays a collective check.
+            if _log0:
+                logger.info(
+                    "  %-24s n=%-8d true=%6.2f%%  realized=%6.2f%%  "
+                    "reps/clip/epoch=%.2f",
+                    name, cnt, 100.0 * cnt / total, 100.0 * p, reps,
+                )
         # Two-level guard on per-clip repetition (the memorization signature).
         # WARN: any tiny set whose clips repeat a lot — visible but allowed,
         #   since keeping micro-datasets under temperature sampling is a
@@ -705,8 +732,10 @@ def make_webdataset(
                 f"Fix sampling_temperature/datasets_weights, drop the micro-"
                 f"dataset, or raise VJEPA_MAX_REPS_PER_CLIP if truly intended."
             )
+        # NOTE the RuntimeError above is deliberately NOT rank-gated: every rank
+        # must raise, or the ranks that stay silent hang the collective.
         for name, cnt, p, reps in reps_per_clip:
-            if reps > warn_reps:
+            if reps > warn_reps and _log0:
                 logger.warning(
                     "Dataset mixing: '%s' (%d clips) repeats each clip ~%.0fx "
                     "per epoch (share %.1f%%) — memorization risk; kept by "
@@ -761,7 +790,8 @@ def make_webdataset(
             return getattr(self.loader, name)
 
     data_loader = _LenWrapper(data_loader, ipe)
-    logger.info(f"WebDataset loader ready: batches_per_rank={ipe}, batch_size={batch_size}")
+    if _is_rank0():
+        logger.info(f"WebDataset loader ready: batches_per_rank={ipe}, batch_size={batch_size}")
 
     sampler = _NoOpSampler()
     return mixed, data_loader, sampler
