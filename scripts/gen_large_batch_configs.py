@@ -61,6 +61,8 @@ import argparse
 import os
 import sys
 
+import yaml
+
 CFGD = "configs/vitg16_surg_vid_webdataset_single4"
 BASE = f"{CFGD}/vitG384_fixedshape_v2.yaml"
 
@@ -134,6 +136,54 @@ def derive(batch_mult, per_rank_bs):
     }
 
 
+def _replay_report(cfg_path, clips_seen, fresh_rule=4.0):
+    """Warn if the budget overshoots the 4x-fresh rule on the EFFECTIVE corpus.
+
+    The raw clip count overstates the corpus badly: source-selection is
+    `prob_i ~ count_i ** T` (src/datasets/webdataset.py:compute_mixing_probs), so
+    at the production T=0.5 the inverse-collision effective size is only ~32% of
+    nominal. A budget that reads as a safe 3.2 corpus-epochs is really ~9.9.
+    Effective size is a property of the sampling DISTRIBUTION and does not grow
+    with budget, so scaling compute makes the overshoot strictly worse.
+
+    Advisory, not fatal -- T is a separate live experiment, and the right value
+    is a judgement call (raising it shifts the mix toward the largest, mostly
+    non-surgical sources). Best-effort: skipped if metadata is unreadable.
+    """
+    try:
+        import json
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from src.datasets.webdataset import compute_mixing_probs
+
+        cfg = yaml.safe_load(open(cfg_path))
+        dsets = cfg["data"]["datasets"]
+        counts = [
+            json.load(open(os.path.join(d, "metadata.json")))["sample_count"]
+            for d in dsets
+        ]
+        T = float(cfg["data"].get("sampling_temperature", 0.5))
+        probs = compute_mixing_probs(counts, cfg["data"].get("datasets_weights"), T)
+        eff = 1.0 / sum(p * p / n for p, n in zip(probs, counts) if n)
+    except Exception as e:  # missing metadata, unmounted path, etc.
+        print(f"\n  (replay check skipped: {type(e).__name__}: {e})")
+        return
+
+    total = sum(counts)
+    print(f"\nReplay check (T={T}):")
+    print(f"  {'raw corpus':22s} {total:,} clips")
+    print(f"  {'effective corpus':22s} {eff:,.0f} ({100*eff/total:.0f}% of raw)")
+    print(f"  {'nominal epochs':22s} {clips_seen/total:.2f}x")
+    print(f"  {'EFFECTIVE epochs':22s} {clips_seen/eff:.1f}x  (4x-fresh rule)")
+    worst = max(p * clips_seen / n for p, n in zip(probs, counts) if n)
+    print(f"  {'worst per-clip replay':22s} {worst:.0f}x")
+    if clips_seen / eff > fresh_rule:
+        print(
+            f"  WARNING: {clips_seen/eff:.1f}x exceeds the {fresh_rule}x-fresh rule on the\n"
+            f"  EFFECTIVE corpus. Raising sampling_temperature (~0.75 -> ~79% effective)\n"
+            f"  fits the budget, but shifts the mix toward the largest sources."
+        )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch-mult", type=int, default=16,
@@ -160,6 +210,8 @@ def main():
           f"(ratio {d['samples']/base_samples:.2f})")
     if d["warmup_steps"] >= d["total_steps"]:
         sys.exit("ABORT: warmup >= total steps; the run would never reach ref_lr")
+
+    _replay_report(BASE, d["samples"])
 
     for arm, spec in ARMS.items():
         out_path = f"{args.outdir}/vitG384_{arm}.yaml"
