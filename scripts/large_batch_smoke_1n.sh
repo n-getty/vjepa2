@@ -16,7 +16,10 @@
 #                  untested at any scale. A 1-node hang here costs an hour; the
 #                  same hang at 16n costs 16 node-hours and a queue slot.
 #
-# Both legs are ~40 iters on the SMOKE config, same node, sequential.
+# Both legs run on the SMOKE config, same node, sequential. Iterations are scaled
+# by 1/accum (40 at accum=1, 8 at accum=16) so the two legs do comparable WORK and
+# both finish inside the per-leg timeout -- a fixed iter count would make the
+# accum=16 leg ~46 min and get it killed as a false "hang".
 #
 # Submit directly (self-contained, ~1h):
 #   qsub scripts/large_batch_smoke_1n.sh
@@ -94,16 +97,19 @@ export WORLD_SIZE=12
 # meta.pretrain_checkpoint so a stale latest.pth.tar in a reused folder cannot
 # make a leg look healthy (or crash) for reasons unrelated to what we're testing.
 make_cfg () {
-  local bs=$1 out=$2 folder=$3
-  $PY - "$CFG" "$bs" "$out" "$folder" <<'PY'
+  local bs=$1 out=$2 folder=$3 ipe=$4
+  $PY - "$CFG" "$bs" "$out" "$folder" "$ipe" <<'PY'
 import sys, yaml
-src, bs, out, folder = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+src, bs, out, folder, ipe = (sys.argv[1], int(sys.argv[2]), sys.argv[3],
+                             sys.argv[4], int(sys.argv[5]))
 c = yaml.safe_load(open(src))
 c["data"]["batch_size"] = bs
 c["folder"] = folder
+c["optimization"]["ipe"] = ipe
 c.setdefault("meta", {})["load_checkpoint"] = False
 yaml.safe_dump(c, open(out, "w"), sort_keys=False)
-print(f"wrote {out} (batch_size={bs}, folder={folder}, load_checkpoint=False)")
+print(f"wrote {out} (batch_size={bs}, ipe={ipe}, folder={folder}, "
+      f"load_checkpoint=False)")
 PY
 }
 
@@ -111,7 +117,14 @@ run_leg () {
   local name=$1 bs=$2 accum=$3
   local folder=$OUTDIR/$name log=$OUTDIR/${name}.log cfg=$OUTDIR/${name}.yaml
   mkdir -p "$folder"
-  make_cfg "$bs" "$cfg" "$folder" || { echo "[$name] config gen FAILED"; return 1; }
+  # Scale ipe DOWN by accum. One accum=16 step does 16x the work of an accum=1
+  # step (~68 s/iter measured vs ~6 s), so a fixed 40-iter leg would need ~46 min
+  # and trip the 25-min timeout -- reporting a perfectly healthy run as a HANG.
+  # The question this leg answers ("does high accum run at all, with finite
+  # losses?") is settled in a handful of iterations; matching WORK per leg rather
+  # than ITERS per leg keeps both legs inside the same wall-clock budget.
+  local ipe=$(( 40 / accum )); (( ipe < 8 )) && ipe=8
+  make_cfg "$bs" "$cfg" "$folder" "$ipe" || { echo "[$name] config gen FAILED"; return 1; }
   echo "===== LEG $name  (batch_size=$bs  VJEPA_TRUE_ACCUM=$accum) ====="
   local t0=$(date +%s)
   timeout 1500 mpiexec --pmi=pmix -n 12 -ppn 12 --cpu-bind depth --depth 8 \
