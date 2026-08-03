@@ -134,8 +134,26 @@ run_leg () {
       2>&1 | tee "$log"
   local rc=$? dt=$(( $(date +%s) - t0 ))
   if (( rc == 124 )); then   # timeout(1)
-    echo "[$name] VERDICT: TIMEOUT after ${dt}s -- treat as a HANG, not a slow run."
-    return 1
+    # A timeout is NOT automatically a hang, and conflating the two produced a
+    # false "GATE FAILED" on job 8730000: the accum=16 leg was writing a CSV row
+    # every ~67 s right up to 27 s before the kill, and was killed only because a
+    # fixed 40-iter leg cannot fit in 25 min at that per-step cost.
+    #
+    # The distinction is mechanical: a HUNG run stops producing rows, a SLOW run
+    # keeps producing them. So compare the last CSV write against the kill time.
+    local csvf="$folder/log_r0.csv" quiet=99999
+    [[ -f "$csvf" ]] && quiet=$(( $(date +%s) - $(stat -c %Y "$csvf") ))
+    local n=0
+    [[ -f "$csvf" ]] && n=$(awk -F, '$2 ~ /^[0-9]+$/ {c++} END{print c+0}' "$csvf")
+    if (( n >= 5 && quiet <= 300 )); then
+      echo "[$name] timeout at ${dt}s, but CSV was live ${quiet}s before the kill" \
+           "($n iters) -- SLOW, not hung. Judging on the rows produced."
+      rc=0   # else the `rc != 0` gate below would re-fail this healthy leg
+    else
+      echo "[$name] VERDICT: HANG -- timeout at ${dt}s with $n iters and no CSV" \
+           "write for ${quiet}s."
+      return 1
+    fi
   fi
   # A leg passes only on real, FINITE losses -- not on rc=0, and not on row count
   # alone. Column 3 of log_r0.csv is `loss` (see the CSVLogger spec in
