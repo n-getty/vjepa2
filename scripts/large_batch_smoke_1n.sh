@@ -124,16 +124,27 @@ run_leg () {
     echo "[$name] VERDICT: TIMEOUT after ${dt}s -- treat as a HANG, not a slow run."
     return 1
   fi
-  # A leg only passes if it actually produced finite losses, not merely exited 0.
-  local rows
-  rows=$(awk -F, '$2 ~ /^[0-9]+$/ {n++} END{print n+0}' "$folder/log_r0.csv" 2>/dev/null || echo 0)
-  local nan
-  nan=$(grep -ciE "nan|inf" "$log" 2>/dev/null || echo 0)
-  echo "[$name] rc=$rc  ${dt}s  csv_rows=$rows  nan/inf_mentions=$nan"
+  # A leg passes only on real, FINITE losses -- not on rc=0, and not on row count
+  # alone. Column 3 of log_r0.csv is `loss` (see the CSVLogger spec in
+  # app/vjepa_2_1/train.py). Grepping the log text for "nan" is useless here: it
+  # matches unrelated words and says nothing about the actual values, so the loss
+  # column is parsed directly.
+  local csv="$folder/log_r0.csv" rows=0 bad=0 last=""
+  if [[ -f "$csv" ]]; then
+    rows=$(awk -F, '$2 ~ /^[0-9]+$/ {n++} END{print n+0}' "$csv")
+    bad=$(awk -F, '$2 ~ /^[0-9]+$/ {
+            v=$3+0
+            if ($3 ~ /[Nn][Aa][Nn]|[Ii][Nn][Ff]/ || v != v || v == 0) n++
+          } END{print n+0}' "$csv")
+    last=$(awk -F, '$2 ~ /^[0-9]+$/ {v=$3} END{print v}' "$csv")
+  fi
+  echo "[$name] rc=$rc  ${dt}s  csv_rows=$rows  nonfinite_or_zero_loss=$bad  last_loss=${last:-n/a}"
   if (( rc != 0 )); then echo "[$name] VERDICT: FAIL (rc=$rc)"; return 1; fi
-  if (( rows < 5 ));  then echo "[$name] VERDICT: FAIL (only $rows iters logged)"; return 1; fi
-  echo "[$name] VERDICT: PASS ($rows iters)"
-  grep -iE "loss" "$log" | tail -3
+  if (( rows < 5 )); then echo "[$name] VERDICT: FAIL (only $rows iters logged)"; return 1; fi
+  if (( bad > 0 )); then
+    echo "[$name] VERDICT: FAIL ($bad/$rows rows have NaN/Inf/zero loss)"; return 1
+  fi
+  echo "[$name] VERDICT: PASS ($rows iters, final loss $last)"
   return 0
 }
 
