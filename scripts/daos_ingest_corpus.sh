@@ -23,7 +23,16 @@
 # PREREQ: container already created (done 2026-08-03):
 #   daos container create --type=POSIX --chunk-size=2097152 \
 #     --properties=rd_fac:3,ec_cell_sz:131072,cksum:crc32,srv_cksum:on \
-#     --file-oclass=EC_16P3GX --dir-oclass=RP_4G1 AuroraGPT vjepa_surg_wds
+#     --file-oclass=EC_16P3G32 --dir-oclass=RP_4G1 AuroraGPT vjepa_surg_wds
+#
+# NOTE the oclass: G32, not the GX that BaseMM_PRISM's scripts use. Current ALCF
+# guidance (user-guides .../daos/daos-overview.md:467) is that GX stripes each
+# file across ALL servers -- optimal for ONE big shared file -- while G32 stripes
+# across 32, which is what you want for many independent files read by many
+# ranks. A WebDataset corpus is thousands of independent .tar shards, so G32 is
+# the right side of that tradeoff. PRISM's scripts predate the guidance change
+# (they were copied from an older revision of the same doc); do not copy GX from
+# them without re-reading that section.
 #
 #   qsub scripts/daos_ingest_corpus.sh
 #
