@@ -100,8 +100,49 @@ copy_one () {
   echo "  $name done in $(( $(date +%s) - t ))s"
 }
 
-for s in "${SOURCES[@]}"; do copy_one "$s" "$SRC_ROOT/$s"; done
-copy_one pe_video "$PE_SRC"
+# ONE mpiexec for the whole tree, not one per source.
+#
+# Measured on job 8730316 across 7 sources, per-source cost fits
+# t ~= 180 s + GB/3.0 within 4% (247/286/214/203 predicted vs 251/296/216/221
+# actual). That 180 s is FIXED launch cost -- mpiexec spin-up over 96 ranks plus
+# dsync's source+destination walk -- and it is paid once per invocation, so 16
+# sources spend ~48 min on overhead alone and blow the 1 h slice while the data
+# itself moves in a few minutes.
+#
+# dsync over SRC_ROOT does the same work in a single launch and a single walk.
+# The tradeoff is granularity: a failure loses the whole tree's progress rather
+# than one source. dsync is idempotent, so a resubmit re-walks (cheap) and
+# re-copies only differences -- worth it against 45+ min of pure overhead.
+#
+# pe_video lives outside SRC_ROOT, so it still needs its own invocation.
+#
+# A plain tree copy of SRC_ROOT is NOT the answer: that directory holds 61 dirs
+# (…_bak_under192, …_staging, …_clean, superseded segmentations) against the 15
+# in the training mix -- 8.7 TB instead of 4.5 TB, and it would put data we
+# deliberately excluded into the training container.
+#
+# Instead, build a symlink farm of exactly the 15 mix sources and dsync THAT in
+# one launch. --dereference (already required for the real symlink sources)
+# makes dsync follow the farm links and write real bytes. One launch, one walk,
+# only the sources we want.
+if [[ "${INGEST_BATCH:-1}" == "1" ]]; then
+  FARM=${INGEST_FARM:-/flare/ModCon/ngetty/logs/_ingest_farm_${PBS_JOBID%%.*}}
+  rm -rf "$FARM"; mkdir -p "$FARM"
+  for s in "${SOURCES[@]}"; do
+    [[ -d "$SRC_ROOT/$s" ]] && ln -s "$SRC_ROOT/$s" "$FARM/$s"
+  done
+  [[ -d "$PE_SRC" ]] && ln -s "$PE_SRC" "$FARM/pe_video"
+  echo "=== BATCH MODE: one dsync over $(ls "$FARM" | wc -l) linked sources ==="
+  t=$(date +%s)
+  mpiexec -n $((NODES * PPN)) -ppn $PPN --cpu-bind none --no-vni \
+      dsync --progress 30 --bufsize 64MB --dereference "$FARM" "$MNT" \
+    || { echo "  DSYNC FAILED (batch)"; FAILED=1; }
+  echo "  batch done in $(( $(date +%s) - t ))s"
+  rm -rf "$FARM"
+else
+  for s in "${SOURCES[@]}"; do copy_one "$s" "$SRC_ROOT/$s"; done
+  copy_one pe_video "$PE_SRC"
+fi
 
 DT=$(( $(date +%s) - T0 ))
 
