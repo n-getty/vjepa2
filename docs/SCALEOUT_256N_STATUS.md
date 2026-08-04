@@ -1,5 +1,8 @@
 # Scaling V-JEPA 2.1 CPT to 256 nodes — status
 
+See also `THROUGHPUT_RECIPE_AURORA.md` for the settings themselves, what each
+is worth, and the list of knobs already tested to nothing.
+
 Working notes from the 2026-08-03/04 session. Written so the next person does not
 re-derive the dead ends. Job IDs are given for everything so claims can be checked.
 
