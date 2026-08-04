@@ -58,12 +58,19 @@ allreduce costs 63 ring hops at 64n vs 255 at 256n.
 
 ## Open
 
-- **CCL knob sweep at 256n** (`scripts/ccl_knob_sweep.sh`) — ring vs double_tree
-  vs 64 MB chunk. Every CCL decision in this repo was made at 16n, and
-  `app/main_dist_aurora.py:154-157` says so about itself: rabenseifner was
-  rejected because its "intra-node fanout overhead exceeds inter-node savings **at
-  only 16 nodes** — ALCF's large scale recs target 64+ nodes." `CCL_CHUNK_SIZE`
-  has never been A/B'd anywhere.
+- ~~CCL knob sweep~~ — **DONE at 64n** (job 8732160), all three arms
+  indistinguishable: double_tree 1.00x, 64 MB chunk 0.97x, IQRs overlap
+  everywhere. Keep ring / 16 MB. This tested the real concern — every CCL
+  decision here was made at 16n, and `app/main_dist_aurora.py:154-157` says so
+  about itself ("intra-node fanout overhead exceeds inter-node savings **at only
+  16 nodes**") — and the answer is that ring-vs-tree does NOT flip at 63 hops.
+  `CCL_CHUNK_SIZE` had never been A/B'd anywhere; 16 MB is now validated.
+  Re-testing at 255 hops is optional, not blocking: backward is ~57% of iter time
+  and accum=2 already halves the collective count, so Amdahl caps any algorithm
+  win at <=9%. One loose thread if a block ever opens — double_tree's range was
+  tighter (6.4-31.7 vs ring 5.7-46.5), hinting at better TAIL behaviour, which is
+  what matters for the straggler-driven desync. n=20, overlapping IQRs, so not a
+  claim.
 - **Sustained 256n run** — `VJEPA_SUSTAINED=1` in `scripts/vitG384_256n_daos.sh`.
 - **Does the large batch train well** — separate from throughput; the
   `lbA8`/`lbB8` capacity arms.
