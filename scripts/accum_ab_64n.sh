@@ -57,7 +57,13 @@ MODELS_MNT=/tmp/${POOL}/${MODELS_CONT}
 PPN=12
 NNODES=$(sort -u "${PBS_NODEFILE:-/dev/null}" 2>/dev/null | wc -l); NNODES=${NNODES:-64}
 WORLD=$(( NNODES * PPN ))
-IPE=${AB_IPE:-60}
+# ipe=30, not 60. Job 8731332 gave accum=2 all 60 iters (2589 s) and then the
+# 1 h walltime cut accum=1 at 28 -- Exit_status -29, verdict block never ran.
+# Unequal samples, and the truncation is not neutral: accum=1's surviving iters
+# are its EARLY ones while accum=2's span the whole run including late fabric
+# spikes, which biases against accum=2 rather than for it. 2 arms x 30 iters x
+# ~28 s + 2 x ~7 min startup ~= 42 min, inside the hour with margin.
+IPE=${AB_IPE:-30}
 CFG_NAME=${VJEPA_CFG_NAME:-vitG384_lbA8}
 BASE_CFG=$ROOT/configs/vitg16_surg_vid_webdataset_single4/${CFG_NAME}.yaml
 PY=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python
