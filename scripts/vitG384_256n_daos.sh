@@ -65,6 +65,18 @@ PPN=12
 NNODES=$(sort -u "${PBS_NODEFILE:-/dev/null}" 2>/dev/null | wc -l); NNODES=${NNODES:-256}
 WORLD=$(( NNODES * PPN ))
 SHAKE_IPE=${VJEPA_SHAKE_IPE:-50}
+# SUSTAINED mode (VJEPA_SUSTAINED=1): keep the config's real epoch count, save
+# every epoch, and self-resubmit on exit. Default 0 = shakeout, unchanged.
+#
+# Why the shakeout defaults are wrong for a real run: it forces epochs=1, so with
+# save_every_freq=5 no checkpoint is ever written and a watchdog kill loses
+# everything. Sustained training needs each epoch DURABLE, and the epoch has to
+# be shorter than the mean time to failure or the run never banks progress. At
+# 256n that estimate is ~14 min (16n's documented ~3.5-4 h scaled by node count),
+# and at ~10 s/iter ipe=30 is ~5 min/epoch -- the same reasoning behind the 16n
+# recipe's "ipe=30 bounds loss to <1 epoch", with a 16x tighter deadline.
+SUSTAINED=${VJEPA_SUSTAINED:-0}
+SUSTAINED_IPE=${VJEPA_SUSTAINED_IPE:-30}
 
 CFG_NAME=${VJEPA_CFG_NAME:-vitG384_lbA8}
 BASE_CFG=$ROOT/configs/vitg16_surg_vid_webdataset_single4/${CFG_NAME}.yaml
@@ -135,7 +147,17 @@ export VJEPA_DIST_STRATEGY=hsdp
 export LOCAL_WORLD_SIZE=$PPN
 export FSDP_SHARDING=shard_grad_op
 export VJEPA_NUM_WORKERS=${VJEPA_NUM_WORKERS:-0}
-export VJEPA_TRUE_ACCUM=1
+# accum=2 by default: MEASURED +36% at 64 nodes (job 8731439, paired same-nodes
+# A/B, n=25 each, IQRs DISJOINT -- 35.4 -> 48.2 clips/s). Replicated in direction
+# by job 8731332 (1.53x). This is a LOWER BOUND at 256n: accum halves the
+# allreduce COUNT and each avoided allreduce costs 63 ring hops at 64n vs 255 at
+# 256n, so the saving is ~4x larger there.
+#
+# Note this DOUBLES global batch (3072 -> 6144), which shifts EMA/warmup/lambda.
+# The lbA8 config is derived for gb=3072, so a sustained run at accum=2 wants the
+# 16x-multiplier config (gen_large_batch_configs.py --batch-mult 16), not lbA8.
+# Left at 1 for shakeouts where a like-for-like comparison matters.
+export VJEPA_TRUE_ACCUM=${VJEPA_TRUE_ACCUM:-1}
 export TORCH_DIST_TIMEOUT_SECONDS=${TORCH_DIST_TIMEOUT_SECONDS:-3600}
 
 # THE FLAG THAT MUST FLIP. See the header. =0 -> global-rank slicing.
@@ -174,8 +196,16 @@ import sys, yaml, os
 p, d, ipe, models = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 c = yaml.safe_load(open(p))
 c["folder"] = d
-c["optimization"]["ipe"] = ipe
-c["optimization"]["epochs"] = 1
+sustained = os.environ.get("VJEPA_SUSTAINED", "0") == "1"
+if sustained:
+    # Keep the config's epoch count; shorten ipe so each epoch banks fast, and
+    # make every epoch durable.
+    c["optimization"]["ipe"] = int(os.environ.get("VJEPA_SUSTAINED_IPE", "30"))
+    c.setdefault("meta", {})["save_every_freq"] = 1
+    print(f"SUSTAINED: ipe={c['optimization']['ipe']} epochs={c['optimization']['epochs']} save_every_freq=1")
+else:
+    c["optimization"]["ipe"] = ipe
+    c["optimization"]["epochs"] = 1
 # Repoint the init checkpoint at DAOS. Leaving it on Lustre is what killed job
 # 8730487: 3072 ranks each pulling 28.2 GB off a 2.71 GB/s filesystem.
 meta = c.setdefault("meta", {})
@@ -327,4 +357,34 @@ fi
   fi
   echo "per-rank logs: $RANKLOG"
 } | tee "$VERDICT"
+# ---- SELF-RESUBMIT (sustained mode only).
+#
+# The watchdog kills a hung run; without this, that is where the run ENDS and the
+# block is spent. At 256n the fabric desync is expected often enough that a
+# single kill would waste the allocation -- the 16n campaign banked e15->e215
+# precisely because every kill was followed by a resume.
+#
+# Guards, mirroring the proven launcher: a .no_relaunch sentinel stops the chain
+# by hand; the successor inherits the arm env (a bare qsub would silently resume
+# THIS checkpoint dir under DEFAULT settings); and we refuse to resubmit if the
+# run banked no epoch, since a config that cannot train once will not train on
+# retry either -- that is a loop, not a recovery.
+if [[ "$SUSTAINED" == "1" ]]; then
+  if [[ -f "$CKPT_DIR/.no_relaunch" ]]; then
+    echo "RESUBMIT: .no_relaunch sentinel present -- stopping the chain."
+  elif [[ ! -f "$CKPT_DIR/latest.pth.tar" ]]; then
+    echo "RESUBMIT: no latest.pth.tar -- the run banked no epoch, so a retry"
+    echo "  would repeat the same failure. Investigate before relaunching."
+  elif (( $(qstat -u "$USER" 2>/dev/null | grep -c "${VJEPA_JOBTAG:-vg256d}") > 1 )); then
+    echo "RESUBMIT: a successor is already queued -- not adding another."
+  else
+    RESUB_V="VJEPA_SUSTAINED=1"
+    [[ -n "${VJEPA_CFG_NAME:-}" ]]   && RESUB_V="$RESUB_V,VJEPA_CFG_NAME=$VJEPA_CFG_NAME"
+    [[ -n "${VJEPA_CKPT_DIR:-}" ]]   && RESUB_V="$RESUB_V,VJEPA_CKPT_DIR=$CKPT_DIR"
+    [[ -n "${VJEPA_TRUE_ACCUM:-}" ]] && RESUB_V="$RESUB_V,VJEPA_TRUE_ACCUM=$VJEPA_TRUE_ACCUM"
+    NEXT=$(qsub -v "$RESUB_V" "$ROOT/scripts/vitG384_256n_daos.sh" 2>&1) \
+      && echo "RESUBMITTED: $NEXT (env: $RESUB_V)" || echo "resubmit failed: $NEXT"
+  fi
+fi
+
 echo "JOB END $(date)"
