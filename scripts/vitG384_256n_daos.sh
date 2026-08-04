@@ -196,6 +196,68 @@ PY
 # --local_data_root remaps every dataset dir by BASENAME
 # (app/main_dist_aurora.py:366-370), so pointing it at the DAOS mount is a
 # drop-in -- no config edit, no trainer change.
+# ---- STALL WATCHDOG + FORENSICS (ported from the proven 16n launcher).
+#
+# This is the difference between a shakeout and a run that survives. Documented
+# at 16 nodes: ~1 disruptive event per 3.5-4 h, a cohort-wide FSDP collective
+# desync, ALL of them self-healed -- that is what carried e15->e215 autonomously.
+# If per-node hazard is constant, MTTF scales down with node count:
+#
+#     16n  ~225 min      64n  ~56 min      256n  ~14 min
+#
+# So at 3072 ranks a hang is expected roughly EVERY 14 MINUTES, and a one-hour
+# slot should see several. Without this layer the FIRST one ends the run and the
+# block is spent; with it, the run keeps going.
+#
+# The deadlines are scaled from the 16n values, not copied: startup at 256n is
+# rendezvous + a 28 GB DAOS checkpoint load across 3072 ranks, measured at ~7 min
+# for 24 ranks, so FIRST_ITER gets 30 min. STALL stays at 1800 s -- comfortably
+# above the worst recoverable spike observed (~544 s) so it fires only on a true
+# hang, not on the intrinsic fabric tax.
+CSV_WATCH="$CKPT_DIR/log_r0.csv"
+STALL_DEADLINE=${VJEPA_STALL_DEADLINE:-1800}
+FIRST_ITER_DEADLINE=${VJEPA_FIRST_ITER_DEADLINE:-1800}
+DIAG_DIR="$CKPT_DIR/hang_diag"; mkdir -p "$DIAG_DIR"
+
+capture_hang_forensics() {
+    local tag="$1" stamp; stamp=$(date +%Y%m%d_%H%M%S)
+    echo "WATCHDOG: capturing forensics ($tag) -> $DIAG_DIR/hang_${stamp}_*" >&2
+    # Node attribution across incidents: which physical hosts keep appearing?
+    [ -f "${PBS_NODEFILE:-}" ] && cp "$PBS_NODEFILE" "$DIAG_DIR/hang_${stamp}_nodefile.txt" 2>/dev/null
+    echo "jobid=$PBS_JOBID nodes=$NNODES last_csv_row=$(tail -1 "$CSV_WATCH" 2>/dev/null)" \
+        > "$DIAG_DIR/hang_${stamp}_info.txt"
+    # SIGUSR1 -> the armed faulthandler dumps every rank's all-thread stack and
+    # CONTINUES, so we learn which collective each rank is blocked in before the
+    # hard kill. Best-effort; never let diagnostics block the kill.
+    mpiexec -n $NNODES -ppn 1 --cpu-bind none --no-vni \
+        bash -c 'pkill -USR1 -f app.main_dist_aurora 2>/dev/null; true' >/dev/null 2>&1 || true
+    sleep 20
+}
+
+(
+    start=$(date +%s); last_rows=-1; last_change=$start
+    while true; do
+        sleep 60
+        pgrep -f "app.main_dist_aurora" >/dev/null 2>&1 || exit 0
+        now=$(date +%s)
+        rows=0; [ -f "$CSV_WATCH" ] && rows=$(awk -F, '$2 ~ /^[0-9]+$/ {n++} END{print n+0}' "$CSV_WATCH" 2>/dev/null)
+        if [ "${rows:-0}" -gt 0 ]; then
+            if [ "$rows" -ne "$last_rows" ]; then last_rows=$rows; last_change=$now; fi
+            if [ $((now-last_change)) -gt $STALL_DEADLINE ]; then
+                echo "WATCHDOG: STALL -- no new iters for ${STALL_DEADLINE}s at row $rows." >&2
+                capture_hang_forensics "stall_row${rows}"
+                pkill -9 -f "app.main_dist_aurora"; exit 1
+            fi
+        elif [ $((now-start)) -gt $FIRST_ITER_DEADLINE ]; then
+            echo "WATCHDOG: NO FIRST ITER within ${FIRST_ITER_DEADLINE}s." >&2
+            capture_hang_forensics "no_first_iter"
+            pkill -9 -f "app.main_dist_aurora"; exit 1
+        fi
+    done
+) &
+WATCHDOG_PID=$!
+export VJEPA_ITER_WATCHDOG_S=${VJEPA_ITER_WATCHDOG_S:-600}
+
 T0=$(date +%s)
 # PER-RANK OUTPUT, not one funnel. Job 8730678 pushed 442,649 stdout lines from
 # 3072 ranks through the head node's PBS log while that same node served the
@@ -217,6 +279,7 @@ mpiexec -n $WORLD -ppn $PPN --cpu-bind depth --depth 16 --no-vni \
         --local_data_root $DAOS_MNT
 RC=$?
 DT=$(( $(date +%s) - T0 ))
+kill $WATCHDOG_PID 2>/dev/null
 
 CSV=$CKPT_DIR/log_r0.csv
 # Count only rows THIS job wrote. CSVLogger APPENDS across jobs sharing
