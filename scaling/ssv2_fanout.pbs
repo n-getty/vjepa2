@@ -1,0 +1,225 @@
+#!/bin/bash -l
+#PBS -N scaling_fanout_9
+#PBS -l select=9
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare
+#PBS -q prod
+#PBS -A AuroraGPT
+
+set -o pipefail
+# NOTE: deliberately NOT `set -u` — lmod's init references unbound vars (ZSH_EVAL_CONTEXT) and
+# `module load` aborts under `set -u` (the python-env-shadowing-hpc trap). The validated single-cell
+# launcher uses `set -eo pipefail` for the same reason. We also avoid `set -e` so one cell's failure
+# doesn't kill the whole job before `wait` collects the others.
+
+echo "FANOUT JOB START: $(date)  cells=9  nodes=9"
+cat "$PBS_NODEFILE"
+cd /lus/flare/projects/ModCon/ngetty/vjepa2
+
+ulimit -c unlimited
+module load frameworks
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export MPICH_GPU_SUPPORT_ENABLED=1
+export CCL_PROCESS_LAUNCHER=pmix
+export CCL_ATL_TRANSPORT=mpi
+export CCL_KVS_MODE=mpi
+export CCL_KVS_USE_MPI_RANKS=1
+export CCL_CONFIGURATION=cpu_gpu_dpcpp
+export CCL_KVS_CONNECTION_TIMEOUT=600
+export CCL_OP_SYNC=1
+export CCL_WORKER_COUNT=1
+export CCL_ALLREDUCE=ring
+export CCL_CHUNK_SIZE=16777216
+export FI_PROVIDER=cxi
+export PYTHONFAULTHANDLER=1
+export TMPDIR=/tmp
+export http_proxy="http://proxy.alcf.anl.gov:3128"
+export https_proxy="http://proxy.alcf.anl.gov:3128"
+export ftp_proxy="http://proxy.alcf.anl.gov:3128"
+
+# Per-job scratch for private nodefiles + per-cell logs (survives on flare via folder copy at end).
+JOBTMP="/lus/flare/projects/ModCon/ngetty/vjepa2/../_fanout_${PBS_JOBID%%.*}"
+mkdir -p "$JOBTMP"
+echo "JOBTMP=$JOBTMP"
+
+
+# ---- cell 0: vit_base_C1p0e18_ssv2 ----
+NODEFILE_0="$JOBTMP/nodefile_0"
+sed -n '1p' "$PBS_NODEFILE" > "$NODEFILE_0"
+HOST_0=$(cat "$NODEFILE_0")
+echo "[cell 0] vit_base_C1p0e18_ssv2 -> node $HOST_0 port 29500"
+(
+  export PBS_NODEFILE="$NODEFILE_0"
+  export MASTER_ADDR="$HOST_0"
+  export MASTER_PORT=29500
+  export WORLD_SIZE=12
+  mpiexec --pmi=pmix -n 12 -ppn 12 \
+      --hostfile "$NODEFILE_0" --cpu-bind depth --depth 16 \
+      python -m app.main_dist_aurora --train_mode \
+          --fname /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_base_C1p0e18_ssv2.yaml --params_path /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_base_C1p0e18_ssv2.yaml \
+      > "$JOBTMP/cell_0_vit_base_C1p0e18_ssv2.log" 2>&1
+) &
+PID_0=$!
+
+
+# ---- cell 1: vit_base_C3p0e18_ssv2 ----
+NODEFILE_1="$JOBTMP/nodefile_1"
+sed -n '2p' "$PBS_NODEFILE" > "$NODEFILE_1"
+HOST_1=$(cat "$NODEFILE_1")
+echo "[cell 1] vit_base_C3p0e18_ssv2 -> node $HOST_1 port 29501"
+(
+  export PBS_NODEFILE="$NODEFILE_1"
+  export MASTER_ADDR="$HOST_1"
+  export MASTER_PORT=29501
+  export WORLD_SIZE=12
+  mpiexec --pmi=pmix -n 12 -ppn 12 \
+      --hostfile "$NODEFILE_1" --cpu-bind depth --depth 16 \
+      python -m app.main_dist_aurora --train_mode \
+          --fname /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_base_C3p0e18_ssv2.yaml --params_path /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_base_C3p0e18_ssv2.yaml \
+      > "$JOBTMP/cell_1_vit_base_C3p0e18_ssv2.log" 2>&1
+) &
+PID_1=$!
+
+
+# ---- cell 2: vit_large_C1p0e18_ssv2 ----
+NODEFILE_2="$JOBTMP/nodefile_2"
+sed -n '3p' "$PBS_NODEFILE" > "$NODEFILE_2"
+HOST_2=$(cat "$NODEFILE_2")
+echo "[cell 2] vit_large_C1p0e18_ssv2 -> node $HOST_2 port 29502"
+(
+  export PBS_NODEFILE="$NODEFILE_2"
+  export MASTER_ADDR="$HOST_2"
+  export MASTER_PORT=29502
+  export WORLD_SIZE=12
+  mpiexec --pmi=pmix -n 12 -ppn 12 \
+      --hostfile "$NODEFILE_2" --cpu-bind depth --depth 16 \
+      python -m app.main_dist_aurora --train_mode \
+          --fname /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_large_C1p0e18_ssv2.yaml --params_path /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_large_C1p0e18_ssv2.yaml \
+      > "$JOBTMP/cell_2_vit_large_C1p0e18_ssv2.log" 2>&1
+) &
+PID_2=$!
+
+
+# ---- cell 3: vit_large_C1p0e19_ssv2 ----
+NODEFILE_3="$JOBTMP/nodefile_3"
+sed -n '4p' "$PBS_NODEFILE" > "$NODEFILE_3"
+HOST_3=$(cat "$NODEFILE_3")
+echo "[cell 3] vit_large_C1p0e19_ssv2 -> node $HOST_3 port 29503"
+(
+  export PBS_NODEFILE="$NODEFILE_3"
+  export MASTER_ADDR="$HOST_3"
+  export MASTER_PORT=29503
+  export WORLD_SIZE=12
+  mpiexec --pmi=pmix -n 12 -ppn 12 \
+      --hostfile "$NODEFILE_3" --cpu-bind depth --depth 16 \
+      python -m app.main_dist_aurora --train_mode \
+          --fname /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_large_C1p0e19_ssv2.yaml --params_path /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_large_C1p0e19_ssv2.yaml \
+      > "$JOBTMP/cell_3_vit_large_C1p0e19_ssv2.log" 2>&1
+) &
+PID_3=$!
+
+
+# ---- cell 4: vit_large_C3p0e18_ssv2 ----
+NODEFILE_4="$JOBTMP/nodefile_4"
+sed -n '5p' "$PBS_NODEFILE" > "$NODEFILE_4"
+HOST_4=$(cat "$NODEFILE_4")
+echo "[cell 4] vit_large_C3p0e18_ssv2 -> node $HOST_4 port 29504"
+(
+  export PBS_NODEFILE="$NODEFILE_4"
+  export MASTER_ADDR="$HOST_4"
+  export MASTER_PORT=29504
+  export WORLD_SIZE=12
+  mpiexec --pmi=pmix -n 12 -ppn 12 \
+      --hostfile "$NODEFILE_4" --cpu-bind depth --depth 16 \
+      python -m app.main_dist_aurora --train_mode \
+          --fname /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_large_C3p0e18_ssv2.yaml --params_path /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_large_C3p0e18_ssv2.yaml \
+      > "$JOBTMP/cell_4_vit_large_C3p0e18_ssv2.log" 2>&1
+) &
+PID_4=$!
+
+
+# ---- cell 5: vit_small_C1p0e18_ssv2 ----
+NODEFILE_5="$JOBTMP/nodefile_5"
+sed -n '6p' "$PBS_NODEFILE" > "$NODEFILE_5"
+HOST_5=$(cat "$NODEFILE_5")
+echo "[cell 5] vit_small_C1p0e18_ssv2 -> node $HOST_5 port 29505"
+(
+  export PBS_NODEFILE="$NODEFILE_5"
+  export MASTER_ADDR="$HOST_5"
+  export MASTER_PORT=29505
+  export WORLD_SIZE=12
+  mpiexec --pmi=pmix -n 12 -ppn 12 \
+      --hostfile "$NODEFILE_5" --cpu-bind depth --depth 16 \
+      python -m app.main_dist_aurora --train_mode \
+          --fname /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_small_C1p0e18_ssv2.yaml --params_path /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_small_C1p0e18_ssv2.yaml \
+      > "$JOBTMP/cell_5_vit_small_C1p0e18_ssv2.log" 2>&1
+) &
+PID_5=$!
+
+
+# ---- cell 6: vit_small_C3p0e18_ssv2 ----
+NODEFILE_6="$JOBTMP/nodefile_6"
+sed -n '7p' "$PBS_NODEFILE" > "$NODEFILE_6"
+HOST_6=$(cat "$NODEFILE_6")
+echo "[cell 6] vit_small_C3p0e18_ssv2 -> node $HOST_6 port 29506"
+(
+  export PBS_NODEFILE="$NODEFILE_6"
+  export MASTER_ADDR="$HOST_6"
+  export MASTER_PORT=29506
+  export WORLD_SIZE=12
+  mpiexec --pmi=pmix -n 12 -ppn 12 \
+      --hostfile "$NODEFILE_6" --cpu-bind depth --depth 16 \
+      python -m app.main_dist_aurora --train_mode \
+          --fname /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_small_C3p0e18_ssv2.yaml --params_path /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_small_C3p0e18_ssv2.yaml \
+      > "$JOBTMP/cell_6_vit_small_C3p0e18_ssv2.log" 2>&1
+) &
+PID_6=$!
+
+
+# ---- cell 7: vit_tiny_C1p0e18_ssv2 ----
+NODEFILE_7="$JOBTMP/nodefile_7"
+sed -n '8p' "$PBS_NODEFILE" > "$NODEFILE_7"
+HOST_7=$(cat "$NODEFILE_7")
+echo "[cell 7] vit_tiny_C1p0e18_ssv2 -> node $HOST_7 port 29507"
+(
+  export PBS_NODEFILE="$NODEFILE_7"
+  export MASTER_ADDR="$HOST_7"
+  export MASTER_PORT=29507
+  export WORLD_SIZE=12
+  mpiexec --pmi=pmix -n 12 -ppn 12 \
+      --hostfile "$NODEFILE_7" --cpu-bind depth --depth 16 \
+      python -m app.main_dist_aurora --train_mode \
+          --fname /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_tiny_C1p0e18_ssv2.yaml --params_path /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_tiny_C1p0e18_ssv2.yaml \
+      > "$JOBTMP/cell_7_vit_tiny_C1p0e18_ssv2.log" 2>&1
+) &
+PID_7=$!
+
+
+# ---- cell 8: vit_tiny_C3p0e18_ssv2 ----
+NODEFILE_8="$JOBTMP/nodefile_8"
+sed -n '9p' "$PBS_NODEFILE" > "$NODEFILE_8"
+HOST_8=$(cat "$NODEFILE_8")
+echo "[cell 8] vit_tiny_C3p0e18_ssv2 -> node $HOST_8 port 29508"
+(
+  export PBS_NODEFILE="$NODEFILE_8"
+  export MASTER_ADDR="$HOST_8"
+  export MASTER_PORT=29508
+  export WORLD_SIZE=12
+  mpiexec --pmi=pmix -n 12 -ppn 12 \
+      --hostfile "$NODEFILE_8" --cpu-bind depth --depth 16 \
+      python -m app.main_dist_aurora --train_mode \
+          --fname /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_tiny_C3p0e18_ssv2.yaml --params_path /flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs/vit_tiny_C3p0e18_ssv2.yaml \
+      > "$JOBTMP/cell_8_vit_tiny_C3p0e18_ssv2.log" 2>&1
+) &
+PID_8=$!
+
+
+echo "launched 9 cells; waiting..."
+rc=0
+for pid in $PID_0 $PID_1 $PID_2 $PID_3 $PID_4 $PID_5 $PID_6 $PID_7 $PID_8; do
+  wait $pid || rc=1
+done
+echo "FANOUT JOB END: $(date)  aggregate_rc=$rc"
+# Surface per-cell tails for quick triage in the PBS stdout.
+for f in "$JOBTMP"/cell_*.log; do echo "===== $f (tail) ====="; tail -5 "$f"; done
+exit $rc

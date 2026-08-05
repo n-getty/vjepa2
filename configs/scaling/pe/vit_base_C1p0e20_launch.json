@@ -1,0 +1,10 @@
+{
+  "model_name": "vit_base",
+  "tiles": 192,
+  "per_rank_bs": 16,
+  "accum": 1,
+  "dist_strategy": "ddp",
+  "nodes": 16,
+  "env": {},
+  "global_batch": 3072
+}

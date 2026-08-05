@@ -1,0 +1,44 @@
+#!/bin/bash -l
+#PBS -N ssv2_smoke_base
+#PBS -l select=1
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare
+#PBS -q debug
+#PBS -A AuroraGPT
+#PBS -j oe
+#PBS -o /flare/ModCon/ngetty/experiments/scaling_real_ssv2/ssv2_smoke_base.log
+set -o pipefail
+CODE=/lus/flare/projects/ModCon/ngetty/vjepa2
+CFG=/flare/ModCon/ngetty/experiments/scaling_real_ssv2/vit_base_C1p0e18_ssv2.yaml
+cd "$CODE"
+module load frameworks
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export MPICH_GPU_SUPPORT_ENABLED=1
+export CCL_PROCESS_LAUNCHER=pmix
+export CCL_ATL_TRANSPORT=mpi
+export CCL_KVS_MODE=mpi
+export CCL_KVS_USE_MPI_RANKS=1
+export CCL_CONFIGURATION=cpu_gpu_dpcpp
+export CCL_KVS_CONNECTION_TIMEOUT=600
+export CCL_OP_SYNC=1
+export CCL_WORKER_COUNT=1
+export CCL_ALLREDUCE=ring
+export CCL_CHUNK_SIZE=16777216
+export FI_PROVIDER=cxi
+export PYTHONFAULTHANDLER=1
+export TMPDIR=/tmp
+export http_proxy="http://proxy.alcf.anl.gov:3128"
+export https_proxy="http://proxy.alcf.anl.gov:3128"
+export ftp_proxy="http://proxy.alcf.anl.gov:3128"
+export MASTER_ADDR=$(head -1 "$PBS_NODEFILE")
+export MASTER_PORT=29551
+export WORLD_SIZE=12
+echo "=== SSv2 SMOKE (vit_base_C1p0e18, 12 tiles) start $(date) ==="
+echo "cfg=$CFG"
+cat "$PBS_NODEFILE"
+mpiexec --pmi=pmix -n 12 -ppn 12 --hostfile "$PBS_NODEFILE" \
+    --cpu-bind depth --depth 16 \
+    python3 -m app.main_dist_aurora --train_mode \
+        --fname "$CFG" --params_path "$CFG"
+rc=$?
+echo "=== SSv2 SMOKE end $(date) rc=$rc ==="

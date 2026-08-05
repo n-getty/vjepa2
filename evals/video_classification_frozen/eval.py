@@ -17,6 +17,7 @@ try:
 except Exception:
     pass
 
+import contextlib
 import json
 import logging
 import math
@@ -32,7 +33,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from evals.video_classification_frozen.models import init_module
 from evals.video_classification_frozen.utils import make_transforms
-from src.datasets.backbone_feature_cache import make_backbone_feature_cache
+from src.datasets.backbone_feature_cache import make_backbone_feature_cache, read_cache_pooled
 from src.datasets.data_manager import init_data
 # MambaHead requires mamba_ssm (CUDA-only custom kernel); import lazily inside
 # the classifier_name == "mamba" branch so the asformer path works on XPU.
@@ -56,6 +57,37 @@ pp = pprint.PrettyPrinter(indent=4)
 
 def unwrap_module(module):
     return module.module if isinstance(module, DistributedDataParallel) else module
+
+
+class _MultiHeadModule(torch.nn.Module):
+    """Holds the N probe heads (an LR sweep) in one module so a SINGLE DDP wrap
+    covers all of them. Its forward returns the per-head outputs as a list,
+    matching the old `[c(x) for c in classifiers]` shape.
+
+    Why: each head was previously its own DistributedDataParallel module, so a
+    training step ran N serialized backward passes and N separate gradient
+    all-reduces. Profiling (job 8654575) showed backward = 97% of iter time,
+    dominated by that per-head grad-allreduce across 24 ranks. Wrapping the heads
+    in one DDP module + summing the losses for ONE backward collapses N reduce
+    passes into one bucketed reduce over all heads' grads. Numerically identical
+    (independent params, summed loss = per-head loss for each head's grads).
+    """
+
+    def __init__(self, heads):
+        super().__init__()
+        self.heads = torch.nn.ModuleList(heads)
+
+    def __len__(self):
+        return len(self.heads)
+
+    def __getitem__(self, i):
+        return self.heads[i]
+
+    def __iter__(self):
+        return iter(self.heads)
+
+    def forward(self, x):
+        return [head(x) for head in self.heads]
 
 
 def is_main_process():
@@ -120,20 +152,104 @@ def _compute_metrics(preds, labels, num_classes):
     }
 
 
+_CPU_GATHER_PG = None
+_CPU_GATHER_PG_INIT = False
+
+
+def _cpu_gather_group():
+    """Lazily create (once) a gloo process group for CPU-side collectives.
+
+    The main PG is xccl (XPU/oneCCL), whose all_gather corrupts on the live
+    probe's epoch-end gather. gloo runs collectives on CPU over TCP and is
+    reliable for these tiny once-per-epoch gathers. Falls back to the default
+    (xccl) group if gloo can't be created, so single-backend setups still run.
+    """
+    global _CPU_GATHER_PG, _CPU_GATHER_PG_INIT
+    if _CPU_GATHER_PG_INIT:
+        return _CPU_GATHER_PG
+    _CPU_GATHER_PG_INIT = True
+    try:
+        _CPU_GATHER_PG = torch.distributed.new_group(backend="gloo")
+        logger.info("created gloo side-group for CPU epoch-end gathers")
+    except Exception as e:
+        logger.warning(
+            f"could not create gloo group ({e}); falling back to default PG for "
+            "epoch-end gathers (may hit the xccl all_gather corruption)"
+        )
+        _CPU_GATHER_PG = None  # None -> default group
+    return _CPU_GATHER_PG
+
+
+def _gather_1d_int(arr_np, device):
+    """Robustly all-gather a variable-length 1-D int array across ranks.
+
+    Uses FIXED-SHAPE tensor collectives (all_gather of padded int64 tensors)
+    instead of all_gather_object. On Aurora oneCCL/XPU, all_gather_object
+    (pickle-over-collective) CORRUPTS large Python-object payloads -> the probe
+    crashes at the epoch-end gather with
+        _pickle.UnpicklingError: invalid load key, '\x00'
+    once the per-rank pred array grows (e.g. the live/augmented path with
+    sequence_labels). Padding to the global-max length and gathering fixed-size
+    tensors avoids the object path entirely and is what oneCCL handles reliably.
+    Returns the concatenated array (in rank order) on ALL ranks.
+    """
+    # Gather on CPU via a gloo side-group, NOT the XPU/xccl main group. The
+    # fixed-shape xccl all_gather (even of a tiny [1] length tensor) returns
+    # CORRUPTED values on Aurora's live probe path -> garbage maxlen ->
+    # "Storage size calculation overflowed". Confirmed with a diagnostic guard:
+    # ranks that sent 0 came back as identical garbage (6698...833) across slots,
+    # i.e. the oneCCL collective itself is broken here, not a stream race (a
+    # torch.xpu.synchronize before it did NOT help). The cached path stays under
+    # whatever triggers it. This op is tiny + once/epoch, so routing it through
+    # CPU/gloo is free and sidesteps the oneCCL bug entirely.
+    # See memory: xpu-allgatherobject-corrupts (this is the same class, now hit
+    # even by the fixed-shape tensor path).
+    pg = _cpu_gather_group()
+    t = torch.as_tensor(np.asarray(arr_np).reshape(-1), dtype=torch.int64, device="cpu")
+    n_local = int(t.numel())
+    ws = torch.distributed.get_world_size(group=pg)
+    # 1) gather per-rank lengths (fixed shape [1]) on CPU/gloo.
+    n = torch.tensor([n_local], dtype=torch.int64, device="cpu")
+    lens = [torch.zeros(1, dtype=torch.int64, device="cpu") for _ in range(ws)]
+    torch.distributed.all_gather(lens, n, group=pg)
+    lens = [int(x.item()) for x in lens]
+    maxlen = max(lens) if lens else 0
+    # Guard kept as a tripwire: if even gloo returns garbage, fail loudly.
+    if maxlen < n_local or maxlen < 0 or maxlen > (1 << 34):
+        raise RuntimeError(
+            f"_gather_1d_int: corrupt lengths from all_gather: "
+            f"local_numel={n_local}, gathered lens={lens}"
+        )
+    # 2) pad to global max, gather fixed-size [maxlen] CPU tensors on gloo.
+    if n_local < maxlen:
+        t = torch.cat([t, torch.zeros(maxlen - n_local, dtype=torch.int64)])
+    bufs = [torch.zeros(maxlen, dtype=torch.int64, device="cpu") for _ in range(ws)]
+    torch.distributed.all_gather(bufs, t, group=pg)
+    # 3) trim each rank's buffer back to its real length, concat in rank order.
+    parts = [bufs[r][: lens[r]].numpy() for r in range(ws)]
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
+
+
 def _gather_preds_labels(preds_np, labels_np, world_size, rank):
     """All-gather per-rank numpy arrays of preds/labels onto every rank.
 
     Returns concatenated (preds, labels) on rank 0, and (None, None) on others.
-    Uses all_gather_object so the arrays don't have to share shape.
+    Uses fixed-shape tensor all_gather (see _gather_1d_int) — NOT
+    all_gather_object, which corrupts large payloads on Aurora XPU/oneCCL.
     """
     if world_size <= 1 or not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return preds_np, labels_np
-    gathered_preds = [None for _ in range(world_size)]
-    gathered_labels = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(gathered_preds, preds_np)
-    torch.distributed.all_gather_object(gathered_labels, labels_np)
+    # device for the collective: prefer the current XPU/CUDA device.
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        dev = torch.device("xpu:0")
+    elif torch.cuda.is_available():
+        dev = torch.device("cuda", torch.cuda.current_device())
+    else:
+        dev = torch.device("cpu")
+    all_preds = _gather_1d_int(preds_np, dev)
+    all_labels = _gather_1d_int(labels_np, dev)
     if rank == 0:
-        return np.concatenate(gathered_preds), np.concatenate(gathered_labels)
+        return all_preds, all_labels
     return None, None
 
 
@@ -200,6 +316,10 @@ def main(args_eval, resume_preempt=False):
     val_cache_root = args_data.get("val_cache_root", None)
     cache_num_workers = args_data.get("cache_num_workers", 1)
     cache_require_complete = args_data.get("cache_require_complete", True)
+    # Low-shot probing: keep a deterministic random `train_frac` fraction of the TRAIN
+    # set (val always full). Applies to both the live and cached train dataloaders.
+    train_frac = args_data.get("train_frac", 1.0)
+    subset_seed = args_data.get("subset_seed", 0)
     resolution = args_data.get("resolution", 224)
     num_segments = args_data.get("num_segments", 1)
     frames_per_clip = args_data.get("frames_per_clip", 16)
@@ -253,6 +373,21 @@ def main(args_eval, resume_preempt=False):
     # tasks like SAR_RARP50 actions, where it reduces over-segmentation.
     loss_smoothing_weight = float(args_opt.get("loss_smoothing_weight", 0.0))
     loss_smoothing_threshold = float(args_opt.get("loss_smoothing_threshold", 4.0))
+    # Grad accumulation: reduce+step every accum_steps microbatches. Default 1 =
+    # unchanged. >1 cuts grad all-reduces ~accum_steps x but multiplies effective
+    # batch -> scale head LRs accordingly in the config.
+    accum_steps = int(args_opt.get("accum_steps", 1))
+    # -- PARTIAL ENCODER UNFREEZE (additive, OFF by default). When >0, the last N
+    # encoder blocks are fine-tuned end-to-end with the head. Requires the LIVE
+    # path (cache has no graph). encoder_lr* set the (low) LR for the encoder
+    # param group -- keep it 10-50x below the head LR to avoid washing out
+    # pretrained features. Default 0 => frozen path bit-identical.
+    encoder_unfreeze_last_n = int(args_opt.get("encoder_unfreeze_last_n", 0))
+    encoder_lr = float(args_opt.get("encoder_lr", 1.0e-5))
+    encoder_start_lr = float(args_opt.get("encoder_start_lr", 1.0e-6))
+    encoder_final_lr = float(args_opt.get("encoder_final_lr", 1.0e-6))
+    encoder_weight_decay = float(args_opt.get("encoder_weight_decay", 0.0))
+    encoder_warmup = float(args_opt.get("encoder_warmup", 0.05))
 
     # Opt-in early stop on val macro-F1 (already computed natively). None disables.
     # log_val_f1 is accepted for harness symmetry; F1 is always logged here so it's a no-op.
@@ -262,6 +397,13 @@ def main(args_eval, resume_preempt=False):
     # doesn't wipe all progress. Resume re-trains the same epoch from iter 0 with
     # the loaded weights (true iter-resume isn't cheap). 0 / None = disabled.
     save_every_iters = args_eval.get("save_every_iters", None)
+    # -- Slim per-epoch checkpoints (opt-in). When true, also write a tiny
+    # head-only `ep{N}.pt` (just classifier weights + epoch, no 5.5GB optimizer
+    # state) after every epoch. Lets us keep ALL epochs and select the promoted
+    # checkpoint by an external live-eval metric later (a downstream scorer only
+    # needs the "classifiers" key). Decouples selection from the noisy cached
+    # `best.pt`. Default false = unchanged behaviour.
+    slim_checkpoints = args_eval.get("slim_checkpoints", False)
     # -- RUN DISCIPLINE (opt-in). When true, the eval writes a STATUS.json
     # under `folder`, saves a single rotating `best.pt` instead of separate
     # `best_val_acc.pt` + `best_val_f1.pt`. Default false preserves prior
@@ -371,12 +513,36 @@ def main(args_eval, resume_preempt=False):
         model_kwargs=args_model,
         wrapper_kwargs=args_wrapper,
         device=device,
+        unfreeze_last_n=encoder_unfreeze_last_n,
     )
+    encoder_finetune = encoder_unfreeze_last_n > 0
+    if encoder_finetune and args_eval.get("export_cache", False):
+        raise ValueError(
+            "encoder_unfreeze_last_n>0 is incompatible with export_cache "
+            "(fine-tuning needs the live path with a live graph, not a static cache)."
+        )
     # -- EXPORT FEATURE CACHE mode: run frozen encoder once over train+val,
     # write a backbone-feature cache, then exit (no head training). Enables fast
     # subsequent probes that read cached features. Opt-in via export_cache: true.
     if args_eval.get("export_cache", False):
         norm = args_data.get("normalization", None)
+        # Fast-probe (opt-in): mean-pool the spatial token axis at export so the
+        # cache is ~S(576)x smaller. This drops the head's LEARNABLE spatial
+        # attention pool (replaced by a fixed mean) -- an accuracy tradeoff, off
+        # by default. The head must be told to skip its spatial pool for a
+        # pooled cache; the manifest records pooled="mean" so that stays honest.
+        export_pool_spatial = args_eval.get("export_pool_spatial", "none")
+        if export_pool_spatial not in ("none", "mean"):
+            raise ValueError(
+                f"export_pool_spatial must be 'none' or 'mean', got "
+                f"{export_pool_spatial!r}"
+            )
+        # tokens_per_clip needed to reshape TS -> (tokens_per_clip, S) when
+        # pooling; matches the head's default (frames_per_clip // 2).
+        _clf_kwargs = args_classifier.get(f"{classifier_name}_kwargs", {}) or {}
+        export_tokens_per_clip = _clf_kwargs.get(
+            "tokens_per_clip", frames_per_clip // 2
+        )
         for split, dpath, croot in (
             ("train", train_data_path, args_data.get("train_cache_root")),
             ("val", val_data_path, args_data.get("val_cache_root")),
@@ -403,9 +569,22 @@ def main(args_eval, resume_preempt=False):
                 rank=rank,
                 device=device,
                 use_bfloat16=args_opt.get("use_bfloat16", True),
+                pool_spatial=export_pool_spatial,
+                tokens_per_clip=export_tokens_per_clip,
             )
         logger.info("[export] feature cache export complete; exiting.")
         return
+
+    # If reading a spatially-pooled cache (fast-probe), the head must SKIP its
+    # own spatial pool -- the export already reduced S to 1. Detect from the
+    # cache manifest so accuracy-max (unpooled) caches are never affected.
+    cache_pooled = read_cache_pooled(train_cache_root)
+    spatial_prepooled = cache_pooled == "mean"
+    if spatial_prepooled:
+        logger.info(
+            "[cache] pooled='mean' detected -> head spatial pool DISABLED "
+            "(fast-probe path; learnable spatial pool replaced by export-time mean)"
+        )
 
     # -- init classifier
     if classifier_name == "asformer":
@@ -422,9 +601,17 @@ def main(args_eval, resume_preempt=False):
                 "is False; ASFormer is designed for per-frame supervision."
             )
 
+        # Optional narrower head working-width. When set (e.g. 1664 for a 6656-dim
+        # HIERARCHICAL cache), the head projects encoder.embed_dim -> head_embed_dim
+        # at entry and runs its O(D^2) body at the cheaper width -> fits the tile.
+        # Default None -> head runs at encoder.embed_dim (bit-identical).
+        _head_dim = asformer_kwargs.get("head_embed_dim", None)
+        _work_dim = _head_dim if _head_dim is not None else encoder.embed_dim
+
         def _build_head():
             return ASFormerHead(
-                embed_dim=encoder.embed_dim,
+                embed_dim=_work_dim,
+                input_dim=encoder.embed_dim,
                 num_classes=num_classes,
                 num_clips=asformer_kwargs.get("num_clips", num_segments),
                 tokens_per_clip=asformer_kwargs.get(
@@ -436,6 +623,7 @@ def main(args_eval, resume_preempt=False):
                 dropout=asformer_kwargs.get("dropout", 0.0),
                 return_sequence=asformer_kwargs.get("return_sequence", True),
                 temporal_tokens=asformer_kwargs.get("temporal_tokens", None),
+                spatial_prepooled=spatial_prepooled,
             ).to(device)
 
         classifiers = [_build_head() for _ in opt_kwargs]
@@ -472,6 +660,7 @@ def main(args_eval, resume_preempt=False):
                 dropout=mamba_kwargs.get("dropout", 0.0),
                 return_sequence=mamba_kwargs.get("return_sequence", True),
                 temporal_tokens=mamba_kwargs.get("temporal_tokens", None),
+                spatial_prepooled=spatial_prepooled,
             ).to(device)
 
         classifiers = [_build_head() for _ in opt_kwargs]
@@ -492,12 +681,68 @@ def main(args_eval, resume_preempt=False):
             "(expected 'attentive', 'asformer', or 'mamba')"
         )
     use_ddp = world_size > 1 and torch.distributed.is_available() and torch.distributed.is_initialized()
+    # `classifiers` stays a plain list of the RAW head modules: per-head
+    # optimizers, checkpoint save/load, and metrics all index it directly. For
+    # DDP we wrap ALL heads in ONE _MultiHeadModule -> ONE DistributedDataParallel
+    # so a training step does a single bucketed grad all-reduce over every head,
+    # not N serialized reduces (backward was 97% of iter time; see profiling
+    # note on _MultiHeadModule). The forward loop routes through `heads_ddp`;
+    # everything else keeps using `classifiers`.
+    heads_ddp = None
     if use_ddp:
-        classifiers = [DistributedDataParallel(c, static_graph=True) for c in classifiers]
-        logger.info("Using DistributedDataParallel for probe classifiers")
+        _bucket_mb = int(args_opt.get("ddp_bucket_cap_mb", 100))
+        # static_graph=True is the fast path, but it records a fixed reduction
+        # schedule on iter 0; grad accumulation (no_sync on non-boundary iters)
+        # deliberately varies reduction, so disable it when accum>1. The
+        # pretrain trainer combines both fine on torch 2.10, but keeping this
+        # guard matches the CLAUDE.md caution about static_graph fragility.
+        _accum = int(args_opt.get("accum_steps", 1))
+        heads_ddp = DistributedDataParallel(
+            _MultiHeadModule(classifiers),
+            static_graph=(_accum == 1),
+            bucket_cap_mb=_bucket_mb,
+        )
+        # bf16 gradient compression: OFF by default. It is genuinely LOSSY (casts
+        # grads to bf16 before all-reduce) and measurably perturbs the F1 curve
+        # (job 8654966: ep1 valF1 48.5 with it vs 49.6 baseline / 49.57 without
+        # it -- see the single-DDP-only run 8655019 which matches baseline to
+        # 0.04). Opt in via ddp_bf16_compress: true when the extra ~throughput is
+        # worth the small accuracy cost; the result-neutral default is single-DDP
+        # + big buckets alone.
+        if args_opt.get("ddp_bf16_compress", False):
+            try:
+                from torch.distributed.algorithms.ddp_comm_hooks import (
+                    default_hooks as _ddp_hooks,
+                )
+                heads_ddp.register_comm_hook(None, _ddp_hooks.bf16_compress_hook)
+                logger.info("DDP bf16_compress_hook registered on probe heads (LOSSY, opt-in)")
+            except Exception as e:
+                logger.warning(f"could not register bf16_compress_hook: {e}")
+        logger.info(
+            f"Using single DDP over {len(classifiers)} probe heads "
+            f"(bucket_cap_mb={_bucket_mb})"
+        )
     else:
         logger.info("Running probe classifiers without DistributedDataParallel")
     print(classifiers[0])
+
+    # -- PARTIAL UNFREEZE: DDP-wrap the encoder so grads on the unfrozen blocks
+    # are all-reduced. Only the trainable (last-N) blocks have requires_grad=True;
+    # frozen params are not reduced. find_unused_parameters=True because the frozen
+    # early blocks / patch_embed produce no grad (DDP must tolerate that). XPU:
+    # NO device_id kwarg (hangs on multi-node XPU -- see CLAUDE.md / torchtune table).
+    encoder_ddp = None
+    if encoder_finetune and use_ddp:
+        encoder_ddp = DistributedDataParallel(
+            encoder,
+            static_graph=False,
+            find_unused_parameters=True,
+            bucket_cap_mb=int(args_opt.get("ddp_bucket_cap_mb", 100)),
+        )
+        logger.info(
+            "Encoder DDP wrap enabled (partial fine-tune, last %d blocks).",
+            encoder_unfreeze_last_n,
+        )
 
     train_loader, train_sampler, train_uses_cached_features = make_probe_dataloader(
         dataset_type=dataset_type,
@@ -519,6 +764,8 @@ def main(args_eval, resume_preempt=False):
         cache_num_workers=cache_num_workers,
         cache_require_complete=cache_require_complete,
         sequence_labels=sequence_labels,
+        train_frac=train_frac,
+        subset_seed=subset_seed,
     )
     val_loader, _, val_uses_cached_features = make_probe_dataloader(
         dataset_type=dataset_type,
@@ -547,12 +794,40 @@ def main(args_eval, resume_preempt=False):
     logger.info(f"Offline val cache enabled: {val_uses_cached_features}")
 
     # -- optimizer and scheduler
+    encoder_params = None
+    encoder_sched = None
+    if encoder_finetune:
+        # Fine-tuning needs a SINGLE head: the training loop sums all heads' losses
+        # into one backward, so a shared trainable encoder would be pulled by every
+        # head's (different) LR at once. Enforce one head (use the winning LR).
+        if len(classifiers) != 1:
+            raise ValueError(
+                f"encoder_unfreeze_last_n>0 requires exactly ONE head "
+                f"(multihead_kwargs len must be 1), got {len(classifiers)}. "
+                "Set a single winning LR schedule for fine-tune runs."
+            )
+        src = encoder_ddp if encoder_ddp is not None else encoder
+        encoder_params = [p for p in src.parameters() if p.requires_grad]
+        encoder_sched = dict(
+            warmup=encoder_warmup,
+            start_lr=encoder_start_lr,
+            ref_lr=encoder_lr,
+            final_lr=encoder_final_lr,
+            ref_wd=encoder_weight_decay,
+            final_wd=encoder_weight_decay,
+        )
+        logger.info(
+            "Fine-tune: %d trainable encoder tensors added to optimizer.",
+            len(encoder_params),
+        )
     optimizer, scaler, scheduler, wd_scheduler = init_opt(
         classifiers=classifiers,
         opt_kwargs=opt_kwargs,
         iterations_per_epoch=ipe,
         num_epochs=num_epochs,
         use_bfloat16=use_bfloat16,
+        encoder_params=encoder_params,
+        encoder_sched=encoder_sched,
     )
 
     # -- load training checkpoint
@@ -589,6 +864,10 @@ def main(args_eval, resume_preempt=False):
         _pre_clf = [_copy.deepcopy(c.state_dict()) for c in classifiers]
         _pre_opt = [_copy.deepcopy(o.state_dict()) for o in optimizer]
         _pre_scaler = [_copy.deepcopy(s.state_dict()) if s is not None else None for s in (scaler or [])]
+        # Only hand the encoder to the loader for fine-tune runs (frozen runs never
+        # persist an "encoder" key, and reloading a frozen encoder is a no-op anyway).
+        _resume_enc = (encoder_ddp.module if encoder_ddp is not None else encoder) if encoder_finetune else None
+        _pre_enc = _copy.deepcopy(unwrap_module(_resume_enc).state_dict()) if _resume_enc is not None else None
         try:
             classifiers, optimizer, scaler, start_epoch, ckpt_bests = load_checkpoint(
                 device=device,
@@ -597,6 +876,7 @@ def main(args_eval, resume_preempt=False):
                 opt=optimizer,
                 scaler=scaler,
                 val_only=val_only,
+                encoder=_resume_enc,
             )
             if ckpt_bests is not None:
                 best_val_acc, best_val_acc_epoch, best_val_f1, best_val_f1_epoch = ckpt_bests
@@ -619,6 +899,8 @@ def main(args_eval, resume_preempt=False):
                 for s, sd in zip(scaler, _pre_scaler):
                     if s is not None and sd is not None:
                         s.load_state_dict(sd)
+            if _resume_enc is not None and _pre_enc is not None:
+                unwrap_module(_resume_enc).load_state_dict(_pre_enc)
             start_epoch = 0
 
     # RUN START banner (after resume so start_epoch is known).
@@ -636,7 +918,7 @@ def main(args_eval, resume_preempt=False):
     def _build_save_dict(epoch):
         all_classifier_dicts = [unwrap_module(c).state_dict() for c in classifiers]
         all_opt_dicts = [o.state_dict() for o in optimizer]
-        return {
+        d = {
             "classifiers": all_classifier_dicts,
             "opt": all_opt_dicts,
             "scaler": None if scaler is None else [s.state_dict() for s in scaler],
@@ -649,6 +931,13 @@ def main(args_eval, resume_preempt=False):
             "best_val_f1": best_val_f1,
             "best_val_f1_epoch": best_val_f1_epoch,
         }
+        # Partial fine-tune: persist the FULL encoder state so resume/scoring can
+        # restore the trained blocks (frozen params are cheap and kept for a clean
+        # reload). Only added when fine-tuning -> frozen-run checkpoints unchanged.
+        if encoder_finetune:
+            enc_src = encoder_ddp.module if encoder_ddp is not None else encoder
+            d["encoder"] = unwrap_module(enc_src).state_dict()
+        return d
 
     def _atomic_torch_save(obj, path):
         # Atomic save with rotating backup. tmp + rename so a kill mid-write
@@ -666,6 +955,22 @@ def main(args_eval, resume_preempt=False):
         if rank != 0:
             return
         _atomic_torch_save(_build_save_dict(epoch), latest_path)
+
+    def save_slim_epoch(epoch):
+        # Per-epoch slim checkpoint for post-hoc F1@10 selection. Saves classifier
+        # heads (always) + encoder state (when fine-tuning). Skips optimizer state so
+        # ~5-15MB for frozen probes vs ~1-2GB for FT runs (vs ~5-10GB full w/ Adam).
+        # eval_segmental_f1.py loads both keys; frozen probes only have "classifiers".
+        if rank != 0 or not slim_checkpoints:
+            return
+        slim = {
+            "classifiers": [unwrap_module(c).state_dict() for c in classifiers],
+            "epoch": epoch,
+        }
+        if encoder_finetune:
+            enc_src = encoder_ddp.module if encoder_ddp is not None else encoder
+            slim["encoder"] = unwrap_module(enc_src).state_dict()
+        _atomic_torch_save(slim, os.path.join(folder, f"ep{epoch}.pt"))
 
     def save_best_acc(epoch):
         if rank != 0:
@@ -700,6 +1005,10 @@ def main(args_eval, resume_preempt=False):
                 training=True,
                 encoder=encoder,
                 classifiers=classifiers,
+                heads_ddp=heads_ddp,
+                encoder_ddp=encoder_ddp,
+                encoder_finetune=encoder_finetune,
+                accum_steps=accum_steps,
                 scaler=scaler,
                 optimizer=optimizer,
                 scheduler=scheduler,
@@ -725,6 +1034,8 @@ def main(args_eval, resume_preempt=False):
             training=False,
             encoder=encoder,
             classifiers=classifiers,
+            encoder_ddp=encoder_ddp,
+            encoder_finetune=encoder_finetune,
             scaler=scaler,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -785,6 +1096,18 @@ def main(args_eval, resume_preempt=False):
                     best_head_f1 = vm["macro_f1"]
                     best_head = hi
             val_metrics = val_metrics_per_head[best_head]
+            # Log which head (i.e. which swept LR) is winning, plus every head's
+            # val F1. Only the best head's metrics reach the CSV, so without this
+            # a multi-head LR sweep never records WHICH lr won — needed to set the
+            # single-head default. Cheap: one line/epoch on rank 0.
+            if is_main_process() and len(classifiers) > 1:
+                _lrs = [k.get("ref_lr", k.get("lr")) for k in opt_kwargs]
+                _f1s = [f"h{hi}(lr={_lrs[hi]}):{100.0*val_metrics_per_head[hi]['macro_f1']:.2f}"
+                        for hi in range(len(classifiers))]
+                logger.info(
+                    f"[head-sweep ep{epoch + 1}] best=h{best_head} "
+                    f"(lr={_lrs[best_head]}) | " + " ".join(_f1s)
+                )
             if train_per_head_preds_all[best_head] is not None and train_per_head_preds_all[best_head].size:
                 train_metrics = _compute_metrics(
                     train_per_head_preds_all[best_head], train_labels_all, num_classes
@@ -848,6 +1171,7 @@ def main(args_eval, resume_preempt=False):
             return
 
         save_checkpoint(epoch + 1)
+        save_slim_epoch(epoch + 1)
 
         # STATUS.json per-epoch update (rank 0 only; best_val_* set above).
         if status_io is not None and rank == 0:
@@ -909,6 +1233,8 @@ def run_one_epoch(
     wd_scheduler,
     data_loader,
     use_bfloat16,
+    heads_ddp=None,
+    accum_steps=1,
     use_cached_features=False,
     profile_timing=False,
     profile_log_interval=10,
@@ -921,10 +1247,23 @@ def run_one_epoch(
     supervise_token_range=None,
     sub_epoch_save_fn=None,
     save_every_iters=None,
+    encoder_ddp=None,
+    encoder_finetune=False,
 ):
 
     for c in classifiers:
         c.train(mode=training)
+
+    # Partial fine-tune: toggle the trainable encoder blocks' train/eval mode with
+    # the pass (BN/dropout etc.). Frozen params are unaffected. When not
+    # fine-tuning the encoder stays in eval() (set at build time) -- unchanged.
+    if encoder_finetune:
+        enc_mod = encoder_ddp.module if encoder_ddp is not None else encoder
+        _vit = getattr(enc_mod, "model", enc_mod)
+        _blocks = getattr(_vit, "blocks", [])
+        for blk in _blocks:
+            if any(p.requires_grad for p in blk.parameters()):
+                blk.train(mode=training)
 
     use_smoothing = sequence_labels and loss_smoothing_weight > 0.0
 
@@ -988,13 +1327,19 @@ def run_one_epoch(
         else:
             maybe_sync(device, timed_iteration and profile_cuda_sync)
             encoder_start_time = time.perf_counter()
+            # Partial fine-tune: run the (DDP-wrapped) encoder WITH grad during
+            # training; otherwise keep the frozen no-grad fast path. encoder_train
+            # is False for eval passes even when fine-tuning (no grad needed).
+            _enc = encoder_ddp if (encoder_ddp is not None and training) else encoder
+            _enc_grad = encoder_finetune and training
             with torch.amp.autocast(
                 device.type,
                 dtype=torch.bfloat16 if use_bfloat16 else torch.float16,
                 enabled=use_bfloat16,
             ):
-                with torch.no_grad():
-                    outputs = encoder(clips, clip_indices)
+                _grad_ctx = contextlib.nullcontext() if _enc_grad else torch.no_grad()
+                with _grad_ctx:
+                    outputs = _enc(clips, clip_indices)
             maybe_sync(device, timed_iteration and profile_cuda_sync)
             encoder_time = time.perf_counter() - encoder_start_time
 
@@ -1005,10 +1350,20 @@ def run_one_epoch(
             dtype=torch.bfloat16 if use_bfloat16 else torch.float16,
             enabled=use_bfloat16,
         ):
-            if not training:
-                outputs = [[c(o) for o in outputs] for c in classifiers]
-            if training:
-                outputs = [[c(o) for o in outputs] for c in classifiers]
+            views = outputs  # list over views of encoder features
+            if training and heads_ddp is not None:
+                # Route through the single DDP-over-all-heads module so ONE
+                # bucketed grad all-reduce covers every head. heads_ddp(view)
+                # returns per-head outputs; regroup to the [head][view] nesting
+                # the loss/metric code below expects.
+                per_view = [heads_ddp(o) for o in views]  # [view][head]
+                outputs = [
+                    [per_view[vi][hi] for vi in range(len(views))]
+                    for hi in range(len(classifiers))
+                ]
+            else:
+                # Eval (no grad sync) and the no-DDP path use the raw heads.
+                outputs = [[c(o) for o in views] for c in classifiers]
         maybe_sync(device, timed_iteration and profile_cuda_sync)
         head_time = time.perf_counter() - head_start_time
 
@@ -1091,16 +1446,30 @@ def run_one_epoch(
                     100.0 * coutputs.max(dim=1).indices.eq(labels).sum() / batch_size
                     for coutputs in outputs
                 ]
-            top1_accs = [float(AllReduce.apply(t1a)) for t1a in top1_accs]
+            # Update the display meters with LOCAL (this-rank) acc/loss every
+            # iter. These meters feed only the progress line — the metrics that
+            # drive early-stop and best-checkpoint selection (F1/recall) are
+            # computed at epoch end from all_gather'd preds/labels below, NOT
+            # from these meters. The cross-rank AllReduce that used to run here
+            # EVERY iter (~12 blocking 24-rank collectives/iter + float() host
+            # syncs, all just to average the displayed number) is deferred to
+            # log cadence (itr % 10) — result-neutral, removes the per-iter
+            # comm/sync stall. `float()` on a 0-dim tensor is a cheap local sync.
             for t1m, t1a in zip(top1_meters, top1_accs):
-                t1m.update(t1a)
-            loss_vals = [sum([float(AllReduce.apply(lij)) for lij in li]) / len(li) for li in losses]
+                t1m.update(float(t1a))
+            loss_vals = [sum(float(lij) for lij in li) / len(li) for li in losses]
             for lm, lv in zip(loss_meters, loss_vals):
                 lm.update(lv)
             # Collect predictions + labels per-classifier so we can compute
-            # macro/weighted F1 + macro recall at epoch end. `outputs` is
-            # already softmax-averaged across views above. Stays on CPU as
-            # int64 to keep the buffer compact (these are class ids, not logits).
+            # macro/weighted F1 + macro recall at epoch end. `outputs` is already
+            # softmax-averaged across views above. REVERTED to the original
+            # per-iter .cpu().numpy() form: the "keep on device, cat once at
+            # epoch end" optimization CRASHED the live path at the epoch-end
+            # gather ("Storage size calculation overflowed") — reproducibly, and
+            # NOT fixed by int16->int64 (so int16 was never the cause). The old
+            # per-iter D2H copy is a hard sync that keeps the buffer well-formed;
+            # and the profiler put this path at <0.1% of iter time, so there was
+            # never a real speedup to chase here. Correctness > a non-win.
             for ci, coutputs in enumerate(outputs):
                 preds_chunks[ci].append(
                     coutputs.argmax(dim=-1).detach().cpu().reshape(-1).numpy().astype(np.int64)
@@ -1115,21 +1484,38 @@ def run_one_epoch(
         if training:
             maybe_sync(device, timed_iteration and profile_cuda_sync)
             backward_start_time = time.perf_counter()
-            if use_bfloat16:
-                # ASFormer/MS-TCN: per-stage CE losses share the encoder
-                # forward graph. Sum the per-stage losses first, then call
-                # backward once — calling .backward() on each stage loss
-                # individually frees the shared subgraph after the first
-                # call and crashes on the second ("backward through the
-                # graph a second time"). Standard MS-TCN training sums
-                # stage losses with equal weight.
-                [s.scale(sum(li)).backward() for s, li in zip(scaler, losses)]
-                [s.step(o) for s, o in zip(scaler, optimizer)]
-                [s.update() for s in scaler]
-            else:
-                [sum(li).backward() for li in losses]
-                [o.step() for o in optimizer]
-            [o.zero_grad() for o in optimizer]
+            # Sum EVERY head's (per-stage-summed) loss into ONE scalar and call
+            # backward ONCE. Heads have disjoint params, so d(sum)/d(head_i) ==
+            # d(head_i_loss)/d(head_i) — numerically identical to N separate
+            # backwards, but the single-DDP wrapper reduces all heads' grads in
+            # one bucketed all-reduce instead of N serialized ones (the 97%
+            # backward cost). MS-TCN per-stage losses are summed first (shared
+            # subgraph -> one backward, as the old comment noted).
+            total_loss = sum(sum(li) for li in losses)
+            # Grad accumulation: scale so accumulated grads average over the
+            # window, and only sync/step on the boundary. no_sync() on the
+            # non-boundary microbatches skips DDP's all-reduce entirely ->
+            # ~accum_steps x fewer reduces. accum_steps=1 (default) = no change.
+            is_boundary = ((itr + 1) % accum_steps == 0) or (itr + 1 == len(data_loader))
+            if accum_steps > 1:
+                total_loss = total_loss / accum_steps
+            _sync_ctx = (
+                contextlib.nullcontext()
+                if (is_boundary or heads_ddp is None)
+                else heads_ddp.no_sync()
+            )
+            with _sync_ctx:
+                if use_bfloat16:
+                    scaler[0].scale(total_loss).backward()
+                else:
+                    total_loss.backward()
+            if is_boundary:
+                if use_bfloat16:
+                    [s.step(o) for s, o in zip(scaler, optimizer)]
+                    [s.update() for s in scaler]
+                else:
+                    [o.step() for o in optimizer]
+                [o.zero_grad() for o in optimizer]
             maybe_sync(device, timed_iteration and profile_cuda_sync)
             backward_time = time.perf_counter() - backward_start_time
 
@@ -1147,14 +1533,23 @@ def run_one_epoch(
         _agg_top1 = np.array([t1m.avg for t1m in top1_meters])
         _agg_loss = np.array([lm.avg for lm in loss_meters])
         if itr % 10 == 0:
+            # Only NOW pay for cross-rank averaging, so the printed number is a
+            # global mean (matches the old per-iter behavior at log points) but
+            # we do ~1 reduce per 10 iters instead of ~12 per iter. Display-only.
+            _disp_top1 = np.array(
+                [float(AllReduce.apply(torch.tensor(v, device=device))) for v in _agg_top1]
+            )
+            _disp_loss = np.array(
+                [float(AllReduce.apply(torch.tensor(v, device=device))) for v in _agg_loss]
+            )
             logger.info(
                 "[%5d] %.3f%% [%.3f%% %.3f%%] loss: %.3f [mem: %.2e]"
                 % (
                     itr,
-                    _agg_top1.max(),
-                    _agg_top1.mean(),
-                    _agg_top1.min(),
-                    _agg_loss.max(),
+                    _disp_top1.max(),
+                    _disp_top1.mean(),
+                    _disp_top1.min(),
+                    _disp_loss.max(),
                     max_mem_mb(device),
                 )
             )
@@ -1197,24 +1592,53 @@ def run_one_epoch(
     # numpy arrays, one per head) and a single labels array shared by all
     # heads. The caller is responsible for all-gather + metric computation
     # on rank 0.
+    # Concatenate the per-iter numpy chunks (chunks are already CPU numpy — see
+    # the per-iter collection above; the on-device variant crashed the live
+    # gather and was reverted).
     per_head_preds = [
         np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.int64)
         for chunks in preds_chunks
     ]
     labels_np = np.concatenate(labels_chunks) if labels_chunks else np.zeros(0, dtype=np.int64)
+    # Reduce the display acc/loss ONCE at epoch end (was implicitly global via
+    # the per-iter AllReduce). These feed only the cosmetic train_acc/train_loss
+    # CSV columns; the F1/recall metrics that drive early-stop come from
+    # per_head_preds via the caller's all_gather. One reduce/epoch, not per-iter.
+    if _agg_top1.size:
+        _agg_top1 = np.array(
+            [float(AllReduce.apply(torch.tensor(v, device=device))) for v in _agg_top1]
+        )
+        _agg_loss = np.array(
+            [float(AllReduce.apply(torch.tensor(v, device=device))) for v in _agg_loss]
+        )
     return _agg_top1.max(), _agg_loss.max(), per_head_preds, labels_np
 
 
-def load_checkpoint(device, r_path, classifiers, opt, scaler, val_only=False):
+def load_checkpoint(device, r_path, classifiers, opt, scaler, val_only=False, encoder=None):
     checkpoint = robust_checkpoint_loader(r_path, map_location=torch.device("cpu"))
     logger.info(f"read-path: {r_path}")
 
-    # -- loading encoder
+    # -- loading classifier heads
     pretrained_dict = checkpoint["classifiers"]
     msg = [
         c.load_state_dict(adapt_state_dict_for_model(c, pd))
         for c, pd in zip(classifiers, pretrained_dict)
     ]
+
+    # -- loading the fine-tuned encoder (partial-unfreeze runs only).
+    # save_checkpoint persists checkpoint["encoder"] iff encoder_finetune. WITHOUT
+    # this, a requeued FT run resets the encoder to pretrained weights while keeping
+    # the trained head + stale Adam moments -> the resumed segments are NOT continuous
+    # fine-tunes. Frozen probes never write this key, so the branch is a no-op there.
+    if encoder is not None and "encoder" in checkpoint:
+        enc_dict = {k.replace("module.", ""): v for k, v in checkpoint["encoder"].items()}
+        enc_msg = unwrap_module(encoder).load_state_dict(enc_dict, strict=False)
+        logger.info(f"restored fine-tuned encoder from checkpoint with msg: {enc_msg}")
+    elif encoder is not None:
+        logger.warning(
+            "load_checkpoint: encoder passed but checkpoint has no 'encoder' key "
+            "(pre-fix checkpoint or frozen run); encoder kept at pretrained weights."
+        )
 
     # Best-tracking tuple: (best_val_acc, best_val_acc_epoch,
     # best_val_f1, best_val_f1_epoch). Older checkpoints (pre-newsplit) won't
@@ -1291,6 +1715,8 @@ def make_dataloader(
     subset_file=None,
     normalization=None,
     sequence_labels=False,
+    train_frac=1.0,
+    subset_seed=0,
 ):
     if normalization is None:
         normalization = DEFAULT_NORMALIZATION
@@ -1325,6 +1751,8 @@ def make_dataloader(
         drop_last=False,
         subset_file=subset_file,
         sequence_labels=sequence_labels,
+        train_frac=train_frac,
+        subset_seed=subset_seed,
     )
     return data_loader, data_sampler
 
@@ -1350,6 +1778,8 @@ def export_feature_cache(
     device,
     use_bfloat16,
     shard_size=64,
+    pool_spatial="none",
+    tokens_per_clip=None,
 ):
     """Run the frozen encoder once over a dataset and write a backbone-feature
     cache that BackboneFeatureCacheDataset can read.
@@ -1435,6 +1865,28 @@ def export_feature_cache(
                 outputs = encoder(clips, clip_indices)  # list[num_views] of [B, ...]
             # Stack views -> [B, num_views, *enc_out]; store bf16 on CPU.
             feats = torch.stack(outputs, dim=1).to(torch.bfloat16).cpu()
+            if pool_spatial == "mean":
+                # feats: [B, num_views, num_clips, TS, D] with TS = T_clip * S.
+                # Mean over the spatial axis S so the cache stores one token per
+                # (clip, temporal) step: [B, num_views, num_clips, T_clip, D].
+                # Token order is T-major/S-minor (matches ASFormerHead
+                # _reshape_input: TS -> [tokens_per_clip, S]).
+                if feats.dim() != 5:
+                    raise ValueError(
+                        "export_pool_spatial='mean' expects preserve_clip_dim "
+                        f"features [B,V,NC,TS,D], got shape {tuple(feats.shape)}. "
+                        "Pooled cache is only valid for asformer/mamba heads."
+                    )
+                B_, V_, NC_, TS_, D_ = feats.shape
+                if tokens_per_clip is None or TS_ % tokens_per_clip != 0:
+                    raise ValueError(
+                        f"TS={TS_} not divisible by tokens_per_clip="
+                        f"{tokens_per_clip}; cannot infer spatial axis to pool."
+                    )
+                S_ = TS_ // tokens_per_clip
+                feats = feats.reshape(B_, V_, NC_, tokens_per_clip, S_, D_).mean(
+                    dim=4
+                )  # -> [B, V, NC, tokens_per_clip, D]
             if feature_shape is None:
                 feature_shape = list(feats.shape[1:])  # [num_views, *enc_out]
             # sequence_labels -> label is a per-clip tensor; store as-is via list.
@@ -1453,6 +1905,11 @@ def export_feature_cache(
         "rank": int(rank),
         "feature_shape_per_sample": feature_shape,
         "shards": shards_meta,
+        # Fast-probe marker: "mean" means the spatial token axis was pooled at
+        # export, so the head MUST skip its (learnable) spatial pool. "none" =
+        # full unpooled tokens (accuracy-max, head pools spatially itself).
+        "pooled": pool_spatial,
+        "tokens_per_clip": int(tokens_per_clip) if tokens_per_clip else None,
     }
     with open(out_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
@@ -1483,6 +1940,8 @@ def make_probe_dataloader(
     cache_num_workers=1,
     cache_require_complete=True,
     sequence_labels=False,
+    train_frac=1.0,
+    subset_seed=0,
 ):
     if cache_root is not None:
         _, data_loader, data_sampler = make_backbone_feature_cache(
@@ -1495,6 +1954,8 @@ def make_probe_dataloader(
             pin_mem=True,
             persistent_workers=True,
             require_complete_export=cache_require_complete,
+            train_frac=train_frac,
+            subset_seed=subset_seed,
         )
         return data_loader, data_sampler, True
 
@@ -1515,13 +1976,32 @@ def make_probe_dataloader(
         num_workers=num_workers,
         normalization=normalization,
         sequence_labels=sequence_labels,
+        train_frac=train_frac,
+        subset_seed=subset_seed,
     )
     return data_loader, data_sampler, False
 
 
-def init_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs, use_bfloat16=False):
+def init_opt(
+    classifiers,
+    iterations_per_epoch,
+    opt_kwargs,
+    num_epochs,
+    use_bfloat16=False,
+    encoder_params=None,
+    encoder_sched=None,
+):
+    """Build one AdamW per classifier head.
+
+    When ``encoder_params`` is given (partial encoder fine-tune), the encoder's
+    trainable params are added as a SECOND param group on the (single) head's
+    optimizer, with its own low-LR cosine schedule from ``encoder_sched``. This
+    path requires exactly ONE head (multi-head loss-summing would pull a shared
+    trainable encoder with 3 different head LRs at once, which is ill-posed) --
+    the caller enforces len(classifiers)==1 when fine-tuning.
+    """
     optimizers, schedulers, wd_schedulers, scalers = [], [], [], []
-    for c, kwargs in zip(classifiers, opt_kwargs):
+    for ci, (c, kwargs) in enumerate(zip(classifiers, opt_kwargs)):
         param_groups = [
             {
                 "params": (p for n, p in c.named_parameters()),
@@ -1533,6 +2013,22 @@ def init_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs, use_bflo
                 "mc_final_wd": kwargs.get("final_wd"),
             }
         ]
+        if encoder_params is not None and ci == 0:
+            param_groups.append(
+                {
+                    "params": encoder_params,
+                    "mc_warmup_steps": int(encoder_sched["warmup"] * iterations_per_epoch),
+                    "mc_start_lr": encoder_sched["start_lr"],
+                    "mc_ref_lr": encoder_sched["ref_lr"],
+                    "mc_final_lr": encoder_sched["final_lr"],
+                    "mc_ref_wd": encoder_sched["ref_wd"],
+                    "mc_final_wd": encoder_sched["final_wd"],
+                }
+            )
+            logger.info(
+                "init_opt: added encoder param group (fine-tune) ref_lr=%.2e wd=%.2e",
+                encoder_sched["ref_lr"], encoder_sched["ref_wd"],
+            )
         logger.info("Using AdamW")
         optimizers += [torch.optim.AdamW(param_groups)]
         schedulers += [WarmupCosineLRSchedule(optimizers[-1], T_max=int(num_epochs * iterations_per_epoch))]

@@ -6,6 +6,7 @@
 import math
 import os
 import pathlib
+import random
 import warnings
 from logging import getLogger
 
@@ -25,6 +26,28 @@ from src.datasets.utils.weighted_sampler import DistributedWeightedSampler
 _GLOBAL_SEED = 0
 MAX_FAILED_SAMPLE_RETRIES = max(1, int(os.environ.get("VJEPA2_MAX_FAILED_SAMPLE_RETRIES", "32")))
 logger = getLogger()
+
+
+def seeded_subset_indices(n, frac, seed=0):
+    """Deterministic sorted indices for a random ``frac`` subset of ``n`` items.
+
+    Used for low-shot probing: given a dataset of ``n`` samples, return a sorted
+    list of indices selecting ``round(n * frac)`` of them, chosen by a local RNG
+    seeded only by ``seed``. The result depends solely on ``(n, seed)`` -- not on
+    rank, world_size, or global RNG state -- so every distributed rank selects the
+    IDENTICAL subset before its DistributedSampler shards it. Indices are sorted so
+    downstream ordering is unaffected by the sampling.
+
+    ``frac == 1.0`` returns ``None`` (the caller must treat this as "no subset",
+    keeping the full-data path byte-identical to before this hook existed).
+    """
+    if not (0.0 < frac <= 1.0):
+        raise ValueError(f"train_frac must be in (0, 1], got {frac}")
+    if frac == 1.0:
+        return None
+    k = max(1, round(n * frac))
+    rng = random.Random(seed)
+    return sorted(rng.sample(range(n), k))
 
 
 def _stringify_label_token(value):
@@ -67,6 +90,8 @@ def make_videodataset(
     log_dir=None,
     sequence_labels=False,
     return_sample_path=False,
+    train_frac=1.0,
+    subset_seed=0,
 ):
     dataset = VideoDataset(
         data_paths=data_paths,
@@ -85,6 +110,8 @@ def make_videodataset(
         transform=transform,
         sequence_labels=sequence_labels,
         return_sample_path=return_sample_path,
+        train_frac=train_frac,
+        subset_seed=subset_seed,
     )
 
     log_dir = pathlib.Path(log_dir) if log_dir else None
@@ -157,6 +184,8 @@ class VideoDataset(torch.utils.data.Dataset):
         duration=None,  # duration in seconds
         sequence_labels=False,
         return_sample_path=False,
+        train_frac=1.0,
+        subset_seed=0,
     ):
         self.data_paths = data_paths
         self.datasets_weights = datasets_weights
@@ -269,6 +298,32 @@ class VideoDataset(torch.utils.data.Dataset):
 
         self.samples = samples
         self.labels = labels
+
+        # Low-shot subsetting (opt-in via train_frac < 1.0). Deterministically keep a
+        # random `train_frac` fraction of samples, identical across all ranks. Applied
+        # AFTER the full CSV load so the choice is over the real corpus. Restricted to
+        # the single-CSV, unweighted case (every probe eval) -- multi-dataset weighted
+        # mixing (pretraining) never subsets, so we hard-guard rather than silently
+        # corrupt per_dataset_indices / sample_weights.
+        full_n = len(self.samples)
+        subset = seeded_subset_indices(full_n, train_frac, subset_seed)
+        if subset is not None:
+            if self.datasets_weights is not None or len(self.num_samples_per_dataset) > 1:
+                raise ValueError(
+                    "train_frac subsetting is only supported for a single unweighted "
+                    "dataset CSV (probe evals); got "
+                    f"{len(self.num_samples_per_dataset)} datasets / "
+                    f"weights={self.datasets_weights}."
+                )
+            self.samples = [self.samples[i] for i in subset]
+            self.labels = [self.labels[i] for i in subset]
+            self.num_samples_per_dataset = [len(self.samples)]
+            self.per_dataset_indices = ConcatIndices(self.num_samples_per_dataset)
+            logger.info(
+                f"Low-shot subset: kept {len(self.samples)} / {full_n} samples "
+                f"(train_frac={train_frac}, subset_seed={subset_seed})"
+            )
+
         self.max_failed_sample_retries = MAX_FAILED_SAMPLE_RETRIES
 
     def _maybe_decode_sequence_label(self, label):

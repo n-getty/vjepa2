@@ -3,10 +3,29 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import drop_path
+
+
+def _sdp_kernel_ctx():
+    """Device-agnostic context for scaled_dot_product_attention.
+
+    The upstream code wrapped SDPA in `torch.backends.cuda.sdp_kernel()`, which
+    is CUDA-scoped AND now deprecated. On XPU (Aurora) it is a no-op that does
+    NOT select a kernel — the backbone's 48 attention blocks were entering a
+    dead CUDA context and falling through to the default XPU dispatch anyway
+    (verified: default dispatch is correct, cos=1.0 vs reference, ~0.76ms/call).
+    So: on CUDA keep the (still-functional) kernel-selection context; everywhere
+    else (XPU/CPU) use a nullcontext and let PyTorch's per-device dispatcher pick
+    the kernel. Pure correctness/cleanliness — not a throughput change.
+    """
+    if torch.cuda.is_available():
+        return torch.backends.cuda.sdp_kernel()
+    return contextlib.nullcontext()
 
 
 def build_action_block_causal_attention_mask(T, H, W, add_tokens=1):
@@ -246,7 +265,7 @@ class ACRoPEAttention(nn.Module):
             v = merge_(v, action_v)
 
         if attn_mask is not None or self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
+            with _sdp_kernel_ctx():
                 x = F.scaled_dot_product_attention(
                     q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal, attn_mask=attn_mask
                 )
@@ -370,7 +389,7 @@ class RoPEAttention(nn.Module):
             k = torch.cat([kd, kh, kw], dim=-1)
 
         if attn_mask is not None or self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
+            with _sdp_kernel_ctx():
                 x = F.scaled_dot_product_attention(
                     q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal, attn_mask=attn_mask
                 )
@@ -417,7 +436,7 @@ class Attention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, D]
 
         if attn_mask is not None or self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
+            with _sdp_kernel_ctx():
                 x = F.scaled_dot_product_attention(
                     q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal, attn_mask=attn_mask
                 )
@@ -588,7 +607,7 @@ class CrossAttention(nn.Module):
         k, v = kv[0], kv[1]  # (batch_size, num_heads, seq_len, feature_dim_per_head)
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
+            with _sdp_kernel_ctx():
                 q = F.scaled_dot_product_attention(q, k, v)
         else:
             xattn = (q @ k.transpose(-2, -1)) * self.scale

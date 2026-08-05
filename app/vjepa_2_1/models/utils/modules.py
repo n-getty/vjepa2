@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +14,58 @@ from timm.models.layers import drop_path
 
 
 _IS_XPU = hasattr(torch, "xpu") and torch.xpu.is_available()
+
+# Aurora native fused flash-attention. Auto-dispatch on XPU never selects the
+# SYCL-TLA flash kernel, so we force the FLASH backend and hand it BSHD-memory
+# q/k/v. See docs/xpu_flash_attention_porting_guide.md.
+#
+# DEFAULT-ON for XPU (HW-validated 2026-07-09: bf16 flash-vs-math cos=0.999988,
+# and it stacks with activation-checkpointing-off as our best recipe). Opt out
+# with VJEPA_USE_XPU_FLASH=0. On CUDA/CPU the eligibility check below is False,
+# so the flag is a no-op there regardless of its value.
+_USE_XPU_FLASH = os.environ.get("VJEPA_USE_XPU_FLASH", "1") == "1"
+
+# The shipped kernel is compiled only for these head dims. The vjepa2 predictor
+# runs head_dim=32 (outside this set); with a loose "<=256" gate, forcing the
+# FLASH backend there raises "No available kernel" instead of using math. Gate
+# on membership so ineligible modules fall through to the normal SDPA dispatch.
+_XPU_FLASH_HEAD_DIMS = (64, 96, 128, 192, 256)
+
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend  # noqa: F401
+
+    _XPU_FLASH_IMPORTS_OK = True
+except Exception:  # pragma: no cover - old torch without the attention API
+    _XPU_FLASH_IMPORTS_OK = False
+
+# One-shot log guard so the "engaged/skipped" line prints once per process.
+_XPU_FLASH_LOGGED = False
+
+
+def _to_bshd_memory(t):
+    """Coerce a [B, H, S, D] tensor to BSHD memory layout.
+
+    Shape is unchanged; the storage becomes a contiguous [B, S, H, D] transposed
+    on dims 1<->2 -- which is what the XPU flash kernel requires. This changes
+    only the memory *stride*, not which axis is attended (transpose ->
+    contiguous -> transpose-back is numerically identical to the BHND input), so
+    it is NOT the scrambling BSHD bug guarded by test_sdpa_layout.py. No-op when
+    the tensor is already in BSHD memory.
+    """
+    if t.transpose(1, 2).is_contiguous():
+        return t
+    return t.transpose(1, 2).contiguous().transpose(1, 2)
+
+
+def _xpu_flash_eligible(q, dropout_p, is_causal):
+    return (
+        _USE_XPU_FLASH
+        and _XPU_FLASH_IMPORTS_OK
+        and q.device.type == "xpu"
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and q.shape[-1] in _XPU_FLASH_HEAD_DIMS
+        and dropout_p == 0.0
+    )
 
 
 def _sdpa(q, k, v, dropout_p=0.0, is_causal=False):
@@ -28,10 +82,32 @@ def _sdpa(q, k, v, dropout_p=0.0, is_causal=False):
     attention output (cos~0.02 vs reference) on XPU, with no error and a
     plausible-looking loss. Do not reintroduce it. See
     tests/models/test_sdpa_layout.py for the regression guard.
+
+    When VJEPA_USE_XPU_FLASH=1 and the inputs are eligible, this forces Aurora's
+    native SYCL-TLA fused flash kernel: it changes only the memory *stride* of
+    q/k/v (BSHD-memory coerce, attended axis preserved) and returns BHND, so the
+    result is numerically the same layout as the default path -- the coerce is
+    distinct from the scrambling BSHD transpose above.
     """
+    if _xpu_flash_eligible(q, dropout_p, is_causal):
+        return _xpu_flash_sdpa(q, k, v, dropout_p=dropout_p, is_causal=is_causal)
     return F.scaled_dot_product_attention(
         q, k, v, dropout_p=dropout_p, is_causal=is_causal
     )
+
+
+def _xpu_flash_sdpa(q, k, v, dropout_p=0.0, is_causal=False):
+    """Force the XPU fused flash kernel. Inputs/outputs BHND. Caller must have
+    checked _xpu_flash_eligible."""
+    q, k, v = _to_bshd_memory(q), _to_bshd_memory(k), _to_bshd_memory(v)
+    global _XPU_FLASH_LOGGED
+    if not _XPU_FLASH_LOGGED:
+        _XPU_FLASH_LOGGED = True
+        print("[vjepa2] xpu_flash=engaged (native SYCL-TLA fused SDPA)", flush=True)
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=is_causal
+        )
 
 
 def rotate_queries_or_keys(x, pos, n_registers, has_cls_first):

@@ -9,6 +9,26 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 logger = getLogger()
 
 
+def read_cache_pooled(cache_root):
+    """Return the 'pooled' mode of a feature cache ("none" | "mean") without
+    loading it, by peeking at one manifest. Used to tell the probe head whether
+    the spatial axis was already pooled at export (so it must skip its own
+    spatial pool). Returns "none" if no cache / no marker (back-compat with
+    caches written before the pooled flag existed)."""
+    if cache_root is None:
+        return "none"
+    root = Path(cache_root)
+    candidates = [root / "manifest.json"] + sorted(root.glob("rank_*/manifest.json"))
+    for m in candidates:
+        if m.exists():
+            try:
+                with open(m) as f:
+                    return json.load(f).get("pooled", "none") or "none"
+            except (OSError, json.JSONDecodeError):
+                continue
+    return "none"
+
+
 class BackboneFeatureCacheDataset(Dataset):
     def __init__(self, cache_root, require_complete_export=True):
         self.cache_root = Path(cache_root)
@@ -109,11 +129,21 @@ class BackboneFeatureCacheDataset(Dataset):
             return self._cached_shard
 
         shard_path = self.shards[shard_id]["path"]
-        shard = torch.load(shard_path, map_location="cpu")
+        # mmap=True: the 2.49 GB feature tensor is memory-mapped, not read up
+        # front. Only the sample slices __getitem__ actually touches fault in,
+        # and because every DataLoader worker mmaps the SAME file the kernel
+        # page cache is shared across workers/processes -- so a shard's pages
+        # load once, not once-per-worker. This is what removes the ~8x read
+        # amplification (all workers used to torch.load the whole shard eagerly).
+        # Requires the zip-format checkpoint (torch>=1.13); our shards are PK.
+        shard = torch.load(shard_path, map_location="cpu", mmap=True)
 
         if self.feature_shape is None:
             self.feature_shape = tuple(shard["features"].shape[1:])
 
+        # Drop the previous shard's mmap before caching the new one so at most
+        # one shard is mapped per worker at a time (bounds RSS; the sampler
+        # iterates shard-contiguously so this is a clean handoff, not thrash).
         self._cached_shard_id = shard_id
         self._cached_shard = shard
         return shard
@@ -122,7 +152,11 @@ class BackboneFeatureCacheDataset(Dataset):
         shard_id, offset = self.sample_index[index]
         shard = self._load_shard(shard_id)
 
-        features = shard["features"][offset]
+        # Clone the per-sample slice out of the mmap: it must be a real
+        # in-memory tensor (a few hundred KB pooled / ~39 MB full), not a view
+        # over the memory-mapped shard, or it would re-touch the map when the
+        # DataLoader serializes it across the worker->main IPC boundary.
+        features = shard["features"][offset].clone()
         # Scalar labels -> python int (classification). Per-clip sequence labels
         # (shape [T]) -> return the tensor as-is so default collate yields [B, T],
         # matching the live (non-cached) path for sequence_labels probes (asformer).
@@ -137,7 +171,9 @@ class BackboneFeatureCacheDataset(Dataset):
 
 
 class ShardOrderDistributedSampler(Sampler):
-    def __init__(self, dataset, num_replicas=1, rank=0, shuffle=True, seed=0, drop_last=False):
+    def __init__(
+        self, dataset, num_replicas=1, rank=0, shuffle=True, seed=0, drop_last=False, subset_indices=None
+    ):
         self.dataset = dataset
         self.num_replicas = num_replicas
         self.rank = rank
@@ -146,7 +182,12 @@ class ShardOrderDistributedSampler(Sampler):
         self.drop_last = drop_last
         self.epoch = 0
 
-        dataset_size = len(self.dataset)
+        # Low-shot subsetting: restrict iteration to a fixed set of global sample
+        # indices (identical across ranks). Keeps the shard-contiguous access order
+        # so the mmap shard-cache handoff in the dataset stays a clean sweep.
+        self.subset_indices = None if subset_indices is None else set(int(i) for i in subset_indices)
+
+        dataset_size = len(self.dataset) if self.subset_indices is None else len(self.subset_indices)
         if self.drop_last:
             self.num_samples = dataset_size // self.num_replicas
         else:
@@ -170,7 +211,10 @@ class ShardOrderDistributedSampler(Sampler):
         ordered = []
         for shard_id in shard_ids:
             start, end = self.dataset.shard_ranges[shard_id]
-            ordered.extend(range(start, end))
+            if self.subset_indices is None:
+                ordered.extend(range(start, end))
+            else:
+                ordered.extend(i for i in range(start, end) if i in self.subset_indices)
         return ordered
 
     def __iter__(self):
@@ -198,11 +242,20 @@ def make_backbone_feature_cache(
     pin_mem=True,
     persistent_workers=True,
     require_complete_export=True,
+    train_frac=1.0,
+    subset_seed=0,
 ):
     dataset = BackboneFeatureCacheDataset(
         cache_root=cache_root,
         require_complete_export=require_complete_export,
     )
+    # Low-shot subsetting is applied to the TRAIN loader only. Compute the fixed
+    # (rank-invariant) index set from the built cache length; None => full data.
+    subset_indices = None
+    if training:
+        from src.datasets.video_dataset import seeded_subset_indices
+
+        subset_indices = seeded_subset_indices(len(dataset), train_frac, subset_seed)
     sampler = ShardOrderDistributedSampler(
         dataset,
         num_replicas=world_size,
@@ -210,6 +263,7 @@ def make_backbone_feature_cache(
         shuffle=training,
         seed=0,
         drop_last=False,
+        subset_indices=subset_indices,
     )
     data_loader = DataLoader(
         dataset,
@@ -220,8 +274,9 @@ def make_backbone_feature_cache(
         num_workers=num_workers,
         persistent_workers=(num_workers > 0) and persistent_workers,
     )
+    subset_note = "" if subset_indices is None else f", subset={len(sampler.subset_indices)}"
     logger.info(
         "BackboneFeatureCache dataset created "
-        f"(cache_root={cache_root}, samples={len(dataset)}, shards={len(dataset.shards)})"
+        f"(cache_root={cache_root}, samples={len(dataset)}{subset_note}, shards={len(dataset.shards)})"
     )
     return dataset, data_loader, sampler

@@ -1,5 +1,16 @@
 # V-JEPA 2 Neural Scaling Law — Findings (through 2026-07-15)
 
+> **PAPER DELIVERABLE (2026-07-17):** the general-arm result is being folded into
+> Leonardo's surgical-arm paper (`/eagle/tpc/leonardo_borgioli/pp_sc/scaling.tex`,
+> pulled via `ssh polaris`). Our shareable, drop-in LaTeX fragment (NOT edited into
+> his .tex) lives in `scaling/paper_general_arm/`: `general_arm_section.tex` (new
+> §, filled `tab:domaincmp`), `abstract_intro_patch.tex`, `general_arm_MERGE_NOTES.md`.
+> Framing = **bounding result + suggested slow-growth**: α consistent with 0
+> (mutual-kNN +0.11 [−0.08,+0.33], 6 metrics + 2 references agree); pairs with his
+> sharp LR-k≈−1 into a two-arm thesis. 1e20 giant/gigantic were compute-blocked
+> (256n never scheduled; killed 8678839); large@1e20 anchor is on disk. See the
+> merge notes for provenance of every number.
+
 ## Goal
 Establish a compute-optimal (IsoFLOP / Chinchilla-style) scaling law for V-JEPA 2 video SSL:
 per-budget parabola of a quality metric vs model size N → vertex N_opt(C); across budgets fit

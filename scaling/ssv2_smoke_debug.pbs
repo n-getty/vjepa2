@@ -1,0 +1,70 @@
+#!/bin/bash -l
+#PBS -N ssv2_smoke
+#PBS -l select=2
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare
+#PBS -q debug
+#PBS -A AuroraGPT
+#PBS -j oe
+#PBS -o /flare/ModCon/ngetty/experiments/scaling_real_ssv2/ssv2_smoke_debug.log
+
+set -o pipefail
+# 2-cell Metric A (SSv2 frozen-probe) SMOKE on the debug queue (2 nodes, 1h). Metric A has NEVER
+# produced a number — validate the eval path end-to-end on the 2 cheapest cells (tiny, both with
+# COMPLETED pretraining ckpts) before the 9-cell fanout. Each cell = 1 node x 12 tiles, frozen
+# encoder + SSv2 probe (174 classes). NOT set -u (lmod trap), NOT set -e (one cell mustn't kill both).
+echo "SSv2 SMOKE START: $(date)  cells=2 nodes=2"
+cat "$PBS_NODEFILE"
+cd /lus/flare/projects/ModCon/ngetty/vjepa2
+ulimit -c unlimited
+module load frameworks
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export MPICH_GPU_SUPPORT_ENABLED=1
+export CCL_PROCESS_LAUNCHER=pmix
+export CCL_ATL_TRANSPORT=mpi
+export CCL_KVS_MODE=mpi
+export CCL_KVS_USE_MPI_RANKS=1
+export CCL_CONFIGURATION=cpu_gpu_dpcpp
+export CCL_KVS_CONNECTION_TIMEOUT=600
+export CCL_OP_SYNC=1
+export CCL_WORKER_COUNT=1
+export CCL_ALLREDUCE=ring
+export CCL_CHUNK_SIZE=16777216
+export FI_PROVIDER=cxi
+export PYTHONFAULTHANDLER=1
+export TMPDIR=/tmp
+export http_proxy="http://proxy.alcf.anl.gov:3128"
+export https_proxy="http://proxy.alcf.anl.gov:3128"
+export ftp_proxy="http://proxy.alcf.anl.gov:3128"
+
+JOBTMP="/flare/ModCon/ngetty/experiments/scaling_real_ssv2/_smoke_${PBS_JOBID%%.*}"
+mkdir -p "$JOBTMP"
+CFGDIR=/flare/ModCon/ngetty/experiments/scaling_real_ssv2/done_configs
+
+run_cell () {
+  local idx=$1 name=$2 port=$3
+  local nf="$JOBTMP/nodefile_$idx"
+  sed -n "$((idx+1))p" "$PBS_NODEFILE" > "$nf"
+  local host; host=$(cat "$nf")
+  echo "[cell $idx] $name -> node $host port $port"
+  (
+    export PBS_NODEFILE="$nf"
+    export MASTER_ADDR="$host"
+    export MASTER_PORT=$port
+    export WORLD_SIZE=12
+    mpiexec --pmi=pmix -n 12 -ppn 12 --hostfile "$nf" --cpu-bind depth --depth 16 \
+        python -m app.main_dist_aurora --train_mode \
+            --fname "$CFGDIR/${name}.yaml" --params_path "$CFGDIR/${name}.yaml" \
+        > "$JOBTMP/cell_${idx}_${name}.log" 2>&1
+  ) &
+}
+
+run_cell 0 vit_tiny_C1p0e18_ssv2 29520
+run_cell 1 vit_tiny_C3p0e18_ssv2 29521
+
+echo "launched 2 cells; waiting..."
+rc=0
+for pid in $(jobs -p); do wait "$pid" || rc=1; done
+echo "SSv2 SMOKE END: $(date)  aggregate_rc=$rc"
+for f in "$JOBTMP"/cell_*.log; do echo "===== $f (tail) ====="; tail -15 "$f"; done
+exit $rc

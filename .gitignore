@@ -50,3 +50,20 @@ core.*
 dataset_table_content.txt
 # Large reference PDFs (papers) — keep out of the repo
 docs/vjepa2.1.pdf
+
+# Aurora port: job-state tracking dotfiles from ad-hoc orchestrators (scratch)
+scripts/.*_status.json
+scripts/.*_tasks.json
+scripts/.*_jobid
+scripts/.*_jobids
+scripts/.*_results.csv
+
+# PBS job stdout/stderr captures left at repo root
+hold_*.[eo][0-9]*
+
+# scratch zip dumps / superseded plot snapshots / generated HTML reports
+scaling/*.zip
+scaling/*_unzip/
+scaling/inprogress_metricB*.png
+scaling/isoflop_canonical_20260711.png
+scaling/lr_ablation_figures.html

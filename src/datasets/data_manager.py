@@ -41,6 +41,8 @@ def init_data(
     log_dir=None,
     sequence_labels=False,
     return_sample_path=False,
+    train_frac=1.0,
+    subset_seed=0,
 ):
     if data.lower() == "imagenet":
         from src.datasets.imagenet1k import make_imagenet1k
@@ -89,6 +91,8 @@ def init_data(
             log_dir=log_dir,
             sequence_labels=sequence_labels,
             return_sample_path=return_sample_path,
+            train_frac=train_frac,
+            subset_seed=subset_seed,
         )
 
     elif data.lower() == "webdataset":

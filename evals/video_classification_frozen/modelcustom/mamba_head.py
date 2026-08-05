@@ -236,6 +236,7 @@ class MambaHead(nn.Module):
         dropout: float = 0.0,
         return_sequence: bool = True,
         temporal_tokens: int | None = None,
+        spatial_prepooled: bool = False,
     ):
         super().__init__()
         if temporal_tokens is not None and temporal_tokens != num_clips * tokens_per_clip:
@@ -254,12 +255,19 @@ class MambaHead(nn.Module):
         self.return_sequence = return_sequence
         self.temporal_tokens = num_clips * tokens_per_clip
 
+        # Fast-probe: pooled cache already reduced S to 1, so skip the spatial
+        # pool (see ASFormerHead for the same tradeoff note).
+        self.spatial_prepooled = spatial_prepooled
         # Reuse the same spatial-attention pooler as ASFormerHead so any
         # difference at training time is attributable to the temporal
         # backbone, not the spatial-pool head. Keep num_heads=8 (matches
         # ASFormer default).
-        self.spatial_pool = SpatialAttentionPool(
-            embed_dim=embed_dim, num_heads=8, dropout=dropout,
+        self.spatial_pool = (
+            None
+            if spatial_prepooled
+            else SpatialAttentionPool(
+                embed_dim=embed_dim, num_heads=8, dropout=dropout,
+            )
         )
 
         # Sinusoidal positional embedding over the full temporal axis.
@@ -361,10 +369,18 @@ class MambaHead(nn.Module):
         x = self._reshape_input(x)                       # [B, NC, T_clip, S, D]
         B, NC, T_clip, S, D = x.shape
 
-        # Pool spatial tokens per (clip, time) step.
-        x = x.reshape(B * NC, T_clip, S, D)
-        feats = self.spatial_pool(x)                     # [B*NC, T_clip, D]
-        feats = feats.reshape(B, NC * T_clip, D)         # [B, T_total, D]
+        if self.spatial_prepooled:
+            if S != 1:
+                raise ValueError(
+                    f"spatial_prepooled head expected S=1 (spatially pooled "
+                    f"cache), got S={S}. The cache and head disagree on pooling."
+                )
+            feats = x.reshape(B, NC * T_clip, D)         # [B, T_total, D]
+        else:
+            # Pool spatial tokens per (clip, time) step.
+            x = x.reshape(B * NC, T_clip, S, D)
+            feats = self.spatial_pool(x)                 # [B*NC, T_clip, D]
+            feats = feats.reshape(B, NC * T_clip, D)     # [B, T_total, D]
         feats = feats + self.pos_embed[:, : feats.shape[1]]
 
         # Stage 0.

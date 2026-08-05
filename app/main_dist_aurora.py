@@ -370,6 +370,23 @@ def run_training(args):
             new_paths.append(os.path.join(args.local_data_root, name))
         params["data"]["datasets"] = new_paths
 
+    # Eval probes (CSV-of-clips VideoDataset) carry their data paths under
+    # experiment.data.dataset_{train,val}. When clips were staged to node-local
+    # /tmp, stage_probe_clips.py wrote prefix-swapped CSVs under
+    # <local_data_root>/csv/; repoint the config at those so VideoDataset reads
+    # from /tmp. Only rewrite when the local CSV actually exists (staging ran),
+    # so an unstaged run is untouched.
+    if args.local_data_root and "experiment" in params:
+        edata = params.get("experiment", {}).get("data", {})
+        for key in ("dataset_train", "dataset_val"):
+            csv = edata.get(key)
+            if csv:
+                local_csv = os.path.join(
+                    args.local_data_root, "csv", os.path.basename(csv)
+                )
+                if os.path.exists(local_csv):
+                    edata[key] = local_csv
+
     # Pin the XPU tile for THIS rank BEFORE init_process_group. Required for
     # both xccl and ccl backends; init_process_group does not accept device_id
     # on XPU multi-node (it hangs DataLoader workers — torchtune table).

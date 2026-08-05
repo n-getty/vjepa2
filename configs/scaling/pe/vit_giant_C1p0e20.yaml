@@ -72,7 +72,7 @@ meta:
   load_predictor: false
   pretrain_checkpoint: null
   read_checkpoint: null
-  save_every_freq: 150
+  save_every_freq: 1
   seed: 239
   target_encoder_key: ema_encoder
   use_sdpa: true
@@ -100,10 +100,10 @@ optimization:
   ema:
   - 0.99925
   - 0.99925
-  epochs: 2
+  epochs: 5
   final_lr: 0.0006
   final_weight_decay: 0.04
-  ipe: 586
+  ipe: 235
   ipe_scale: 1.0
   lr: 0.0006
   start_lr: 0.0001
@@ -114,5 +114,5 @@ scaling:
   n_params: 1065411712
   train_flops_per_clip: 29057869676544
   global_batch: 3072
-  clips_seen_D: 3600384
+  clips_seen_D: 3609600
   seed: 239

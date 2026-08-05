@@ -34,12 +34,38 @@ _MAX_BS = {
     "vit_small": 32,    # 10.19 clips/s/tile @ bs32 (122/node)
     "vit_base": 16,     # 6.53 clips/s/tile @ bs16 (78/node)
     "vit_large": 4,     # 1.48 clips/s/tile @ bs4 (18/node); DDP fine, 53GB headroom -> no HSDP
-    "vit_giant": 2,     # NOT calibrated (HSDP); ~0.58 clips/s/tile extrapolated via FLOP ratio
-    "vit_gigantic": 1,  # NOT calibrated (HSDP); ~0.34 clips/s/tile extrapolated
+    "vit_giant": 2,     # HSDP bs2 proven at 256px (2n OFI smoke ran the HEAVIER gigantic@384/bs2)
+    "vit_gigantic": 2,  # was 1 (uncalibrated); the 2n OFI smoke ran gigantic-class @384/bs2 on a
+                        # tile -> 256px/bs2 fits with ~2.25x token margin. bs2 also keeps the
+                        # d_weights loss off the per-rank bs==1 landmine (d_ij.unsqueeze(2)).
 }
 
 # Which sizes get HSDP (the rest DDP). Calibration/OOM may push 'large' here too.
 _HSDP = {"vit_giant", "vit_gigantic"}
+
+# OFI transport env for HSDP cells (baked into each cell's _launch.json "env" and re-exported by
+# scaling.overnight_chain.emit_launch_block before mpiexec). This OVERRIDES the chain's global
+# AURORA_ENV, which sets the DDP transport (CCL_PROCESS_LAUNCHER=pmix + CCL_ATL_TRANSPORT=mpi +
+# CCL_KVS_MODE=mpi). HSDP needs launcher=none + ofi + a fabric KVS on hsn0 (PRISM-validated; matches
+# the 2n giant/gigantic OFI smoke). The empty CCL_KVS_* strings NEUTRALIZE the global mpi-KVS vars.
+# NOTE: this env change is necessary but NOT sufficient — emit_launch_block ALSO drops `--pmi=pmix`
+# from mpiexec for dist_strategy=="hsdp" (launcher=none conflicts with a pmix PMI). Keep both in sync.
+_HSDP_OFI_ENV = {
+    "CCL_PROCESS_LAUNCHER": "none",
+    "CCL_ATL_TRANSPORT": "ofi",
+    "CCL_KVS_IFACE": "hsn0",
+    "CCL_KVS_MODE": "",              # unset global =mpi
+    "CCL_KVS_USE_MPI_RANKS": "",     # unset global =1
+    "FI_CXI_RX_MATCH_MODE": "hybrid",
+    "FI_CXI_OFLOW_BUF_SIZE": "8388608",
+    "FI_CXI_DEFAULT_CQ_SIZE": "131072",
+    "FI_MR_CACHE_MONITOR": "disabled",
+    "PYTORCH_ALLOC_CONF": "garbage_collection_threshold:0.95",
+    "CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD": "65536",
+    "MPICH_GPU_SUPPORT_ENABLED": "1",
+    "LOCAL_WORLD_SIZE": "12",        # also derivable from PALS_LOCAL_SIZE; set explicit for the mesh
+    "FSDP_SHARDING": "shard_grad_op",
+}
 
 
 @dataclass
@@ -100,6 +126,7 @@ def topology_for(model_name, global_batch=GLOBAL_BATCH, max_nodes=1):
         if hsdp:
             env["VJEPA_DIST_STRATEGY"] = "hsdp"
             env["VJEPA_NUM_WORKERS"] = "0"   # no persistent workers after mesh init (deadlock guard)
+            env.update(_HSDP_OFI_ENV)        # launcher=none + ofi transport (see _HSDP_OFI_ENV note)
         return LaunchSpec2(model_name, tiles, per_rank, "hsdp" if hsdp else "ddp", nodes, env, accum)
 
     # 1) try to hit global batch with NO accum, fewest tiles

@@ -168,8 +168,15 @@ def rankme(X, eps=1e-7):
     genuine vertex free of the saturation confound. Higher = better, so we return ERROR = -RankMe/d
     (normalized by feature dim, negated so down=better matches the parabola fitter)."""
     Xc = X - X.mean(axis=0, keepdims=True)
-    # singular values of the (n x d) feature matrix
-    s = np.linalg.svd(Xc, compute_uv=False)
+    # singular values of the (n x d) feature matrix. gesdd (numpy's default
+    # divide-and-conquer driver) can fail to converge on real, highly
+    # redundant ViT features; fall back to the slower but robust QR-based
+    # gesvd driver rather than crashing the whole scoring pass.
+    try:
+        s = np.linalg.svd(Xc, compute_uv=False)
+    except np.linalg.LinAlgError:
+        import scipy.linalg
+        s = scipy.linalg.svd(Xc, compute_uv=False, lapack_driver="gesvd")
     p = s / (s.sum() + eps)
     p = p[p > 0]
     entropy = -(p * np.log(p)).sum()

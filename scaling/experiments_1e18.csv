@@ -1,0 +1,6 @@
+run_id,backbone,model_name,budget_flops,n_active_params,train_flops_per_clip,loss_main,loss_stability,loss_source,metric_a_error_f1,metric_a_error_acc,metric_b_error,clips_seen_D,global_batch,steps_done,seed,status
+vit_base_C1p0e18,vit_base,vit_base,1e+18,134443392,5464809013248,0.415544,0.019720,train_running_mean,,,0.773632,192000,96,2043,239,done
+vit_giant_C1p0e18,vit_giant,vit_giant,1e+18,1068666368,29057869676544,,,train_running_mean,,,,48000,96,0,239,no_loss
+vit_large_C1p0e18,vit_large,vit_large,1e+18,355013248,11345156112384,0.444336,0.072070,train_running_mean,,,0.835042,96000,96,1000,239,unconverged
+vit_small_C1p0e18,vit_small,vit_small,1e+18,66693120,3725347258368,0.509473,0.015586,train_running_mean,,,0.796661,288000,96,2712,239,done
+vit_tiny_C1p0e18,vit_tiny,vit_tiny,1e+18,49185600,3198072913920,0.566286,0.017475,train_running_mean,,,0.855945,336000,96,3270,239,done

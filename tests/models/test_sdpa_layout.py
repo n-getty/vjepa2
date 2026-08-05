@@ -14,7 +14,7 @@ attention is computed over the sequence axis, in BHND layout.
 import torch
 import torch.nn.functional as F
 
-from app.vjepa_2_1.models.utils.modules import _sdpa
+from app.vjepa_2_1.models.utils.modules import _sdpa, _to_bshd_memory
 
 
 def _reference_attention(q, k, v):
@@ -52,4 +52,38 @@ def test_old_transposed_path_would_be_wrong():
     assert cos < 0.5, (
         f"transposed BSHD path unexpectedly matched reference (cos={cos:.4f}); "
         "the head/seq dims may be equal in this shape -- pick N != H"
+    )
+
+
+def test_to_bshd_memory_preserves_values_and_shape():
+    """The flash-path coerce must change only stride, not values or shape.
+
+    This is the invariant separating it from the scrambling BSHD transpose: the
+    coerced tensor has identical shape and elementwise-equal values (it is the
+    same [B,H,S,D] logical tensor), only its storage stride differs.
+    """
+    torch.manual_seed(0)
+    B, H, N, D = 2, 16, 128, 64
+    q = torch.randn(B, H, N, D)
+    coerced = _to_bshd_memory(q)
+    assert coerced.shape == q.shape
+    assert torch.equal(coerced, q)
+    # BSHD memory == the [B,S,H,D] view is contiguous.
+    assert coerced.transpose(1, 2).is_contiguous()
+
+
+def test_bshd_coerce_then_sdpa_matches_reference():
+    """SDPA on BSHD-coerced q/k/v (the flash path's layout) must equal the BHND
+    reference -- proving the coerce preserves the attended axis. This mirrors
+    what xpu_flash_sdpa does, minus the XPU-only backend force (CPU-safe)."""
+    torch.manual_seed(0)
+    B, H, N, D = 2, 16, 128, 64
+    q, k, v = (torch.randn(B, H, N, D) for _ in range(3))
+    ref = _reference_attention(q, k, v)
+    qc, kc, vc = _to_bshd_memory(q), _to_bshd_memory(k), _to_bshd_memory(v)
+    out = F.scaled_dot_product_attention(qc, kc, vc)
+    cos = F.cosine_similarity(out.flatten(), ref.flatten(), dim=0).item()
+    assert cos > 0.999, (
+        f"BSHD-coerced SDPA diverged from reference (cos={cos:.4f}); the coerce "
+        "must preserve the attended axis, unlike the naive BSHD transpose"
     )

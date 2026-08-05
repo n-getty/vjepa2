@@ -12,7 +12,7 @@ data:
   datasets_weights:
   - 1
   sampling_temperature: 0.5
-  batch_size: 1
+  batch_size: 2
   crop_size: 256
   patch_size: 16
   dataset_fpcs:

@@ -1,0 +1,10 @@
+{
+  "model_name": "vit_large",
+  "tiles": 768,
+  "per_rank_bs": 4,
+  "accum": 1,
+  "dist_strategy": "ddp",
+  "nodes": 64,
+  "env": {},
+  "global_batch": 3072
+}

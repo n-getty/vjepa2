@@ -1,0 +1,70 @@
+# Base SSv2 frozen attentive-probe eval for the JEPA scaling-law sweep (Metric A).
+# Geometry matches the scaling cells: 256px / 16f / patch16 / tubelet2.
+# `scaling.eval_metric_a gen` stamps per-cell: model_kwargs.checkpoint,
+# pretrain_kwargs.encoder.model_name, checkpoint_key(=target_encoder), folder,
+# experiment.data.dataset_{train,val}, num_classes, and resolution.
+# Probe hyperparameters here are HELD FIXED across the whole sweep so the probe is a
+# constant function of the representation (design-doc requirement).
+eval_name: video_classification_frozen
+cpus_per_task: 16
+mem_per_gpu: 100G
+nodes: 1
+max_workers: 4
+resume_checkpoint: true
+tag: ssv2-scaling-256-16x1x3-16f
+tasks_per_node: 12
+num_workers: 8
+experiment:
+  classifier:
+    num_heads: 16
+    num_probe_blocks: 4
+  data:
+    dataset_type: VideoDataset
+    dataset_train: /flare/ModCon/ngetty/data/ssv2_eval/ssv2_train_paths.csv
+    dataset_val: /flare/ModCon/ngetty/data/ssv2_eval/ssv2_val_paths.csv
+    frame_step: 4
+    frames_per_clip: 16
+    num_classes: 174
+    num_segments: 1
+    num_views_per_segment: 3
+    resolution: 256
+  optimization:
+    batch_size: 8
+    multihead_kwargs:
+    - final_lr: 0.0
+      final_weight_decay: 0.01
+      lr: 0.005
+      start_lr: 0.005
+      warmup: 0.0
+      weight_decay: 0.01
+    - final_lr: 0.0
+      final_weight_decay: 0.01
+      lr: 0.001
+      start_lr: 0.001
+      warmup: 0.0
+      weight_decay: 0.01
+    - final_lr: 0.0
+      final_weight_decay: 0.01
+      lr: 0.0003
+      start_lr: 0.0003
+      warmup: 0.0
+      weight_decay: 0.01
+    num_epochs: 10
+    use_bfloat16: true
+    use_pos_embed: false
+model_kwargs:
+  checkpoint: STAMPED_BY_GEN
+  module_name: evals.video_classification_frozen.modelcustom.vit_encoder_multiclip
+  pretrain_kwargs:
+    encoder:
+      checkpoint_key: target_encoder
+      img_temporal_dim_size: 1
+      model_name: vit_base
+      patch_size: 16
+      tubelet_size: 2
+      uniform_power: true
+      use_rope: true
+  wrapper_kwargs:
+    max_frames: 128
+    use_pos_embed: false
+folder: STAMPED_BY_GEN

@@ -61,10 +61,33 @@ def init_module(
     msg = model.load_state_dict(pretrained_dict, strict=False)
     logger.info(f"loaded pretrained model with msg: {msg}")
 
+    # HIERARCHICAL multi-level features (flag-gated, default OFF -> bit-identical).
+    # When wrapper_kwargs.return_hierarchical is set, the V-JEPA-2.1 ViT returns the
+    # concat of its 4 distillation layers ([11,23,37,47] for gigantic) along the
+    # FEATURE axis, each passed through its own ALREADY-TRAINED norms_block ->
+    # [B, N, 4*embed_dim]. This is the paper's native hierarchical head input (used
+    # during distillation), reused here as a frozen-probe lever: richer multi-scale
+    # tokens for the same frozen encoder. We pop the key so it isn't forwarded to
+    # ClipAggregation, set the flag on the inner ViT, and widen the wrapper's
+    # advertised embed_dim to 4x so the downstream head builds at the right width.
+    return_hier = bool(wrapper_kwargs.pop("return_hierarchical", False))
+    if return_hier:
+        model.return_hierarchical = True
+        n_levels = len(model.hierarchical_layers)
+        logger.info(
+            "HIERARCHICAL features ON: concat of %d distillation layers %s -> "
+            "embed_dim %d x%d = %d",
+            n_levels, model.hierarchical_layers, model.embed_dim, n_levels,
+            model.embed_dim * n_levels,
+        )
+
     model = ClipAggregation(
         model,
         tubelet_size=model.tubelet_size,
         **wrapper_kwargs,
     )
+    if return_hier:
+        # forward now emits 4*D features; advertise that to the head builder.
+        model.embed_dim = model.model.embed_dim * len(model.model.hierarchical_layers)
     del checkpoint
     return model

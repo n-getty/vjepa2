@@ -72,19 +72,43 @@ else
 fi
 export MASTER_ADDR
 export MASTER_PORT=29610
-# 2 nodes x 12 tiles = 24 ranks (FULL node utilization; global batch 96, batch
-# 4/rank). Earlier 16-rank (-ppn 8) config left 4 tiles/node idle to match
-# Leo's Polaris global batch 64 exactly; we standardize on full-node here and
-# accept global batch 96 — still within run-to-run F1 noise vs the 75.12 anchor.
-export WORLD_SIZE=24
+# Topology DERIVED from the actual PBS allocation, not hardcoded — so a 1-node
+# (`-l select=1`) submission Just Works and can't silently mismatch the mpiexec
+# geometry (the old `WORLD_SIZE=24` + `-n 24` were pinned to select=2 and would
+# desync if select changed). PPN (tiles/rank-per-node) defaults to 12 (full
+# Aurora node); override with VJEPA_PPN. Full node = 12 tiles.
+NUM_NODES=$(sort -u "${PBS_NODEFILE:?PBS_NODEFILE unset}" | wc -l)
+PPN="${VJEPA_PPN:-12}"
+export WORLD_SIZE=$(( NUM_NODES * PPN ))
 
-echo "MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT WORLD_SIZE=$WORLD_SIZE"
+echo "MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT NUM_NODES=$NUM_NODES PPN=$PPN WORLD_SIZE=$WORLD_SIZE"
 
-# VideoDataset (CSV-of-paths) reads clips directly from flare — no webdataset
-# /tmp staging. Do NOT set WDS_LOCAL_SLICING here.
+# VideoDataset (CSV-of-paths) reads clips directly from flare. The LIVE/uncached
+# probe is bottlenecked on random small-file Lustre reads; opt into node-local
+# tmpfs staging with VJEPA_STAGE_CLIPS=1 (corpus is ~13 GB, fits /tmp). Cached
+# probes read .pt feature shards and do NOT need this (they use mmap instead).
+LOCAL_DATA_ROOT=""
+if [[ "${VJEPA_STAGE_CLIPS:-0}" == "1" ]]; then
+  export LOCAL_DATA_ROOT=/tmp/vjepa_data/${PBS_JOBID%%.*}
+  echo "=== staging probe clips to $LOCAL_DATA_ROOT on $NUM_NODES node(s) ==="
+  mpiexec --pmi=pmix -n "$NUM_NODES" -ppn 1 --cpu-bind none \
+      python "$ROOT/scripts/stage_probe_clips.py" \
+          --config "$PROBE_CFG" --local-root "$LOCAL_DATA_ROOT" --workers 16 \
+      2>&1 | tail -6
+fi
 
-mpiexec --pmi=pmix -n 24 -ppn 12 --cpu-bind depth --depth 16 \
+# --local_data_root triggers the CSV path-rewrite in app.main_dist_aurora (only
+# repoints dataset_{train,val} when the local prefix-swapped CSVs exist).
+LOCAL_FLAG=()
+[[ -n "$LOCAL_DATA_ROOT" ]] && LOCAL_FLAG=(--local_data_root "$LOCAL_DATA_ROOT")
+
+# Probe seed for 3-seed runs (default 0 = prior single-seed behavior). Exported
+# like the CCL_*/ZE_* vars above; PALS forwards the environment to every rank, so
+# eval.py's VJEPA_PROBE_SEED (np/torch manual_seed) is set per rank.
+export VJEPA_PROBE_SEED="${VJEPA_PROBE_SEED:-0}"
+
+mpiexec --pmi=pmix -n "$WORLD_SIZE" -ppn "$PPN" --cpu-bind depth --depth 16 \
     python -m app.main_dist_aurora --train_mode \
-        --fname "$PROBE_CFG" --params_path "$PROBE_CFG"
+        --fname "$PROBE_CFG" --params_path "$PROBE_CFG" "${LOCAL_FLAG[@]}"
 
 echo "JOB END: $(date)"

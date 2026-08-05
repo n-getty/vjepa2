@@ -145,7 +145,17 @@ def init_distributed(port=37129, rank_and_world_size=(None, None)):
         # 2) PMI / PMIX / PALS / OMPI  (PBS + mpiexec on Polaris and Aurora)
         elif _get_pmi_env("RANK") is not None and _get_pmi_env("SIZE") is not None:
             rank = int(_get_pmi_env("RANK"))
-            world_size = int(_get_pmi_env("SIZE"))
+            # PMIx SIZE is unreliable when several independent `mpiexec
+            # --pmi=pmix` sub-launches share one PBS allocation's PMIx
+            # namespace (the multi-MPI-per-PBS-job orchestrator pattern):
+            # different hosts of the SAME task have been observed reporting
+            # different SIZE values (e.g. host 0 sees the true task size,
+            # other hosts see their own per-host rank count instead), which
+            # silently breaks any collective (DDP construction, barriers).
+            # RANK from PMI is reliable; prefer an orchestrator-supplied
+            # WORLD_SIZE env (the true per-task world) over PMI SIZE when set.
+            env_world_size = os.environ.get("WORLD_SIZE")
+            world_size = int(env_world_size) if env_world_size else int(_get_pmi_env("SIZE"))
             master_addr = os.environ.get("MASTER_ADDR")
             if not master_addr:
                 nodefile = os.environ.get("PBS_NODEFILE")

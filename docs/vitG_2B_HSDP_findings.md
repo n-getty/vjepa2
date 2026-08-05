@@ -8,6 +8,124 @@ written to be reviewed by a fresh agent, so hypotheses are labelled as such.
 
 ---
 
+## CROSS-CHECK vs Leonardo's 1B 15-src postmortem (2026-07-06) — decode contention IS real, but is not our 2B bottleneck
+
+**Context.** Leonardo hit a *different* wall on the **1B** with essentially the same new
+data catalog (`docs/2026-07-05_15src_ablation_postmortem.md`). His leave-one-out sweep proved
+a **decode-pipeline concurrency regression**: the run only stalls when all four of the
+"small-clean quartet" `{grasp, cholec80, sitl_2026, heichole}` are active together (any three
+are fine); dropping heichole restored throughput (~11 s → ~6 s/iter). His config: `num_workers=2`,
+`sampling_temperature=0.5`, 8–16 nodes. Loss stayed clean; jobs just ran out of walltime.
+
+**Did we miss this on the 2B? No — but our "data isn't the issue" was an inference; now it's measured.**
+Two independent checks, both done 2026-07-06:
+
+1. **Direct CSV check at our spike iters (the runs the fabric verdict rests on).** The env-diff
+   run **8643398 used `num_workers=2`** — *identical* to Leonardo's config, *same* quartet, same
+   temp. Across all 192 per-rank CSVs, `dataload-time` is **0.00 s at p50/p90/max on every
+   post-warmup iter**, including at every backward spike (iter62 bwd=57 s, iter64=66 s, iter69=82 s)
+   and at the 365 s host-stall (iter70: dataload=0.00, backward=19 s → the 344 s untracked wall is
+   *post-dataload*). With a worker pool + `persistent_workers`, decode is fully shadowed behind the
+   2B backward and never on the critical path. The live `num_workers=0` run: dataload p50≈0.96 s,
+   p99≈10 s — still an order of magnitude under the backward spikes. **So decode is not our
+   bottleneck at either worker count, confirmed by measurement, not inference.**
+
+2. **Minimal decode-only reproducer** (`scripts/decode_contention_repro.py` — 1 login-node process,
+   no XPU / no model / no distributed; drives the real `make_webdataset` + `make_transforms` +
+   `MaskCollator` path). Per-batch decode wall, 80 steady batches, our fixedshape recipe:
+
+   | sources | num_workers | p50 ms | p90 ms | p99 ms | mean ms |
+   |---------|-------------|--------|--------|--------|---------|
+   | **quartet (4)** | 2 | 1470 | 4557 | **11951** | 1757 |
+   | minus_one (3)   | 2 | 1067 | 3065 | 4362 | 1240 |
+   | **quartet (4)** | 0 | 2543 | 5160 | **8558** | 2994 |
+   | minus_one (3)   | 0 | 2057 | 3512 | 4869 | 2208 |
+
+   **Leonardo's ordering reproduces on our data/pipeline:** the quartet is worse than minus-one at
+   both worker counts (p99 12 s vs 4.4 s at nw=2; 8.6 s vs 4.9 s at nw=0; ~30–40 % worse mean).
+   Absolute numbers are inflated vs his ~6/11 s/iter because this is *1 rank on a shared login node*
+   with no compute-node Lustre bandwidth or 96-way aggregation — the **relative quartet penalty** is
+   the transferable signal, and it is real.
+
+**Three things this settles (two corroborate our doc, one corrects a nuance):**
+
+- **(corroborates) The 1B/2B divergence is consistent.** Leonardo's 1B never hit our fabric
+  spikes (half the grad volume → shorter collectives, as §1/mode-1 already argued); our 2B's heavy
+  backward hides the decode cost his 1B could not. Two different bottlenecks on the same data, from
+  two config deltas (model size, and worker count) — neither result invalidates the other.
+
+- **(corrects a nuance) `num_workers=0` was NOT the shield I first guessed.** The reproducer shows
+  the quartet penalty persists at nw=0 (it's inherent to sampling four small high-realized-share
+  sources under temp=0.5, not a worker-threadpool artifact). What actually protects the 2B is that
+  **decode of any flavor is dwarfed by the 2B collective**, not that nw=0 removes contention. The
+  earlier framing "nw=0 is silently shielding us from Leonardo's bug" is therefore wrong in
+  mechanism — nw=0 was adopted for the Mode-A shm crash and is *slower* per-batch than nw=2 here;
+  it's the model size, not the loader config, that makes decode a non-issue for us.
+
+- **(records a live landmine) The quartet is in OUR config too** (`vitG384_fixedshape.yaml`,
+  same temp=0.5). It costs us nothing today because the 2B backward hides it, BUT: (a) if the 2B
+  ever moves to `num_workers>0` for throughput AND the fabric spikes are fixed, decode could
+  resurface as the tail; (b) anyone reusing this catalog on a **smaller/faster** model (1B, or a
+  distilled variant) inherits Leonardo's exact regression. **RESOLVED 2026-07-06 — see below.**
+
+### ROOT CAUSE + FIX (2026-07-06): heichole bitrate, re-encoded (not dropped)
+
+Rather than repeat Leonardo's "workers thrash between shard streams" mechanism story, we measured
+per-source decode cost directly (`scripts/decode_per_source_profile.py`):
+
+| source | decode ms/clip | bytes/frame | resolution |
+|--------|----------------|-------------|------------|
+| grasp | 440 | 33 KB | 1024×1280 |
+| cholec80 | 474 | 14 KB | 480×854 |
+| sitl_2026 | 511 | 23 KB | 720–1080p |
+| **heichole** | **1765** | **83 KB** | 1080×1920 |
+
+heichole decodes **~4× slower** than the other three. The driver is **bitrate, not resolution**
+(sitl_2026 is also 1080p, more frames, but 23 KB/frame → 511 ms) and it is seek-amplified (sparse
+keyframes → 15–47× penalty on scattered clip indices). Two competing hypotheses were **refuted by
+measurement**: (a) worker-thrash — the penalty persists at `num_workers=0` where there are no
+worker threads; (b) drop-retry from the `min_clip_std` black-clip filter — heichole's drop rate is
+only 1.7% (1.02× amplification, negligible). Leonardo's *combinatorial* "all-4-together" threshold
+is best explained as **prefetch-queue starvation / latency-variance** (heichole's 1.7 s outlier
+draws drain the shallow nw=2 queue), not a mean-throughput effect — the realized-share weighted-mean
+decode cost is ~flat (450–477 ms) across all of his A/B/C/D variants, so the mean cannot be the
+cause; the tail is.
+
+**Fix = re-encode, not drop.** The model only ever sees a 384px crop, so decoding 1080p high-bitrate
+video is wasted work. `scripts/reencode_source_reshard.py` (mirrors `filter_black_clips_reshard.py`:
+shard ranges + `--finalize`, 1:1 shard names, json/cls copied verbatim; encoder = the static ffmpeg
+bundled in the `imageio-ffmpeg` wheel — there is no system ffmpeg / module / PyAV on Aurora) produced
+**heichole_512** (512 short-side, x264 crf23, gop16): 97 GB → 12.5 GB, decode **1765 → 182 ms** (now
+the cheapest of the four), **894/894 samples preserved** (enc_fail=0), std healthy. Ran on one debug
+node (job 8647718, 32 workers × 4 x264 threads). All four configs (`vitG384_fixedshape`,
+`vitG384_cleandata`, `vitg384_cleandata`, `vitg384_cooldown_64f`) now point at `heichole_512`;
+original 108 GB `heichole/` kept until a training run consumes the new dir cleanly. This dissolves
+Leonardo's need to drop heichole — the re-encoded copy is a strict win (same samples, 4× faster
+decode). General lesson: profile per-source decode cost before excluding a "slow" source; re-encode
+bitrate outliers (they decode wasted resolution) instead.
+
+**One genuine unification we hadn't drawn.** Leonardo's 16n jobs died with `exit 127` =
+"downstream cascade after a stalled collective/OOM." Our mode-1 deadlock is *lag-source-agnostic*:
+"a few ranks lag entering the fwd all-gather → majority block in backward AllReduce → deadlock."
+Decode contention is a **proven, same-machine, same-data per-rank lag source** that feeds our exact
+deadlock surface. We root-caused the *amplifier* (FSDP grad-AllReduce desync) and attributed the
+*lag* solely to fabric; decode-jitter is a second lag source that is minimized (not eliminated) at
+nw=0 and would matter more at nw>0. This does not change the 2B verdict (decode measured flat at the
+spikes) but it means "fabric contention" and "decode contention" are the same failure surface at
+16n at different lag magnitudes, not two unrelated problems.
+
+**Bottom line: we did not get the 2B wrong.** The fabric verdict is now backed by direct
+`dataload-time` measurement on the very `num_workers=2` run it rests on, and Leonardo's decode
+regression is confirmed real on our pipeline but sub-dominant for the 2B. The actionable
+carry-over is the catalog landmine (never re-enable the full quartet on a fast model / at nw>0
+without dropping one), plus the recognition that decode-jitter and fabric-jitter both feed the
+same mode-1 collective desync.
+
+Repro + analysis: `scripts/decode_contention_repro.py`; CSV check reads
+`/flare/ModCon/ngetty/checkpoints/SPIKETEST_vitG384/fixedshape_n16g12/log_r*.csv` (job 8643398).
+
+---
+
 ## CURRENT STATE (2026-07-05) — TRAINING LIVE & SELF-HEALING; three failure modes catalogued
 
 **Training is running and banking epochs autonomously.** The 2B CPT resumed from the Meta
@@ -913,3 +1031,82 @@ Full blow-by-blow: memory `vitG-2b-allreduce-spikes.md`. Key repro scripts:
 `scripts/vitG384_hsdp_fixedshape_16n.sh` (16n gate + free-L0 probe),
 `scripts/analyze_straggler.py` (cross-rank distribution + free-L0 trend),
 `scripts/vitG384_hsdp_2n_ofi.sh` (2n clean repro), `scripts/collective_probe.py`.
+
+---
+
+## §5. From-scratch scaling-sweep HSDP recipe (FINALIZED 2026-07-11)
+
+The scaling sweep (`configs/scaling/real/`, `scaling/overnight_chain.py`) needs the giant (~1.0B)
+and gigantic (~1.85B) cells to train **from scratch** at gb=96. The 2n OFI smoke
+(`giant_ofi_2n_scratch/` — actually `SMOKE_vitG384.yaml` = `vit_gigantic_xformers` @384/bs2, 24 tiles)
+ran 60 clean from-scratch iters (loss 0.855→0.75, ~2.3s/iter). This section is the productionized
+recipe now baked into the sweep configs.
+
+### 5a. Transport env (OFI, launcher=none) — the winning recipe
+The chain's global `AURORA_ENV` sets the **DDP** transport (works for base/large/etc.):
+`CCL_PROCESS_LAUNCHER=pmix`, `CCL_ATL_TRANSPORT=mpi`, `CCL_KVS_MODE=mpi`, `CCL_KVS_USE_MPI_RANKS=1`.
+HSDP inter-node collectives need the **opposite** — oneCCL brings up its OWN KVS over the CXI fabric:
+
+```
+CCL_PROCESS_LAUNCHER=none
+CCL_ATL_TRANSPORT=ofi
+CCL_KVS_IFACE=hsn0
+CCL_KVS_MODE=            # NEUTRALIZE the global =mpi (empty string)
+CCL_KVS_USE_MPI_RANKS=   # NEUTRALIZE the global =1
+FI_CXI_RX_MATCH_MODE=hybrid
+FI_CXI_OFLOW_BUF_SIZE=8388608
+FI_CXI_DEFAULT_CQ_SIZE=131072
+FI_MR_CACHE_MONITOR=disabled
+PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.95
+CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
+MPICH_GPU_SUPPORT_ENABLED=1
+LOCAL_WORLD_SIZE=12        # also derivable from PALS_LOCAL_SIZE; set explicit for build_hsdp_mesh
+FSDP_SHARDING=shard_grad_op
+```
+
+This lives in each HSDP cell's `configs/scaling/real/vit_{giant,gigantic}_C*_launch.json` `env` dict.
+`emit_launch_block` re-exports it (`export {k}={v}`) inside the per-cell subshell, AFTER the global
+AURORA_ENV, so it OVERRIDES the DDP transport. Source of truth for regen: `scaling/topology.py`
+`_HSDP_OFI_ENV` (merged into the env of any model in `_HSDP`).
+
+### 5b. mpiexec invocation — MUST differ by strategy (the trap)
+`launcher=none` + `ofi` is INCOMPATIBLE with `mpiexec --pmi=pmix` (pmix PMI conflicts with oneCCL's
+own KVS bootstrap). The 2n OFI smoke used **plain** `mpiexec -n N -ppn 12 --cpu-bind depth --depth 16`
+with NO `--pmi=pmix`. `emit_launch_block` (overnight_chain.py) now selects the flavor by
+`dist_strategy`:
+- **ddp**  → `mpiexec --pmi=pmix -n {tiles} -ppn {ppn} ...`   (unchanged; base/large/small/tiny)
+- **hsdp** → `mpiexec -n {tiles} -ppn 12 ...`                 (no pmix; giant/gigantic)
+
+Env vars alone are NOT sufficient — this hardcoded flag had to change too. Verified by dry-run
+`_emit` of a mixed cfglist: small(ddp) emitted with `--pmi=pmix`, giant(hsdp) without.
+
+### 5c. Per-cell topology (all budgets identical; only epochs differ)
+gb=96 fixed, ipe=500, `weight_distance_loss=true` ⇒ per-rank bs≥2 required (d_ij.unsqueeze(2)).
+
+| cell        | model (params)   | crop | tiles | nodes | per-rank bs | accum | gb |
+|-------------|------------------|------|-------|-------|-------------|-------|----|
+| vit_giant   | 1408d/40L (~1.0B)| 256  | 48    | 4     | 2           | 1     | 96 |
+| vit_gigantic| 1664d/48L (~1.85B)| 256 | 48    | 4     | 2           | 1     | 96 |
+
+**gigantic changed 96t/8n/bs1 → 48t/4n/bs2** (this pass): (1) bs1 sits on the `weight_distance_loss`
+landmine even with the `squeeze(1)` fix — bs2 is the well-trodden path; (2) the OFI smoke proved the
+HEAVIER gigantic-class@384/bs2 fits a tile, so 256px/bs2 fits with ~2.25× token margin; (3) halves
+node cost (4n vs 8n). gb, step count, and total FLOPs are unchanged (bs×tiles=96 either way), so the
+compute budget/parallelogram is preserved. YAML `batch_size` bumped 1→2 to match (the chain launches
+the cell YAML directly — no prepare_runtime_config rewrite — so YAML batch_size is authoritative).
+Calibration source updated: `topology.py` `_MAX_BS["vit_gigantic"]` 1→2.
+
+### 5d. Launch command (when ready — do NOT auto-run the full giant/gigantic sweep)
+The chain auto-claims any unfinished, non-live cell in its cfglist. To run ONLY the HSDP cells:
+```
+python -m scaling.overnight_chain start \
+  --ctrl   <ctrl_dir> \
+  --configs 'configs/scaling/real/vit_giant_*.yaml configs/scaling/real/vit_gigantic_*.yaml' \
+  --nodes  4 \                # >= max single-cell nodes; one 4-node cell per link
+  --account ModCon --partition debug-scaling \
+  --python-exe /opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python
+```
+For a single giant cell as a one-off (bypassing the chain), replicate the emitted block: export the
+`env` from its `_launch.json`, then `mpiexec -n 48 -ppn 12 --hostfile $PBS_NODEFILE --cpu-bind depth
+--depth 16 python -m app.main_dist_aurora --train_mode --fname <cell>.yaml --params_path <cell>.yaml`
+(NO `--pmi=pmix`). Dry-run first: `python -m scaling.overnight_chain _emit --ctrl <ctrl> --cpus 16`.

@@ -7,7 +7,21 @@
   "nodes": 4,
   "env": {
     "VJEPA_DIST_STRATEGY": "hsdp",
-    "VJEPA_NUM_WORKERS": "0"
+    "VJEPA_NUM_WORKERS": "0",
+    "CCL_PROCESS_LAUNCHER": "none",
+    "CCL_ATL_TRANSPORT": "ofi",
+    "CCL_KVS_IFACE": "hsn0",
+    "CCL_KVS_MODE": "",
+    "CCL_KVS_USE_MPI_RANKS": "",
+    "FI_CXI_RX_MATCH_MODE": "hybrid",
+    "FI_CXI_OFLOW_BUF_SIZE": "8388608",
+    "FI_CXI_DEFAULT_CQ_SIZE": "131072",
+    "FI_MR_CACHE_MONITOR": "disabled",
+    "PYTORCH_ALLOC_CONF": "garbage_collection_threshold:0.95",
+    "CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD": "65536",
+    "MPICH_GPU_SUPPORT_ENABLED": "1",
+    "LOCAL_WORLD_SIZE": "12",
+    "FSDP_SHARDING": "shard_grad_op"
   },
   "global_batch": 96
 }

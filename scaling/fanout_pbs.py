@@ -145,10 +145,12 @@ def main():
     configs = sorted(glob.glob(args.configs))
     if not configs:
         raise SystemExit(f"no configs match {args.configs}")
-    # sanity: every cell must be a valid YAML with a folder + model
+    # sanity: every cell must be a valid YAML with a folder + a model spec. Training configs carry
+    # `model:`; eval configs (eval_name + model_kwargs, e.g. the SSv2 Metric-A probes) carry
+    # `model_kwargs:` instead. Accept either so this fan-out drives both training and eval cells.
     for c in configs:
         y = yaml.safe_load(open(c))
-        assert "model" in y and "folder" in y, f"{c} missing model/folder"
+        assert ("model" in y or "model_kwargs" in y) and "folder" in y, f"{c} missing model/folder"
 
     script = build(configs, args.account, args.partition, args.time,
                    args.tiles_per_node, args.cpus_per_task, args.master_port_base,

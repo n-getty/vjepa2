@@ -59,6 +59,7 @@ logger = get_logger(__name__, force=True)
 
 
 def main(args, resume_preempt=False):
+    _main_start_s = time.time()
     # ----------------------------------------------------------------------- #
     #  PASSED IN PARAMS FROM CONFIG FILE
     # ----------------------------------------------------------------------- #
@@ -1497,16 +1498,45 @@ def main(args, resume_preempt=False):
                 save_every_file = f"e{epoch}.pth.tar"
                 save_every_path = os.path.join(folder, save_every_file)
                 save_checkpoint(epoch + 1, save_every_path)
-            # On a short-walltime chained slice (debug-scaling), we only ever get
-            # ~one epoch per slice. Exiting right after the checkpoint avoids
-            # burning the rest of the walltime on a partial next epoch that will
-            # be discarded (next slice resumes from this same checkpoint). The
-            # chain/watchdog relaunches; the successor resumes from latest.pth.tar.
-            # Opt-in via VJEPA_EXIT_AFTER_CKPT=1 so the capacity/long runs (which
-            # SHOULD keep going) are unaffected.
+            # On a short-walltime chained slice (debug-scaling), a partial next epoch
+            # would be discarded (next slice resumes from the last complete
+            # checkpoint), so exiting AT A CHECKPOINT is safe while exiting mid-epoch
+            # is not. Opt-in via VJEPA_EXIT_AFTER_CKPT=1 so the capacity/long runs
+            # (which SHOULD keep going) are unaffected.
+            #
+            # BUDGET-AWARE (2026-07-22): originally this always exited after exactly
+            # ONE epoch, regardless of how much walltime remained. Measured: staging
+            # ~3-5min + one ipe=30 epoch ~18-22min against a 1h debug-scaling slice
+            # left 35+ min of allocated compute idle on EVERY slice (observed over a
+            # night of chain jobs 8686098/8686202/8686671/8687026, each exiting at
+            # ~23-25min total). Fixed to keep training additional epochs within the
+            # same slice as long as, based on this run's own measured avg epoch
+            # duration, another epoch is likely to finish before the slice's
+            # walltime budget (VJEPA_SLICE_BUDGET_S, set by the launcher from its
+            # own #PBS walltime minus a safety margin). If the budget var isn't set,
+            # falls back to the original always-exit-after-1-epoch behavior so any
+            # other caller is unaffected.
             if os.environ.get("VJEPA_EXIT_AFTER_CKPT") == "1" and (epoch + 1) < num_epochs:
+                _budget_s = float(os.environ.get("VJEPA_SLICE_BUDGET_S", "0") or 0)
+                if _budget_s <= 0:
+                    logger.info(
+                        f"VJEPA_EXIT_AFTER_CKPT: saved epoch {epoch + 1}, exiting "
+                        f"slice cleanly (chain will resume from latest.pth.tar)."
+                    )
+                    return
+                _elapsed_s = time.time() - _main_start_s
+                _epochs_done_this_run = epoch + 1 - start_epoch
+                _avg_epoch_s = _elapsed_s / max(_epochs_done_this_run, 1)
+                if _elapsed_s + _avg_epoch_s > _budget_s:
+                    logger.info(
+                        f"VJEPA_EXIT_AFTER_CKPT: saved epoch {epoch + 1}, "
+                        f"elapsed={_elapsed_s:.0f}s + avg_epoch={_avg_epoch_s:.0f}s "
+                        f"would exceed budget={_budget_s:.0f}s -- exiting slice cleanly "
+                        f"(chain will resume from latest.pth.tar)."
+                    )
+                    return
                 logger.info(
-                    f"VJEPA_EXIT_AFTER_CKPT: saved epoch {epoch + 1}, exiting "
-                    f"slice cleanly (chain will resume from latest.pth.tar)."
+                    f"VJEPA_EXIT_AFTER_CKPT: saved epoch {epoch + 1}, "
+                    f"elapsed={_elapsed_s:.0f}s + avg_epoch={_avg_epoch_s:.0f}s "
+                    f"fits budget={_budget_s:.0f}s -- continuing this slice."
                 )
-                return

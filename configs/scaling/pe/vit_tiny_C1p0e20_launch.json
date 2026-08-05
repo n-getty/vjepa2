@@ -1,0 +1,10 @@
+{
+  "model_name": "vit_tiny",
+  "tiles": 96,
+  "per_rank_bs": 32,
+  "accum": 1,
+  "dist_strategy": "ddp",
+  "nodes": 8,
+  "env": {},
+  "global_batch": 3072
+}

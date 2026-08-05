@@ -172,6 +172,8 @@ class ASFormerHead(nn.Module):
         dropout: float = 0.0,
         return_sequence: bool = True,
         temporal_tokens: int | None = None,
+        spatial_prepooled: bool = False,
+        input_dim: int | None = None,
     ):
         super().__init__()
         if temporal_tokens is not None and temporal_tokens != num_clips * tokens_per_clip:
@@ -180,15 +182,36 @@ class ASFormerHead(nn.Module):
                 f"{num_clips * tokens_per_clip}"
             )
 
+        # Optional input projection: when the encoder emits wider features than the
+        # head's working width (e.g. HIERARCHICAL multi-level export = 4*1664=6656),
+        # a single Linear fuses them down to embed_dim so the whole ASFormer body
+        # (spatial pool, temporal convs, attn -- all O(D^2)) stays at the cheaper
+        # width. This is the memory-safe way to consume multi-scale features AND a
+        # learned fusion of the 4 scales. input_dim=None (default) -> no projection,
+        # bit-identical to the original head.
+        self.input_dim = input_dim if input_dim is not None else embed_dim
+        self.input_proj = (
+            nn.Linear(self.input_dim, embed_dim) if self.input_dim != embed_dim else None
+        )
+
         self.embed_dim = embed_dim
         self.num_classes = num_classes
         self.num_clips = num_clips
         self.tokens_per_clip = tokens_per_clip
         self.return_sequence = return_sequence
         self.temporal_tokens = num_clips * tokens_per_clip
-
-        self.spatial_pool = SpatialAttentionPool(
-            embed_dim=embed_dim, num_heads=num_heads, dropout=dropout,
+        # Fast-probe mode: the feature cache already mean-pooled the spatial axis
+        # at export (manifest pooled="mean"), so each (clip, temporal) step is a
+        # single token (S=1). Skip the learnable spatial pool -- there is nothing
+        # to attend over. This trades the learnable spatial-attention pool for the
+        # export-time fixed mean (an accepted accuracy tradeoff, opt-in).
+        self.spatial_prepooled = spatial_prepooled
+        self.spatial_pool = (
+            None
+            if spatial_prepooled
+            else SpatialAttentionPool(
+                embed_dim=embed_dim, num_heads=num_heads, dropout=dropout,
+            )
         )
 
         # Sinusoidal positional embedding over the full temporal axis.
@@ -281,13 +304,26 @@ class ASFormerHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, num_clips, T_clip*S, D] or [B, num_clips*T_clip*S, D]
+        # Fuse wide multi-scale features -> embed_dim FIRST (last-dim Linear works
+        # for any rank), so _reshape_input and everything after run at embed_dim.
+        if self.input_proj is not None:
+            x = self.input_proj(x)
         x = self._reshape_input(x)               # [B, NC, T_clip, S, D]
         B, NC, T_clip, S, D = x.shape
 
-        # Pool spatial tokens per (clip, time) step.
-        x = x.reshape(B * NC, T_clip, S, D)
-        x = self.spatial_pool(x)                 # [B*NC, T_clip, D]
-        x = x.reshape(B, NC * T_clip, D)         # [B, T_total, D]
+        if self.spatial_prepooled:
+            # Spatial axis was pooled at export -> S must be 1; drop it.
+            if S != 1:
+                raise ValueError(
+                    f"spatial_prepooled head expected S=1 (spatially pooled "
+                    f"cache), got S={S}. The cache and head disagree on pooling."
+                )
+            x = x.reshape(B, NC * T_clip, D)     # [B, T_total, D]
+        else:
+            # Pool spatial tokens per (clip, time) step.
+            x = x.reshape(B * NC, T_clip, S, D)
+            x = self.spatial_pool(x)             # [B*NC, T_clip, D]
+            x = x.reshape(B, NC * T_clip, D)     # [B, T_total, D]
 
         # Add positional info, run temporal self-attention + dilated convs.
         x = x + self.pos_embed[:, : x.shape[1]]
