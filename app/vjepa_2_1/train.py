@@ -292,6 +292,18 @@ def main(args, resume_preempt=False):
     world_size, rank = init_distributed()
     data_world_size, data_rank = world_size, rank
     logger.info(f"Initialized (rank/world-size) {rank}/{world_size}")
+    # Record the RESOLVED throughput knobs and the global batch they imply. These
+    # arrive as env vars through `mpiexec --env`, so a launcher typo or a failed
+    # propagation silently degrades to the defaults -- and an A/B that infers the
+    # accum value from timing cannot tell "accum ran" from "accum didn't". Logging
+    # the effective global batch makes a matched-global-batch comparison checkable
+    # after the fact instead of assumed.
+    logger.info(
+        f"THROUGHPUT KNOBS: true_accum={true_accum} grad_accum={grad_accum} "
+        f"dist_strategy={dist_strategy} -> effective global batch "
+        f"{world_size * batch_size * true_accum} "
+        f"({world_size} ranks x bs {batch_size} x accum {true_accum})"
+    )
     img_world_size = 0
 
     # make adjustments to batch size for image data
