@@ -185,7 +185,14 @@ def init_distributed(port=37129, rank_and_world_size=(None, None)):
     master_port = int(os.environ.get("MASTER_PORT", port))
     os.environ["MASTER_PORT"] = str(master_port)
     backend = _select_backend()
-    timeout_seconds = int(os.environ.get("TORCH_DIST_TIMEOUT_SECONDS", "300"))
+    # 900 s, not torch's 300. 192 ranks were MEASURED to need more than 300 s to
+    # rendezvous on Aurora and died with DistStoreError; the whole 16n launcher
+    # family omits this env var and so silently took the too-short default. A
+    # too-long timeout costs nothing on a healthy job -- it only delays how fast
+    # a genuinely-hung one is declared dead -- so the safe direction is up. The
+    # scale-out path raises it further still (scripts/lib/aurora_hsdp_env.sh sets
+    # 3600 for 3072 ranks).
+    timeout_seconds = int(os.environ.get("TORCH_DIST_TIMEOUT_SECONDS", "900"))
     logger.info(
         f"init_process_group backend={backend} world_size={world_size} rank={rank} "
         f"master={os.environ['MASTER_ADDR']}:{master_port}"

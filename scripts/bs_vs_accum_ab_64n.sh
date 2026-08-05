@@ -80,36 +80,10 @@ module load daos
 export PYTHONNOUSERSITE=1
 source /flare/ModCon/ngetty/venvs/torchtune-pt213-xpu/bin/activate
 export PYTHONPATH=$ROOT:$PYTHONPATH
-export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export MPICH_GPU_SUPPORT_ENABLED=1
-export CCL_PROCESS_LAUNCHER=none
-export CCL_ATL_TRANSPORT=ofi
-export CCL_KVS_IFACE=hsn0
-# UNSET, not empty -- oneCCL validates this enum and rejects '' (that killed job
-# 8731004 at iter 0). findings 5a recommends the empty string and is wrong.
-unset CCL_KVS_MODE CCL_KVS_USE_MPI_RANKS
-export CCL_OP_SYNC=1
-export CCL_LOG_LEVEL=${CCL_LOG_LEVEL:-error}
-export CCL_WORKER_COUNT=1
-export CCL_ALLREDUCE=ring
-export CCL_CHUNK_SIZE=16777216
-export FI_PROVIDER=cxi
-export FI_CXI_RX_MATCH_MODE=hybrid
-export FI_CXI_OFLOW_BUF_SIZE=8388608
-export FI_CXI_DEFAULT_CQ_SIZE=131072
-export PYTHONFAULTHANDLER=1
-export TMPDIR=/tmp
-export OMP_NUM_THREADS=16
-export http_proxy="http://proxy.alcf.anl.gov:3128"
-export https_proxy="http://proxy.alcf.anl.gov:3128"
-export ftp_proxy="http://proxy.alcf.anl.gov:3128"
-export VJEPA_DIST_STRATEGY=hsdp
+# The measured HSDP/DAOS recipe (CCL transport, FI, WDS_LOCAL_SLICING=0,
+# the LD_PRELOAD and CCL_KVS_MODE unsets). Overrides go BELOW the source.
+source $ROOT/scripts/lib/aurora_hsdp_env.sh
 export LOCAL_WORLD_SIZE=$PPN
-export FSDP_SHARDING=shard_grad_op
-export VJEPA_NUM_WORKERS=${VJEPA_NUM_WORKERS:-0}
-export TORCH_DIST_TIMEOUT_SECONDS=${TORCH_DIST_TIMEOUT_SECONDS:-3600}
-export WDS_LOCAL_SLICING=0
-unset LD_PRELOAD
 
 if [[ -n "${PBS_NODEFILE:-}" && -r "${PBS_NODEFILE}" ]]; then
   MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")

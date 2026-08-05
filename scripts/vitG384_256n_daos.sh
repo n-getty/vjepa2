@@ -78,7 +78,14 @@ SHAKE_IPE=${VJEPA_SHAKE_IPE:-50}
 SUSTAINED=${VJEPA_SUSTAINED:-0}
 SUSTAINED_IPE=${VJEPA_SUSTAINED_IPE:-30}
 
-CFG_NAME=${VJEPA_CFG_NAME:-vitG384_lbA8}
+# vitG384_lbA is `batch_size: 2` -- the max-throughput lever -- with lr/ema/
+# warmup/lambda all DERIVED for the gb=6144 that 3072 ranks x 2 produces. At this
+# node count it is a NATIVE gb=6144 config, not an emulation of one: lbA and lbA8
+# are byte-identical in meta/data/mask/loss/data_aug apart from batch_size, and
+# see the same 3.83 M samples (624 x 6144 == 1248 x 3072), so the replay position
+# is unchanged. lbA8 (bs=1, gb=3072) remains the accum fallback -- see
+# VJEPA_TRUE_ACCUM below.
+CFG_NAME=${VJEPA_CFG_NAME:-vitG384_lbA}
 BASE_CFG=$ROOT/configs/vitg16_surg_vid_webdataset_single4/${CFG_NAME}.yaml
 # PER-JOB output dir. This is a shakeout, not a resumable production run, so
 # every job gets its own directory keyed by jobid and node count.
@@ -96,7 +103,10 @@ _TAG="${PBS_JOBID%%.*}"; _TAG="${_TAG:-manual}"
 CKPT_DIR=${VJEPA_CKPT_DIR:-/flare/ModCon/ngetty/checkpoints/daos_shakeout/${CFG_NAME}_n${NNODES}_${_TAG}}
 PARAMS=$CKPT_DIR/params-pretrain.yaml
 PY=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python
-VERDICT=/flare/ModCon/ngetty/logs/daos256_VERDICT.txt
+# Keyed by node count: this launcher is run at 2n (validation) and 64n as well as
+# 256n, and a single fixed path means the small run silently overwrites the big
+# run's record. Same reasoning as the per-job CKPT_DIR above.
+VERDICT=${VJEPA_VERDICT:-/flare/ModCon/ngetty/logs/daos_n${NNODES}_VERDICT.txt}
 mkdir -p "$CKPT_DIR" /flare/ModCon/ngetty/logs
 
 echo "JOB START $(date) PBS_JOBID=$PBS_JOBID"
@@ -110,60 +120,30 @@ module load daos
 export PYTHONNOUSERSITE=1
 source /flare/ModCon/ngetty/venvs/torchtune-pt213-xpu/bin/activate
 export PYTHONPATH=$ROOT:$PYTHONPATH
-export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export MPICH_GPU_SUPPORT_ENABLED=1
-export CCL_PROCESS_LAUNCHER=none
-export CCL_ATL_TRANSPORT=ofi
-export CCL_KVS_IFACE=hsn0
-# Neutralize the DDP-oriented globals in case an outer AURORA_ENV sets them:
-# CCL_KVS_MODE=mpi / CCL_KVS_USE_MPI_RANKS=1 conflict with oneCCL bringing up its
-# OWN KVS over CXI, which is what launcher=none + ofi requires (findings 5a).
-# Free insurance -- this script does not inherit that global today, but a future
-# wrapper might.
-# UNSET, not empty. oneCCL validates this enum and rejects '': it raised
-# "CCL_KVS_MODE: unexpected value: , expected values: pmi, mpi, pmix_ofi,
-# pmix_ofi_shm" and killed the accum=2 arm of job 8731004 at iter 0. findings 5a
-# literally says 'CCL_KVS_MODE=   # NEUTRALIZE (empty string)' -- that guidance is
-# wrong for this oneCCL build. Removing the vars is what neutralizes them.
-unset CCL_KVS_MODE CCL_KVS_USE_MPI_RANKS
-export CCL_OP_SYNC=1
-# CCL_WARN emitted 10,900 lines at 3072 ranks (device-uuid vector warnings that
-# are expected under HSDP). Not actionable, and they were a tenth of the funnel.
-export CCL_LOG_LEVEL=${CCL_LOG_LEVEL:-error}
-export CCL_WORKER_COUNT=1
-export CCL_ALLREDUCE=ring
-export CCL_CHUNK_SIZE=16777216
-export FI_PROVIDER=cxi
-export FI_CXI_RX_MATCH_MODE=hybrid
-export FI_CXI_OFLOW_BUF_SIZE=8388608
-export FI_CXI_DEFAULT_CQ_SIZE=131072
-export PYTHONFAULTHANDLER=1
-export TMPDIR=/tmp
-export OMP_NUM_THREADS=16
-export http_proxy="http://proxy.alcf.anl.gov:3128"
-export https_proxy="http://proxy.alcf.anl.gov:3128"
-export ftp_proxy="http://proxy.alcf.anl.gov:3128"
-export VJEPA_DIST_STRATEGY=hsdp
+# The measured recipe -- CCL transport, FI, HSDP, WDS_LOCAL_SLICING=0, the
+# LD_PRELOAD and CCL_KVS_MODE unsets. This script was the only place it lived;
+# it is now shared so a recipe change lands everywhere at once. Overrides go
+# BELOW the source (most values in the fragment are ${VAR:-default}; the FI ones
+# are hard-set because Aurora's profile already exports them).
+source $ROOT/scripts/lib/aurora_hsdp_env.sh
 export LOCAL_WORLD_SIZE=$PPN
-export FSDP_SHARDING=shard_grad_op
-export VJEPA_NUM_WORKERS=${VJEPA_NUM_WORKERS:-0}
-# accum=2 by default: MEASURED +36% at 64 nodes (job 8731439, paired same-nodes
-# A/B, n=25 each, IQRs DISJOINT -- 35.4 -> 48.2 clips/s). Replicated in direction
-# by job 8731332 (1.53x). This is a LOWER BOUND at 256n: accum halves the
-# allreduce COUNT and each avoided allreduce costs 63 ring hops at 64n vs 255 at
-# 256n, so the saving is ~4x larger there.
+# accum stays at 1. The lever is 2 clips per collective, and `batch_size: 2` in
+# the config supplies them -- at MATCHED global batch (job 8735877, 64n, n=19)
+# bs=2 ran 24.92 s / 61.6 clips/s with 4.6 GiB min l0-free against accum's
+# 32.36 s / 47.5 clips/s / 0.8 GiB. Medians 1.30x with overlapping IQRs, so
+# throughput is suggestive and headroom is decisive; nothing favours accum.
 #
-# Note this DOUBLES global batch (3072 -> 6144), which shifts EMA/warmup/lambda.
-# The lbA8 config is derived for gb=3072, so a sustained run at accum=2 wants the
-# 16x-multiplier config (gen_large_batch_configs.py --batch-mult 16), not lbA8.
-# Left at 1 for shakeouts where a like-for-like comparison matters.
+# The older "+36%" number (job 8731439) compared accum=2 against HALF the global
+# batch. It showed "2 clips per collective beats 1", not "accum beats bs=2".
+#
+# accum IS the fallback if 256n OOMs at bs=2, but it has to keep gb=6144 to keep
+# lbA's schedule valid, so it is bs=1 AND accum=2 TOGETHER -- on lbA, not lbA8:
+#
+#     VJEPA_PER_RANK_BS=1 VJEPA_TRUE_ACCUM=2 qsub scripts/vitG384_256n_daos.sh
+#
+# Switching to lbA8 instead would take lbA8's gb=3072 constants at gb=6144; the
+# assertion in the heredoc rejects that. Raising accum alone does too (gb 12288).
 export VJEPA_TRUE_ACCUM=${VJEPA_TRUE_ACCUM:-1}
-export TORCH_DIST_TIMEOUT_SECONDS=${TORCH_DIST_TIMEOUT_SECONDS:-3600}
-
-# THE FLAG THAT MUST FLIP. See the header. =0 -> global-rank slicing.
-export WDS_LOCAL_SLICING=0
-# Explicitly ensure the FSDP-hanging interception library is not inherited.
-unset LD_PRELOAD
 
 if [[ -n "${PBS_NODEFILE:-}" && -r "${PBS_NODEFILE}" ]]; then
   MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
@@ -191,21 +171,83 @@ $PY $ROOT/scripts/prepare_runtime_config.py \
     echo "FATAL: prepare_runtime_config failed"; exit 1; }
 RUNTIME_CFG=$ROOT/.runtime_configs/n${NNODES}g${PPN}_weak/configs/vitg16_surg_vid_webdataset_single4/${CFG_NAME}.yaml
 cp "$RUNTIME_CFG" "$PARAMS" || { echo "FATAL: no runtime config"; exit 1; }
-$PY - "$PARAMS" "$CKPT_DIR" "$SHAKE_IPE" "$MODELS_MNT" <<'PY'
+$PY - "$PARAMS" "$CKPT_DIR" "$SHAKE_IPE" "$MODELS_MNT" "$WORLD" <<'PY'
 import sys, yaml, os
 p, d, ipe, models = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+world = int(sys.argv[5])
 c = yaml.safe_load(open(p))
 c["folder"] = d
+opt = c["optimization"]
+orig_ipe, orig_epochs = opt["ipe"], opt["epochs"]
+
+# ---- GLOBAL-BATCH ASSERTION -------------------------------------------------
+# lr / ema / warmup / lambda in these configs are DERIVED for one specific global
+# batch (scripts/gen_large_batch_configs.py). Run the config at a different one
+# and every constant is silently wrong -- no error, just a worse model, which is
+# the failure mode of [[step-count-constants-break-at-scale]].
+#
+# The whole family is derived to hold SAMPLES SEEN invariant at the 16n baseline
+# 30 x 333 x 384, so gb_derived = SAMPLES / (ipe x epochs) recovers the batch a
+# config was built for without needing it recorded anywhere. Tolerance covers the
+# epoch rounding in derive() (624 x 6144 is 0.06% off the target); it is nowhere
+# near loose enough to admit a 2x error.
+#
+# What this catches: scripts/submit_large_batch_arm.sh pairs lbA with ACCUM=16,
+# which is correct at 16 nodes (where accum EMULATES gb=6144) and gives gb=98304
+# if the same pairing is ever pointed at 256.
+SAMPLES = 30 * 333 * 384  # 3,836,160
+accum = int(os.environ.get("VJEPA_TRUE_ACCUM", "1"))
+# VJEPA_PER_RANK_BS exists so the OOM fallback is reachable WITHOUT changing the
+# schedule: bs=1 + accum=2 on lbA is the same gb=6144 and the same lr/ema/warmup
+# as bs=2 + accum=1, just paying accum's per-step overhead to get flat
+# activations. Doing it by switching to lbA8 instead would silently take lbA8's
+# gb=3072 constants -- the assertion below rejects that, correctly.
+_bs_override = os.environ.get("VJEPA_PER_RANK_BS")
+if _bs_override:
+    print(f"batch_size {c['data']['batch_size']} -> {_bs_override} "
+          f"(VJEPA_PER_RANK_BS)")
+    c["data"]["batch_size"] = int(_bs_override)
+bs = c["data"]["batch_size"]
+gb_actual = world * bs * accum
+gb_derived = SAMPLES / (orig_ipe * orig_epochs)
+print(f"global batch: {world} ranks x bs {bs} x accum {accum} = {gb_actual}; "
+      f"config schedule derived for ~{gb_derived:.0f} "
+      f"({orig_ipe} x {orig_epochs} steps)")
+if abs(gb_actual - gb_derived) / gb_derived > 0.05:
+    msg = (f"global batch {gb_actual} does not match the {gb_derived:.0f} this "
+           f"config's lr/ema/warmup/lambda were derived for. Either pick the "
+           f"config for this topology (at 3072 ranks: vitG384_lbA = bs2/gb6144, "
+           f"vitG384_lbA8 = bs1/gb3072) or set VJEPA_TRUE_ACCUM to match.")
+    if os.environ.get("VJEPA_SKIP_GB_CHECK", "0") == "1":
+        print(f"WARNING: {msg}\n  OVERRIDDEN by VJEPA_SKIP_GB_CHECK=1 -- the "
+              f"schedule constants are wrong for this batch.")
+    else:
+        sys.exit(f"FATAL: {msg} Set VJEPA_SKIP_GB_CHECK=1 only if being "
+                 f"off-schedule is deliberate.")
+
 sustained = os.environ.get("VJEPA_SUSTAINED", "0") == "1"
 if sustained:
-    # Keep the config's epoch count; shorten ipe so each epoch banks fast, and
-    # make every epoch durable.
-    c["optimization"]["ipe"] = int(os.environ.get("VJEPA_SUSTAINED_IPE", "30"))
+    # Shorten ipe so each epoch banks fast and make every epoch durable -- but
+    # PRESERVE TOTAL STEPS. The previous version kept `epochs` while overwriting
+    # `ipe`, which turned lbA's derived 39 x 16 = 624 into 30 x 16 = 480: 2.95 M
+    # samples instead of 3.83 M, run against an EMA/warmup/lambda schedule built
+    # for 624. Same class of bug as the gb assertion above -- a step count
+    # changing under constants that were derived from it.
+    new_ipe = int(os.environ.get("VJEPA_SUSTAINED_IPE", "30"))
+    opt["ipe"] = new_ipe
+    opt["epochs"] = max(1, round(orig_ipe * orig_epochs / new_ipe))
+    # warmup is specified in EPOCHS but consumed as int(warmup * ipe)
+    # (app/vjepa_2_1/utils.py:493), so shortening the epoch shortens warmup in
+    # steps unless it is rescaled. Hold the STEP count.
+    opt["warmup"] = round(opt["warmup"] * orig_ipe / new_ipe, 3)
     c.setdefault("meta", {})["save_every_freq"] = 1
-    print(f"SUSTAINED: ipe={c['optimization']['ipe']} epochs={c['optimization']['epochs']} save_every_freq=1")
+    print(f"SUSTAINED: ipe {orig_ipe}->{new_ipe} epochs {orig_epochs}->"
+          f"{opt['epochs']} (steps {orig_ipe*orig_epochs}->"
+          f"{new_ipe*opt['epochs']}) warmup {opt['warmup']} ep = "
+          f"{int(opt['warmup']*new_ipe)} steps save_every_freq=1")
 else:
-    c["optimization"]["ipe"] = ipe
-    c["optimization"]["epochs"] = 1
+    opt["ipe"] = ipe
+    opt["epochs"] = 1
 # Repoint the init checkpoint at DAOS. Leaving it on Lustre is what killed job
 # 8730487: 3072 ranks each pulling 28.2 GB off a 2.71 GB/s filesystem.
 meta = c.setdefault("meta", {})
@@ -220,7 +262,10 @@ if ck:
         # are fixing, and at 3072 ranks it burns the whole allocation.
         sys.exit(f"FATAL: {cand} missing -- stage the checkpoint into DAOS first")
 yaml.safe_dump(c, open(p, "w"), sort_keys=False)
-print(f"folder={d} ipe={ipe} epochs=1")
+# Report what was WRITTEN, not what the shakeout branch would have written --
+# the old line hardcoded "epochs=1" and so lied in sustained mode.
+print(f"folder={d} ipe={opt['ipe']} epochs={opt['epochs']} "
+      f"bs={bs} accum={accum} lr={opt['lr']} ema={opt['ema']}")
 PY
 
 # --local_data_root remaps every dataset dir by BASENAME

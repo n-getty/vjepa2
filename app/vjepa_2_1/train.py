@@ -298,9 +298,20 @@ def main(args, resume_preempt=False):
     # accum value from timing cannot tell "accum ran" from "accum didn't". Logging
     # the effective global batch makes a matched-global-batch comparison checkable
     # after the fact instead of assumed.
+    # act-ckpt and WDS_LOCAL_SLICING are here for the same reason: both are
+    # silent when wrong. ckpt-off is worth +22% at 16n but train.py force-flips
+    # it back on under DDP (below), so the config value is not what ran;
+    # WDS_LOCAL_SLICING=1 on DAOS makes every node compute the SAME 12 slices --
+    # N-fold data duplication with no error, invisible in the loss curve. Logging
+    # the RESOLVED values makes a degraded run diagnosable from rank 0's first 50
+    # lines instead of by inferring it from throughput weeks later.
     logger.info(
         f"THROUGHPUT KNOBS: true_accum={true_accum} grad_accum={grad_accum} "
-        f"dist_strategy={dist_strategy} -> effective global batch "
+        f"dist_strategy={dist_strategy} "
+        f"act_ckpt={use_activation_checkpointing} "
+        f"wds_local_slicing={os.environ.get('WDS_LOCAL_SLICING', '0')} "
+        f"xpu_flash={os.environ.get('VJEPA_USE_XPU_FLASH', '1')} "
+        f"-> effective global batch "
         f"{world_size * batch_size * true_accum} "
         f"({world_size} ranks x bs {batch_size} x accum {true_accum})"
     )

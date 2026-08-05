@@ -68,10 +68,37 @@ ring hops at 64n vs 255 at 256n. The bs-vs-accum *ranking*, though, is not
 scale-free: accum's per-step overhead is fixed while the collective saving grows
 with node count, so re-measure rather than extrapolate.
 
-`vitG384_lbA8` is `batch_size: 1` and the 256n launcher defaults
-`VJEPA_TRUE_ACCUM=1`, so today's 256n path takes **neither** lever — gb=3072 with
-one collective per clip. Raising it to bs=2 doubles gb to 6144 and pulls in the
-EMA/warmup/lambda re-derivation, so it is a recipe decision, not a free switch.
+**Taken, 2026-08-05.** The 256n path used to take *neither* lever (`lbA8` is
+`batch_size: 1`, launcher default `VJEPA_TRUE_ACCUM=1`) — gb=3072 with one
+collective per clip, the worst compute-to-comms ratio available.
+`scripts/vitG384_256n_daos.sh` now defaults to **`vitG384_lbA`**: `batch_size: 2`
+with `lr`/`ema`/`warmup`/`lambda` all derived for the gb=6144 that 3072 ranks x 2
+produces. Samples seen is unchanged (624 x 6144 == 1248 x 3072 == 3.83 M), so
+this is a throughput-and-schedule change, not a corpus-budget change. The
+launcher asserts `world x bs x accum` matches the config's derived gb and exits
+on mismatch. See `THROUGHPUT_RECIPE_AURORA.md` for the table and the OOM
+fallback (`VJEPA_PER_RANK_BS=1 VJEPA_TRUE_ACCUM=2`, same gb).
+
+**Validated on hardware at 2 nodes** (job 8736104, `debug`, rc=0, 20 iters in
+646 s, 24 ranks): the shared env fragment sources on a compute node with no
+oneCCL enum rejection on any of the 24 ranks (the empty-`CCL_KVS_MODE` form
+killed 8731004 at iter 0), both DAOS containers mount, `lbA` is picked up with
+`bs=2 / lr 2.1e-4 / ema 0.988`, loss falls 0.343 → 0.329, and `l0-free` sits flat
+at 14.5 GiB. The gb assertion also fired correctly here and was overridden on
+purpose: 24 ranks x 2 = 48 against a schedule derived for 6148, so the run was
+launched with `VJEPA_SKIP_GB_CHECK=1`. That makes it a **mechanics** test — it
+says nothing about throughput (2 replicate hops, not 255) or about the schedule.
+
+**Throughput confirmed at 64 nodes** (job 8736153, `debug-scaling`, rc=0, 30
+iters, 768 ranks): 61.0 clips/s and 7.82 GiB min `l0-free` against the reference
+bs=2 arm's 61.6 / 4.62 on the common window, ratio 0.989x with overlapping IQRs.
+Indistinguishable, which is what a refactor that preserves the recipe should
+look like. See `THROUGHPUT_RECIPE_AURORA.md` for the table and the note that the
+headroom difference is tail, not level.
+
+Whether gb=6144 *trains* as well as gb=3072 is a separate, still-open question —
+the `lbA`/`lbB` capacity A/B. This change only makes the schedule self-consistent
+at whatever batch is run.
 
 ## Weak-scaling efficiency
 

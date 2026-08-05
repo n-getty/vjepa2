@@ -1,4 +1,20 @@
 #!/bin/bash
+# ############################################################################
+# DEPRECATED 2026-08-05 -- use scripts/vitG384_256n_daos.sh instead.
+#
+# This is the pre-DAOS launcher: it stages the corpus to per-node /tmp, which
+# was measured at 0.43 GB/s/node (66 TB at 256n, up to 2.7 h before iter 1)
+# against DAOS's 25.07 GB/s. It is kept only as the record of what the staging
+# path looked like; every question in the list below has since been answered by
+# the DAOS launcher.
+#
+# It is NOT half-migrated on purpose. It carries the recipe's CCL block but
+# WDS_LOCAL_SLICING=1, no --no-vni, and no per-rank log files -- correct for
+# per-node staging, silently wrong on DAOS (every node computing the SAME 12
+# slices). Deliberately left un-updated rather than partially updated: a script
+# that looks current but isn't is the more dangerous artifact. Do not source
+# scripts/lib/aurora_hsdp_env.sh into it without also fixing the slicing flag.
+# ############################################################################
 # 256-NODE SHAKEOUT (debug-scaling, 1h, free). Proves the mechanics of a 3072-rank
 # run BEFORE any prod time is requested. This is deliberately NOT a training run:
 # it answers four yes/no questions in order and stops.

@@ -10,6 +10,47 @@ Companion docs: `SCALEOUT_256N_STATUS.md` (the 256-node path and its blockers),
 
 ## The recipe
 
+**As of 2026-08-05 this is no longer something you copy — it is the default.**
+The env half lives in `scripts/lib/aurora_hsdp_env.sh`; source it and put your
+overrides after. The config half is `vitG384_lbA` (bs=2), which
+`scripts/vitG384_256n_daos.sh` now defaults to.
+
+```bash
+source $ROOT/scripts/lib/aurora_hsdp_env.sh   # HSDP ONLY -- see the traps below
+```
+
+Validated end-to-end on hardware, twice:
+
+- **Mechanics, job 8736104** (2 nodes, `debug`, rc=0, 20 iters, 24 ranks):
+  fragment sources clean, no oneCCL enum rejection on any rank, both DAOS
+  containers mount, `lbA` picked up at `bs=2`, loss 0.343 → 0.329. Not a
+  throughput datapoint — at 2 nodes the replicate dim is 2 hops.
+- **Throughput, job 8736153** (64 nodes, `debug-scaling`, rc=0, 30 iters, 768
+  ranks, `avg. loss 0.326`). Against the bs=2 arm of job 8735877 on the **common
+  window 3..21**, both at gb=1536 with 768 ranks:
+
+  | | median max-over-ranks | IQR | clips/s | min `l0-free` |
+  |---|---|---|---|---|
+  | 8736153 (promoted defaults) | 25.19 s | 20.61–32.16 | **61.0** | **7.82 GiB** |
+  | 8735877 bs2 arm (reference) | 24.92 s | 20.17–29.47 | 61.6 | 4.62 GiB |
+
+  0.989x with heavily overlapping IQRs — **indistinguishable**, which is the
+  intended result: the refactor was meant to preserve the recipe, not improve it.
+  Both hit the plan's ~61 clips/s and ≥4 GiB targets. Over 8736153's own full
+  window (3..29) the median is 23.37 s / 65.7 clips/s; the shorter common window
+  is the number to quote, since a truncated tail flatters whoever is behind
+  ([[ab-window-truncation-trap]]).
+
+  The min-`l0-free` gap (7.82 vs 4.62 GiB) is **tail, not level**: median
+  headroom over the same window is 12.63 vs 12.66 GiB and p1 is 8.29 vs 5.36, so
+  it is one rank's transient dip rather than a systematic difference. The two
+  configs differ only in schedule constants (lr/ema/warmup/lambda/ipe, the
+  lbA-vs-lbA8 derivation) — nothing compute- or memory-relevant. Do not read the
+  gap as the refactor buying headroom.
+
+That fragment is exactly the block below. It is written out here because the
+*reasoning* is the useful part; the file is the thing that actually runs.
+
 ```bash
 # data path — the single largest win
 --local_data_root /tmp/AuroraGPT/vjepa_surg_wds   # DAOS, not /tmp staging
@@ -17,7 +58,7 @@ meta.pretrain_checkpoint: /tmp/AuroraGPT/vjepa_models/vjepa2_1_vitG_384.pt
 export WDS_LOCAL_SLICING=0        # MUST flip to 0 on DAOS. See "silent traps".
 
 # comms — get 2 clips/rank/step through ONE collective. Two ways to do it;
-# at matched global batch bs=2 wins 1.31x AND leaves 5.5x more headroom (8735877).
+# at matched global batch bs=2 wins 1.30x AND leaves 5.5x more headroom (8735877).
 batch_size: 2                     # PREFERRED. Not VJEPA_TRUE_ACCUM=2.
 # export VJEPA_TRUE_ACCUM=2       # same comms saving, strictly worse. Use only
                                   # when bs=2 does not fit (it does, under HSDP).
@@ -34,6 +75,48 @@ export CCL_OP_SYNC=1 CCL_WORKER_COUNT=1
 export VJEPA_NUM_WORKERS=0
 mpiexec ... --no-vni -o "$DIR/rank.%r.out" -e "$DIR/rank.%r.err"   # NO --pmi=pmix
 ```
+
+### Two rules for editing the fragment
+
+- **`${VAR:-default}` is the right guard for most things and WRONG for the FI
+  variables.** Aurora's system profile already exports `FI_PROVIDER`,
+  `FI_CXI_RX_MATCH_MODE` and `FI_CXI_OFLOW_BUF_SIZE`, so a `:-` guard on those
+  inherits the system value and silently discards the recipe — the exact opposite
+  of the guard's purpose. They are hard-set. Before adding a `:-` to anything
+  new, check `env | grep <VAR>` in a clean login shell.
+- **Never `set -u`** — Lmod's init trips it.
+
+### Taking the throughput without breaking the schedule
+
+bs=2 doubles the global batch, and `lr`/`ema`/`warmup`/`lambda_*_iter` are all
+DERIVED for one specific global batch. So the default config moved too:
+
+| | `vitG384_lbA8` (old default) | **`vitG384_lbA` (now default)** |
+|---|---|---|
+| per-rank bs / gb @ 3072 ranks | 1 / 3072 | **2 / 6144** |
+| lr | 1.5e-04 | **2.1e-04** |
+| ema | 0.994 | **0.988** |
+| warmup | 3.2 ep | **1.6 ep** (62 steps either way) |
+| lambda ramp | 62 / 188 | **31 / 94** |
+| ipe x epochs | 39 x 32 = 1248 | **39 x 16 = 624** |
+| samples seen | 3.83 M | **3.83 M** (invariant) |
+
+Samples-seen is identical, so the replay / 4x-fresh position does not move. At
+3072 ranks `lbA` is a *native* gb=6144 config, not an emulation of one — the two
+files are byte-identical outside `batch_size` and those constants.
+
+`scripts/vitG384_256n_daos.sh` asserts
+`world_size x batch_size x true_accum == the gb the config was derived for` and
+exits on mismatch (override: `VJEPA_SKIP_GB_CHECK=1`). It recovers the derived
+value as `3,836,160 / (ipe x epochs)`, since the whole family is built to hold
+samples-seen at the 16n baseline. What it catches:
+`scripts/submit_large_batch_arm.sh` pairs `lbA` with `ACCUM=16`, which is right
+at 16 nodes (accum *emulating* gb=6144) and gives **gb=98304** if the same
+pairing is pointed at 256.
+
+**If bs=2 ever OOMs at 256n**, the fallback keeps gb=6144 rather than switching
+config: `VJEPA_PER_RANK_BS=1 VJEPA_TRUE_ACCUM=2`. Falling back to `lbA8` instead
+would run gb=6144 against gb=3072 constants — the assertion rejects it.
 
 ## What each lever is worth
 
@@ -91,7 +174,18 @@ These fail without an error, which is what makes them expensive.
 - **`glob.glob()` hangs on dfuse** — use `os.listdir()`.
 - **Transport is strategy-dependent.** HSDP needs `launcher=none`+`ofi` and NO
   `--pmi=pmix`; DDP needs the opposite. The same ofi block under DDP hung at
-  iter 0 (job 8641936).
+  iter 0 (job 8641936). So **do not source `scripts/lib/aurora_hsdp_env.sh` into
+  a DDP launcher.** The `vitG1B_capwd_*.sh` family sets
+  `VJEPA_DIST_STRATEGY=ddp` and its `pmix`/`mpi` transport is correct as written
+  — an audit flagged it as off-recipe and was wrong.
+- **A launcher that rewrites `ipe` must preserve TOTAL STEPS.**
+  `VJEPA_SUSTAINED=1` shortens the epoch so each one banks durably; it used to
+  keep `epochs` while overwriting `ipe`, turning `lbA`'s 39 x 16 = 624 into
+  30 x 16 = 480 — 2.95 M samples instead of 3.83 M, run against an EMA/warmup/
+  lambda schedule derived for 624. Fixed to rescale `epochs`, and to rescale
+  `warmup` too (it is specified in epochs but consumed as
+  `int(warmup * ipe)`, `app/vjepa_2_1/utils.py:493`, so a shorter epoch silently
+  shortens warmup in steps).
 
 ## Activation checkpointing and per-rank batch are INDEPENDENT
 
@@ -124,6 +218,46 @@ bs) is identical, and n is large.
 free** against 7.0 (bs2+ckpt) and ~11 (bs1+ckpt-off). bs3 OOMs. Do not read
 1.8 GiB as safe — `torch mem:` undercounts true L0 peak by ~12 GB, so size
 headroom off `l0-free`/`l0-ext` only.
+
+### Why bs=2 is the ceiling, and why free memory at small scale does not change that
+
+Asked 2026-08-05, after a 2-node run showed ~14 GiB free and looked like room for
+a bigger batch. It is not. Three separate things have to be true to raise bs, and
+none of them is:
+
+**1. bs=3 was measured and OOMs.** Job leg L4 in
+`xpu_flash_attention_porting_guide.md` (1 node, ckpt-off, flash-ON): bs=2 is
+43.2 GB torch, bs=3 is 52.1 GB torch → `UR_RESULT_ERROR_OUT_OF_RESOURCES` at FSDP
+`_mp_shard.copy_`. With the ~12 GB undercount that is ~54 GB real vs >64 GB on a
+64 GB tile. XPU flash frees 3 GB — an order of magnitude short. That test ran at
+**1 node, where headroom is most generous**; every larger topology is tighter.
+
+**2. `l0-free` falls with node count, so a small-scale reading does not transfer.**
+Compute-identical configs (`lbA` and `fixedshape_v2` are byte-identical in model /
+crop / fpcs / mask / loss / ckpt), min over ranks:
+
+| nodes | bs | ckpt | min `l0-free` | job |
+|---|---|---|---|---|
+| 2 | 2 | off | **11.9 GiB** | 8736104 |
+| 16 | 2 | off | **1.8 GiB** | v2 |
+| 64 | 2 | off | **4.6 GiB** | 8735877 |
+
+HSDP shards optimizer state intra-node (12 tiles) and replicates inter-node, so
+what grows with node count is the replicate dim and its fabric transients. A
+2-node run is the *most* headroom that will ever be observed — sizing a batch off
+it is [[scale-dependent-results-dont-transfer]] in its most expensive form.
+
+**3. Read the MIN over ranks, not rank 0.** On job 8736104 rank 0 reported 14,564
+MiB while the tightest rank (12) held 11,943 MiB — a 2.6 GiB spread across 24
+ranks. The rank that OOMs is the tightest one, and the spread widens with scale.
+
+**Even with memory to spare, the return is small and the risk is not.** The lever
+is clips-per-collective: 1→2 halves collectives per clip, 2→3 removes only another
+1/6 of the original, against backward at ~57% of step time. And bs is also the
+global-batch knob — at 3072 ranks bs=3 means gb=9216 with no derived schedule,
+when gb=6144 itself is not yet shown to train well (the `lbA`/`lbB` A/B). The
+spare headroom's job is absorbing fabric transients on the replicate dim, which
+is exactly what grows on the way to 256 nodes.
 
 **Why the 256n config uses bs1 anyway: it is a GLOBAL BATCH decision, not a
 memory one.** At 3072 ranks bs1 gives gb=3072 and bs2 gives 6144; bs1 is the only
