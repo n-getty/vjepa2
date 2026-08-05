@@ -76,6 +76,11 @@ nodes.** These two rows are the only valid scaling pair here — `diff` of their
 tile": different per-rank batch (2 vs 1), activation checkpointing ON, and a
 different config lineage. Per-tile clips is exactly the metric bs inflates.
 
+For the bs / checkpointing interaction — they are independent knobs, bs2+ckpt-off
+runs and is the fastest config measured (0.233 clips/s/tile), and 256n uses bs1
+for **global-batch** reasons rather than memory — see the dedicated section in
+`THROUGHPUT_RECIPE_AURORA.md`.
+
 **Confidence: low-to-moderate — n=3 iterations.** Full-rank coverage exists only
 for iters 1-3 at 256n (job 8730678 died to the log funnel at iter 11, and from
 iter 4 on only 192 of 3072 ranks logged). Within-run CV is ~81%, so 86% ±

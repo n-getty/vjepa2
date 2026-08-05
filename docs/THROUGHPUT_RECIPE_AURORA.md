@@ -20,7 +20,8 @@ export WDS_LOCAL_SLICING=0        # MUST flip to 0 on DAOS. See "silent traps".
 export VJEPA_TRUE_ACCUM=2         # +36% at 64n. Raises global batch; see caveat.
 
 # compute
-use_activation_checkpointing: false   # +9%, only affordable under HSDP
+use_activation_checkpointing: false   # +22% at 16n, only affordable under HSDP
+batch_size: 2                         # bs2 FITS with ckpt off; bs3 OOMs
 VJEPA_USE_XPU_FLASH=1                 # memory lever (-3 GB), not a speed lever
 
 # transport (HSDP; DDP needs the opposite — see traps)
@@ -39,7 +40,7 @@ mpiexec ... --no-vni -o "$DIR/rank.%r.out" -e "$DIR/rank.%r.err"   # NO --pmi=pm
 | **DAOS instead of Lustre reads** | **9.3x** (25.07 vs 2.71 GB/s) | job 8730476, same files/job/hour |
 | **DAOS instead of /tmp staging** | removes 66 TB/job, up to **2.7 h** before iter 1 | staging measured at 0.43 GB/s/node (8729208) |
 | **`VJEPA_TRUE_ACCUM=2`** | **+36%** (35.4 -> 48.2 clips/s) | job 8731439, paired, n=25/arm, **IQRs disjoint** |
-| activation checkpointing OFF | +9% | job 8659973, same-node A/B |
+| activation checkpointing OFF | **+22% at 16n** (+9% at 1n) | 1n: job 8659973; 16n: fixedshape vs v2, n=5750/8937 |
 | HSDP instead of DDP | 57.6 -> 22.0 GB/tile; makes ckpt-off affordable | findings §1-2 |
 | per-rank stdout files | 442,649 -> **68** lines through the head node | 16n and 64n |
 
@@ -88,6 +89,45 @@ These fail without an error, which is what makes them expensive.
 - **Transport is strategy-dependent.** HSDP needs `launcher=none`+`ofi` and NO
   `--pmi=pmix`; DDP needs the opposite. The same ofi block under DDP hung at
   iter 0 (job 8641936).
+
+## Activation checkpointing and per-rank batch are INDEPENDENT
+
+Easy to conflate, because the production 16n config happened to pair bs2 with
+ckpt ON. They are separate knobs and ckpt-off is not the price of bs2.
+
+| run | bs | ckpt | med s | clips/s/tile | min l0-free |
+|---|---|---|---|---|---|
+| 16n fixedshape | 2 | **ON** | 10.44 | 0.192 | 7.0 GiB |
+| **16n v2** | **2** | **OFF** | **8.57** | **0.233** | **1.8 GiB** |
+| 64n lbA8 | 1 | OFF | — | 0.129 | 10.5 GiB |
+| 256n lbA8 | 1 | OFF | — | 0.111 | 11.3 GiB |
+
+**bs2 + ckpt-off runs, and it is the fastest config measured.** `v2` sustained
+331 epochs that way. So "bs2 needs checkpointing" is false — the 2B bs2 memory
+problem was a **DDP** problem (57.6 GB/tile), and HSDP fixed it by sharding
+optimizer state to a 22 GB baseline. Under HSDP both knobs are affordable at once.
+
+**ckpt-off is worth +22% at 16n, not the +9% measured at 1 node** (job 8659973,
+1 node, bs2 — 7022 -> 6440 ms). Steady state, epoch>=3, full 192-rank coverage,
+n=5750 vs 8937 iterations: **10.44 -> 8.57 s, 1.22x, bootstrap 95% CI
+1.17-1.26x.** The multi-node gap is expected in direction: ckpt-off removes a
+recompute-forward from the backward phase, and backward is where the inter-node
+allreduce also lands, so the saving is worth more where backward is a larger
+share of the step. Confounded by data-source list (15 vs 16 sources) and by being
+different jobs; compute-relevant config (model, 384px, fpcs 16, mask, pred_depth,
+bs) is identical, and n is large.
+
+**The real constraint is headroom, and bs2+ckpt-off has almost none: 1.8 GiB
+free** against 7.0 (bs2+ckpt) and ~11 (bs1+ckpt-off). bs3 OOMs. Do not read
+1.8 GiB as safe — `torch mem:` undercounts true L0 peak by ~12 GB, so size
+headroom off `l0-free`/`l0-ext` only.
+
+**Why the 256n config uses bs1 anyway: it is a GLOBAL BATCH decision, not a
+memory one.** At 3072 ranks bs1 gives gb=3072 and bs2 gives 6144; bs1 is the only
+lever holding the recipe near a batch the schedule was derived for. The per-tile
+throughput cost of bs1 is real and is being paid deliberately —
+`VJEPA_TRUE_ACCUM` is the way to buy the comms amortization back without the
+extra activation peak, whereas raising bs raises both together.
 
 ## Caveats on the accum win
 
