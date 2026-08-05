@@ -52,9 +52,26 @@ timeouts**, 78-line PBS log.
 matching the 16n baseline — before the log funnel killed the head node. That
 funnel is fixed and the fix is measured at both 16n and 64n.
 
-**Throughput: accum=2 is +36%** (job 8731439, paired same-nodes, n=25 each,
-**IQRs disjoint**): 35.4 → 48.2 clips/s. Lower bound for 256n, since each avoided
-allreduce costs 63 ring hops at 64n vs 255 at 256n.
+**Throughput: get 2 clips/rank/step through ONE collective — and do it with
+`batch_size: 2`, not accum.** Two results, in order:
+
+- accum=2 vs accum=1 is **+36%** (job 8731439, paired, n=25, IQRs disjoint):
+  35.4 → 48.2 clips/s. But that compares against *half* the global batch, so it
+  shows "2 clips per collective beats 1", not "accum beats bs=2".
+- At **matched** gb=1536 (job 8735877, 64n, n=19/arm), bs=2 median 24.92 s /
+  61.6 clips/s / **4.6 GiB** min l0-free vs accum 32.36 s / 47.5 clips/s /
+  **0.8 GiB**. 1.30x on the median with overlapping IQRs — throughput suggestive,
+  headroom decisive, nothing favoring accum.
+
+Still a lower bound for 256n either way, since each avoided allreduce costs 63
+ring hops at 64n vs 255 at 256n. The bs-vs-accum *ranking*, though, is not
+scale-free: accum's per-step overhead is fixed while the collective saving grows
+with node count, so re-measure rather than extrapolate.
+
+`vitG384_lbA8` is `batch_size: 1` and the 256n launcher defaults
+`VJEPA_TRUE_ACCUM=1`, so today's 256n path takes **neither** lever — gb=3072 with
+one collective per clip. Raising it to bs=2 doubles gb to 6144 and pulls in the
+EMA/warmup/lambda re-derivation, so it is a recipe decision, not a free switch.
 
 ## Weak-scaling efficiency
 
