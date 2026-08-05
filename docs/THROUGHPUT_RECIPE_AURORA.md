@@ -125,9 +125,41 @@ headroom off `l0-free`/`l0-ext` only.
 **Why the 256n config uses bs1 anyway: it is a GLOBAL BATCH decision, not a
 memory one.** At 3072 ranks bs1 gives gb=3072 and bs2 gives 6144; bs1 is the only
 lever holding the recipe near a batch the schedule was derived for. The per-tile
-throughput cost of bs1 is real and is being paid deliberately —
-`VJEPA_TRUE_ACCUM` is the way to buy the comms amortization back without the
-extra activation peak, whereas raising bs raises both together.
+throughput cost of bs1 is real and is being paid deliberately, with
+`VJEPA_TRUE_ACCUM` buying the comms amortization back.
+
+**But accumulation is not the free-in-memory option this doc used to claim.**
+Its *activations* are flat; `no_sync` nonetheless holds the unreduced gradient
+across sub-batches. Measured on job 8731439 (64n, 48 ranks, 1200 rows/arm,
+median l0-free):
+
+| arm | l0-free | min |
+|---|---|---|
+| bs=1 accum=1 | 10.73 GiB | 9.92 |
+| bs=1 accum=2 | **7.10 GiB** | 6.29 |
+
+That is a **3.6 GiB** charge, matching `app/vjepa_2_1/train.py:1169`'s own "2B
+bf16 grad ~4GB" estimate, so it is the mechanism and not a measurement artifact.
+Both levers cost L0; the question is which costs less at matched global batch,
+and that had never been measured — see the next section.
+
+## bs=2 vs bs=1+accum=2 at matched global batch — job 8735877
+
+The +36% accum result compares accum=2 against accum=1, i.e. against **half** the
+global batch, so it conflates "amortize the collective" with "do more work per
+step". It does not establish that accumulation beats simply raising `bs`.
+
+Job 8735877 (64n, `scripts/bs_vs_accum_ab_64n.sh`) runs both at gb=1536: each arm
+moves 2 clips/rank/step and issues one collective per step, so comms volume and
+global batch match and the median ratio *is* the throughput ratio. The arms are
+gradient-equivalent — `train.py:1189` divides each sub-batch loss by `true_accum`,
+giving the same mean reduction `bs=2` does internally — so the only difference is
+where the memory goes. Verdict via `scripts/ab_verdict.py`, which is standalone so
+the number survives a walltime kill.
+
+**Until it reports, "prefer TRUE_ACCUM over raising bs" is unsettled**, not
+established: it was reasoned from a headroom advantage now measured to be
+3.6 GiB smaller than assumed.
 
 ## Caveats on the accum win
 
