@@ -29,8 +29,14 @@ Measurement rules encoded here (each was learned by getting it wrong):
   * Compare a COMMON iteration window. Equal counts are not enough: iteration
     position is not exchangeable, because late iterations carry the fabric
     spikes. If the wall truncates one arm, trim the other's tail to match.
+  * Never verdict on a window that ends where an arm merely HAPPENS to be.
+    Pass --expect-last-itr (= ipe-1) so a still-running arm is called out. On
+    job 8735877 the partial window 3..19 gave disjoint IQRs and 1.31x; the
+    complete window 3..21 overlapped. The tail is a run's worst part, so
+    truncating flatters whichever arm is behind.
   * Require DISJOINT IQRs before naming a winner, and judge on CSV rows, not
-    exit codes.
+    exit codes. Overlap means UNRESOLVED, not equivalent -- 8735877's medians
+    differed 1.30x while overlapping.
 """
 
 import argparse
@@ -87,6 +93,10 @@ def main():
                     help="drop iterations below this index")
     ap.add_argument("--clips-per-step", type=int, default=2,
                     help="per-rank clips per optimizer step (SAME on both arms)")
+    ap.add_argument("--expect-last-itr", type=int, default=None,
+                    help="final iteration index each arm should reach (ipe-1). "
+                         "Warns loudly if the common window stops short, which "
+                         "means an arm was still running when you ran this.")
     a = ap.parse_args()
 
     cps = a.clips_per_step
@@ -109,9 +119,22 @@ def main():
         if v["full"]:
             s = set(v["full"])
             common = s if common is None else (common & s)
+    truncated = False
     if common:
         print(f"  common iteration window: {min(common)}..{max(common)}  "
-              f"(n={len(common)})\n")
+              f"(n={len(common)})")
+        # A window that ends where one arm merely HAPPENS to be is not a fair
+        # one. On job 8735877 the window 3..19 (arm 2 still running) gave
+        # disjoint IQRs and 1.31x; the real window 3..21 overlapped. A run's
+        # tail is systematically its worst part, so truncating drops the
+        # slowest iterations of whichever arm is behind -- flattering it.
+        if a.expect_last_itr is not None and max(common) < a.expect_last_itr:
+            truncated = True
+            print(f"  *** TRUNCATED: expected to reach itr "
+                  f"{a.expect_last_itr}. An arm is still running, or died. "
+                  f"The tail carries the fabric spikes, so this window "
+                  f"flatters whichever arm is behind. Do not cite it. ***")
+        print()
 
     res = {}
     for name, v in arms.items():
@@ -139,13 +162,21 @@ def main():
               f"(>1 means {first} is faster)")
         if x["p75"] < y["p25"] or y["p75"] < x["p25"]:
             faster = first if x["med"] < y["med"] else second
-            print(f"  IQRs DISJOINT -- resolved: {faster} is faster at matched "
-                  f"global batch.")
+            if truncated:
+                print(f"  IQRs disjoint ({faster} faster) -- but the window is "
+                      f"TRUNCATED, so this is NOT a verdict. Rerun once both "
+                      f"arms have finished.")
+            else:
+                print(f"  IQRs DISJOINT -- resolved: {faster} is faster at "
+                      f"matched global batch.")
         else:
-            print("  IQRs OVERLAP -- NOT resolved. The arms are throughput-")
-            print("  equivalent as far as this sample can tell; decide on")
-            print("  HEADROOM instead -- but read the l0-free column above")
-            print("  rather than assuming accumulation is the cheaper one.")
+            print("  IQRs OVERLAP -- NOT resolved. This does NOT mean the arms")
+            print("  are equivalent: the medians can still differ a lot (they")
+            print("  differed 1.30x on job 8735877 with overlapping IQRs). It")
+            print("  means THIS SAMPLE cannot separate them -- report the median")
+            print("  ratio as suggestive and decide on HEADROOM, reading the")
+            print("  l0-free column above rather than assuming accumulation is")
+            print("  the cheaper one.")
             print("  TRUE_ACCUM's activations are flat, but no_sync holds the")
             print("  unreduced gradient across sub-batches: measured 10.73 ->")
             print("  7.10 GiB at 64n (job 8731439), a 3.6 GiB charge matching")

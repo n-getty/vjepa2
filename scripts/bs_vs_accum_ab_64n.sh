@@ -201,5 +201,5 @@ fi
 echo "=== verdict: python scripts/ab_verdict.py $OUTROOT --world $WORLD ==="
 $PY $ROOT/scripts/ab_verdict.py "$OUTROOT" \
     --world "$WORLD" --warmup "$WARMUP_ITERS" \
-    --arms bs2_accum1 bs1_accum2 --clips-per-step 2 2>&1 | tee "$VERDICT"
+    --arms bs2_accum1 bs1_accum2 --clips-per-step 2 --expect-last-itr $((IPE-1)) 2>&1 | tee "$VERDICT"
 echo "JOB END $(date)"
