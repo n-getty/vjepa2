@@ -56,6 +56,48 @@ funnel is fixed and the fix is measured at both 16n and 64n.
 **IQRs disjoint**): 35.4 → 48.2 clips/s. Lower bound for 256n, since each avoided
 allreduce costs 63 ring hops at 64n vs 255 at 256n.
 
+## Weak-scaling efficiency
+
+Reproduce with `python scripts/scaling_efficiency.py --preset`. Window: epoch 1,
+iters 1-3, **max over ranks** (a synchronous step costs what its slowest rank
+costs), **only iterations where every rank logged**.
+
+| run | ranks | median s | clips/s | clips/s/tile |
+|---|---|---|---|---|
+| 16n fixedshape (bs2, ckpt **ON**, 2B) | 192 | 9.94 | 38.6 | 0.201 |
+| **64n lbA8** (bs1, ckpt off, 2B) | 768 | 7.73 | 99.3 | **0.129** |
+| **256n lbA8** (bs1, ckpt off, 2B) | 3072 | 9.02 | 340.5 | **0.111** |
+
+**64n → 256n weak-scaling efficiency: 86% per-tile, 3.43x aggregate for 4x the
+nodes.** These two rows are the only valid scaling pair here — `diff` of their
+`params-pretrain.yaml` is empty apart from topology.
+
+**The 16n row is NOT comparable** and must not be read as "16n is faster per
+tile": different per-rank batch (2 vs 1), activation checkpointing ON, and a
+different config lineage. Per-tile clips is exactly the metric bs inflates.
+
+**Confidence: low-to-moderate — n=3 iterations.** Full-rank coverage exists only
+for iters 1-3 at 256n (job 8730678 died to the log funnel at iter 11, and from
+iter 4 on only 192 of 3072 ranks logged). Within-run CV is ~81%, so 86% ±
+a lot. It is the honest number available today; the sustained run replaces it.
+
+Three traps, each of which produced a *wrong and plausible* number first:
+
+- **Key on `(epoch, itr)`, not `itr`.** `itr` restarts per epoch; pooling on it
+  mixes cold and steady-state iterations. This alone reported the 16n run at
+  171 s/iter instead of 10.3 s.
+- **Sample a fixed FRACTION of ranks, or all of them — never a fixed count.**
+  Max-over-192-of-3072 misses stragglers that max-over-768-of-768 catches. This
+  made 256n look *superlinear* (0.069 vs 0.052 clips/s/tile), which is not
+  physical for a comms-bound run and is what exposed the bug.
+- **Match the window.** A long run is mostly steady state; a 30-iter shakeout is
+  mostly warmup. 16n epoch 1 medians 18.0 s against 8.8-10 s in later epochs, so
+  whole-run medians favour whichever run is longer, independent of scale.
+
+Sanity check that the corrected script is right: it recovers 21.40 s for the
+accum A/B's accum=1 arm, matching the independently-recorded `ring_16M` median
+from a different job to 3 significant figures.
+
 ## Open
 
 - ~~CCL knob sweep~~ — **DONE at 64n** (job 8732160), all three arms
