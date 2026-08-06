@@ -1035,6 +1035,84 @@ rung boundary; under `VJEPA_SUSTAINED` self-resubmit, an aborting exit path is a
 different matter and needs to be closed before nw>0 becomes a default. It also
 has no 64n hazard arm yet.
 
+### Two nw>0 failures, not one — and only the second is fixed
+
+Tracing the above turned up a **second, unrelated** failure that had been
+folded in with it. They are separable by a single observable: whether any
+batches were delivered.
+
+| | (A) exit throw | (B) startup hang |
+|---|---|---|
+| when | after `avg. loss`, after the checkpoint | before iteration 0 |
+| iterations | all of them | **zero** |
+| symptom | `std::system_error` abort at exit | silence |
+| status | **open** | **fixed** |
+
+**(B) is an AF_UNIX path-length overflow, and it is not our port.** PBS sets
+`TMPDIR=/var/tmp/pbs.<jobid>.<server>` (68 chars); PALS then splices a
+per-mpiexec-launch UUID into it, `.../<uuid>/tmp`, reaching **109**. Python
+multiprocessing builds `pymp-XXXXXXXX/listener-XXXXXXXX` on top — **141**
+against an `AF_UNIX` `sun_path` cap of 107 usable bytes. The bind fails, and it
+fails **on the queue feeder thread**, where the exception is non-fatal. So the
+loader never delivers a batch and the run **hangs instead of erroring** — which
+is why this read as a mysterious stall rather than as the plain `OSError` it is.
+
+Bisected at 12 ranks (job 8740830), six arms, per-arm timeout:
+
+| arm | rc | af_unix | batches |
+|---|---|---|---|
+| bare (no XPU, no dist, 512-elem tensors) | 1 | 12/12 | 0/12 |
+| + XPU | 143 | 12/12 | 0/12 |
+| + xccl init | 143 | 12/12 | 0/12 |
+| + `worker_init_fn` → `file_system` | 143 | 0/12 | **0/12** |
+| + `TMPDIR=/tmp` | **0** | 0/12 | **12/12** |
+
+Identical failure at bare/xpu/dist puts the defect **below XPU and below
+xccl** — it reproduces with no GPU, no collective, and no video decode.
+
+The `file_system` arm is the informative one: it *clears the AF_UNIX error and
+still delivers nothing*, failing at `libshm/core.cpp:62` instead. It trades the
+`resource_sharer` socket for `torch_shm_manager`'s, and both are built from the
+same over-long `TMPDIR`. **The cause is path length, not sharing strategy** —
+which retires two mitigations this file used to carry. `MP_SOCKET_DIR=/tmp`
+has zero occurrences anywhere in the torch install, and
+`set_sharing_strategy("file_system")` is process-local and does not survive the
+`spawn` into a worker (the workers print `strategy=file_descriptor` regardless).
+Both were set for years and neither ever reached a worker.
+
+Fix: `scripts/lib/aurora_hsdp_env.sh` now **hard-sets** `TMPDIR=/tmp`. The line
+previously read `${TMPDIR:-/tmp}` — and PBS *always* sets `TMPDIR`, so the guard
+never fired and the intended `/tmp` was never applied. That is the identical
+`:-` trap this file already documents for the `FI_*` block, in a file that
+documents it. Headroom is `107 − 32 = 75` chars; `/tmp` leaves 71 spare even
+after PALS.
+
+Two process notes:
+
+- **This could not be settled retrospectively.** No historical rung ever logged
+  its resolved `TMPDIR` — the same "resolved value never logged" gap that made
+  `num_workers` unrecoverable from a finished run's own artifacts. `train.py`'s
+  `THROUGHPUT KNOBS` line now prints it and flags `len > 75`.
+- **Do not re-derive these paths off-node.** A login-shell calculation gives a
+  comfortable 36 and a job-shell one gives ~68, because neither has the UUID
+  yet, and `tempfile.gettempdir()` silently falls back to `/tmp` when `TMPDIR`
+  does not exist. An off-node probe reported PASS while all 12 ranks were
+  failing. Only the value printed from inside a rank is evidence.
+
+Corroboration: ALCF documents this (`user-guides/aurora/known-issues.md` #7),
+and all four BaseMM_PRISM Aurora launchers already export `TMPDIR=/tmp`.
+
+**Scope — what is still owed.** (B) is validated in a 12-rank toy, not in the
+trainer, and the fix was landed one layer *above* where it was validated: the
+bisect set `TMPDIR` from inside python, while `aurora_hsdp_env.sh` sets it in
+the job shell above `mpiexec` — and PALS *rewrites* `TMPDIR` rather than
+inheriting it. If PALS composes from `PBS_TMPDIR` instead, the one-liner is
+inert and looks exactly like a fix. `scripts/probe_tmpdir_pals.sh` settles that
+in under a minute on one node. (A) remains untraced; a `sigterm` arm returned
+`exit-throw=0/12`, so it is **not** generic signal-kill. And the 64n hazard arm
+is still owed regardless — the xccl-fork deadlock is `O(ranks)` and 8n does not
+transfer.
+
 ## Survivability is a throughput lever at scale
 
 HSDP fixed the DDP memory wedge and the *startup* collective hang. It did **not**
