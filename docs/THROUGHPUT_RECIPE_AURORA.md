@@ -1157,6 +1157,56 @@ in under a minute on one node. (A) remains untraced; a `sigterm` arm returned
 is still owed regardless — the xccl-fork deadlock is `O(ranks)` and 8n does not
 transfer.
 
+**Update — the probe passed, and (A) now has a candidate mechanism.** Job
+8740990 ran all three arms on one node with an untouched control:
+
+| arm | rank `TMPDIR` | listener path | verdict |
+|---|---|---|---|
+| A — job-shell `export TMPDIR=/tmp` (the landed fix) | `/tmp/<uuid>/tmp` (45) | 77/107 | **ok**, 30 spare |
+| B — `mpiexec --env TMPDIR=/tmp` | `/tmp` (4) | 36/107 | ok |
+| C — untouched control | `/var/tmp/pbs.…/<uuid>/tmp` (109) | **141/107** | OVER |
+
+A passes and C reproduces, so the landed one-liner **is** effective and no
+per-`mpiexec` `--env` is needed. `PBS_TMPDIR` is empty on Aurora, so PALS
+composes from `TMPDIR` — the "if PALS composes from `PBS_TMPDIR`" branch above
+is closed. **(B) is fully fixed, in the layer where it ships.**
+
+#### A candidate mechanism for (A) — same cap, different socket
+
+This is a **hypothesis with arithmetic behind it, not a diagnosis.** The throw
+in job 8739712's `n2_nw2` rung lands with no Python frame on the stack:
+
+```
+terminate called after throwing an instance of 'std::system_error'
+  what():  No such file or directory
+```
+
+`std::system_error` from ENOENT with no Python frame is the signature of
+`SYSCHECK_ERR_RETURN_NEG1` in `torch/lib/libshm/err.h`, which wraps `errno` in
+exactly that type. Under `set_sharing_strategy("file_system")` — active at
+`app/main_dist_aurora.py:385` — every shared storage goes through
+`torch_shm_manager`, whose socket is `<c10::TempDir>/manager.sock`. `c10`'s
+`try_make_tempdir` reads `TMPDIR`/`TMP`/`TEMP`/`TEMPDIR` and falls back to
+`/tmp` (`c10/util/tempfile.h`), and the manager's own prefix is
+`torch-shm-dir-` (in the `torch_shm_manager` string table). So the path is
+`$TMPDIR/torch-shm-dir-XXXXXX/manager.sock` — a **34**-byte suffix against
+python multiprocessing's 32:
+
+| `TMPDIR` at the rank | `manager.sock` | |
+|---|---|---|
+| PBS default, 109 | **143**/107 | OVER |
+| with the fix, 45 | 79/107 | ok, 28 spare |
+
+Job 8739712 **predates the `TMPDIR` fix** and *did* deliver batches, so it was
+not the bind that hangs (B) — but its shm segments were created under the
+143-byte path, which makes an ENOENT at teardown consistent with the same cap by
+a second route. What this does **not** establish: that the throw is in fact in
+libshm rather than another ENOENT-raising `SYSCHECK` in the same family, and
+that the 3-of-24 rank distribution follows from it. Both need the decisive test:
+**nw=2 in the real trainer with the fix live**. If the throw is gone, (A) was
+downstream of (B); if it survives, the libshm story is wrong and the next step
+is `catchsegv`/`gdb` on the aborting rank, not more arithmetic.
+
 ## Survivability is a throughput lever at scale
 
 HSDP fixed the DDP memory wedge and the *startup* collective hang. It did **not**
