@@ -776,6 +776,59 @@ contains a stall — which is exactly the 64n≈256n flatness already on record.
 pushes the knee out. Reducing the *tail itself* (p99 ≈ 22 s per-rank decode) is
 the only lever that changes the asymptote.
 
+### Chasing the tail: payload size is REFUTED, keyframe spacing is the lead
+
+Since the tail is the only asymptote lever, its owner has to be identified.
+Measured offline against the real shards (shard 0 of each source, 4 clips,
+`decord` `num_threads=1`, 16-frame `linspace` — the access pattern training
+actually uses), so this costs no scaling slot:
+
+| source | MB/clip | frames | resolution | GOP | open | seek-16 |
+|---|---|---|---|---|---|---|
+| surgtoolloc2022 | 8.9 | 1806 | 640×360 | 12 | 0.01 | **0.05 s** |
+| multibypass140 | 32.6 | 1500 | 720×576 | 12 | 0.04 | **0.15 s** |
+| heichole_512 | 12.9 | 1319 | 910×512 | 16 | 0.01 | **0.36 s** |
+| openh | 7.5 | 406 | 682×512 | 14 | 0.01 | 0.38 s |
+| grasp_noleak | **96.6** | 2730 | 1280×1024 | 10 | 0.16 | **0.56 s** |
+| pe_video | 2.3 | 699 | 608×342 | 66 | 0.01 | 0.44 s |
+| sitl | 4.9 | 1688 | 640×360 | 218 | 0.01 | 0.94 s |
+| cholec80 | 22.5 | 1632 | 854×480 | 249 | 0.03 | 3.16 s |
+| surgvu24_clean | 9.8 | 3514 | 1280×720 | 250 | 0.02 | 3.10 s |
+| lemon | 21.1 | 1626 | 916×660 | 96 | 0.03 | 3.76 s |
+| sitl_2026 | 75.4 | 1800 | 1920×1080 | 30 | 0.13 | **4.85 s** |
+| lapgyn6_events | 23.7 | 908 | 1920×1080 | — | 0.05 | **5.37 s** |
+
+**Payload size is refuted as the predictor.** `grasp_noleak` is the largest
+source on disk (96.6 MB/clip) and decodes in 0.56 s; `surgvu24_clean` is 10×
+smaller and takes 3.10 s. Pearson r vs decode time: MB/clip **+0.20**, frame
+count +0.50, GOP **+0.62**, and `min(16·GOP, frames)` — the frames a 16-seek
+scatter actually forces the decoder through — **+0.70**.
+
+⚠️ **The arithmetic near-match that started this was a coincidence.** Under the
+realized T=0.5 mixture, `p(clip from a >30 MB/clip source) = 0.104` against a
+measured `p(dataload > 10 s) = 0.098`. Two numbers agreeing to 6% is not a
+mechanism, and here the mechanism it suggested is wrong. It is recorded because
+it was persuasive and false.
+
+**The lead is keyframe spacing.** Seek dominates open by 10–100× everywhere, and
+every fast source is a *dense-GOP* one. That is consistent with the already-
+measured heichole re-encode (1080p high-bitrate sparse-keyframe → 512p/crf23/
+**g16**: decode 1765 → 182 ms, `scripts/reencode_source_reshard.py`) — the same
+intervention, on a different source, for the same stated reason.
+
+Two reasons this is a lead and not yet a finding: r=0.70 over 12 points is not
+decisive, and `sitl_2026` (7.3 ms per decoded frame vs a ~1 ms median) shows
+resolution confounds GOP — it is 1080p. **Both are settled by intervention, not
+correlation:** re-encode one slow source at native resolution with `g16` and at
+512p with `g16`, decode the *same clip*, and the two arms separate GOP from
+pixels. That test is running.
+
+**Instrument for the live path** — `VJEPA_DECODE_PROFILE=1` (default OFF,
+canonical-worker-gated) logs per source the decode call's own time and the gap
+since the previous sample, so a payload/codec tail (lives in `decode`, sorts by
+source) is distinguishable from a DAOS stall (lives in `gap`, does not). Offline
+benchmarks cannot see DAOS; this closes that gap.
+
 ## Scaling ladder (`scripts/scaling_ladder.sh`)
 
 Measures per-tile efficiency across node counts in **one allocation**, so every
