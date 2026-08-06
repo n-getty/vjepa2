@@ -174,10 +174,19 @@ echo "DAOS mounted (corpus + models)"
 # Called once for the allocation -- under weak scaling batch_size does not depend
 # on node count, and the config's `nodes:` key is read only on the submit path
 # (app/main_dist_aurora.py:284), never under --train_mode.
-$PY $ROOT/scripts/prepare_runtime_config.py \
-  $BASE_CFG --root $ROOT --num-gpus $PPN --num-nodes $NNODES --weak-scale > /dev/null || exit 1
-RUNTIME_CFG=$ROOT/.runtime_configs/n${NNODES}g${PPN}_weak/configs/vitg16_surg_vid_webdataset_single4/${CFG_NAME}.yaml
-[ -r "$RUNTIME_CFG" ] || { echo "FATAL: runtime cfg missing: $RUNTIME_CFG"; exit 1; }
+# TAKE THE PATH FROM THE SCRIPT -- do not re-derive it here. The script prints
+# its output path on stdout (prepare_runtime_config.py:172) and owns the naming
+# rule, which has a special case this launcher does not: at num_nodes==1 the
+# directory is `g12_weak`, NOT `n1g12_weak` (:117-124). Job 8740602 -- the 1-node
+# L4 tail rung -- died at `FATAL: runtime cfg missing` on exactly that, having
+# already spent the queue wait and the DAOS mount. Every earlier rung set started
+# at >=2 nodes, so the hardcoded spelling was right by accident for L0-L3 and the
+# one allocation size that exercises the special case is the cheap-queue job.
+# Two copies of a naming rule is one copy too many.
+RUNTIME_CFG=$($PY $ROOT/scripts/prepare_runtime_config.py \
+  $BASE_CFG --root $ROOT --num-gpus $PPN --num-nodes $NNODES --weak-scale | tail -n1) || exit 1
+[ -r "$RUNTIME_CFG" ] || { echo "FATAL: runtime cfg missing: '$RUNTIME_CFG'"; exit 1; }
+echo "runtime cfg: $RUNTIME_CFG"
 
 # Per-rung stall watchdog. Same shape as vitG384_256n_daos.sh:297-331, but scoped
 # to ONE rung: it must not outlive its rung or it would kill the next one, so it
