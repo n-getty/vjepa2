@@ -63,15 +63,28 @@ _clip_diag = {"seen": 0, "dropped": {}, "kept": {}}
 # the only lever that changes the asymptote, so the tail's OWNER has to be
 # identified rather than guessed.
 #
-# The standing candidate is source heterogeneity. Per-clip payload spans ~45x
-# across the 16 sources (metadata + on-disk shard sizes): sitl_2026 51 MB/clip,
-# grasp_noleak 83, multibypass140 30, against pe_video's 1.6. Under the
-# realized T=0.5 mixture, p(a clip is drawn from a >30 MB/clip source) = 0.1037
-# -- suspiciously close to the measured p(dataload > 10 s) = 0.098. That
-# numerical agreement is a COINCIDENCE UNTIL MEASURED: it is consistent with a
-# payload-driven tail, and equally consistent with a DAOS-side stall that has
-# nothing to do with which source was drawn. Two numbers matching is not
-# evidence of a mechanism.
+# Two candidates have now been tested offline and BOTH fail to explain the tail:
+#
+#   payload size   REFUTED outright. grasp_noleak is the largest source on disk
+#                  (96.6 MB/clip) and among the fastest to decode (0.56 s);
+#                  surgvu24_clean is 10x smaller and 6x slower. Pearson r vs
+#                  decode time is +0.20. The near-match that made it persuasive
+#                  -- p(clip from a >30 MB/clip source) = 0.104 vs measured
+#                  p(dataload > 10 s) = 0.098 -- was a coincidence.
+#   keyframe spacing (GOP)  REAL, but only for the BODY of the distribution.
+#                  Re-encoding the same clip at GOP-16 buys 4.4-8.8x at
+#                  unchanged pixels, and a mixture model over the measured
+#                  per-source decode costs reproduces the median (predicted
+#                  1.38 s vs observed 1.20) and the mean (2.66 vs 3.10). It
+#                  does NOT reproduce the tail: predicted p99 8.6 s against an
+#                  observed 23.0 s, predicted p(>10 s) 0.002 against 0.095.
+#
+# The decisive number is a ceiling. At bs=2, a pure-decode story cannot exceed
+# twice the slowest per-clip decode ever measured (lapgyn6_events, 5.37 s), i.e.
+# 10.74 s -- yet 8.7% of 18,252 observed samples are above it, median 15.1 s and
+# max 67.8 s, 6.3x the ceiling. No mixture of measured decode costs can produce
+# those draws. The excess appears at ONE node, so it is not fabric, and offline
+# benchmarks structurally cannot see it because they do not read through DAOS.
 #
 # This records, per source, the wall time of the decode call itself and the
 # gap since the previous sample left this worker. The split is the point:
@@ -82,12 +95,36 @@ _clip_diag = {"seen": 0, "dropped": {}, "kept": {}}
 # storage story predicts it lives in gap_ms and does NOT sort by source. They
 # are distinguishable, which is the whole reason to split them.
 #
-# Canonical-worker only and OFF by default: this is one time.time() pair per
-# sample, but the log line is what costs, and at 3072 ranks any per-sample line
-# is what took out job 8730678's head node.
+# OFF by default. When on, profile the first VJEPA_DECODE_PROFILE_RANKS ranks
+# rather than rank 0 alone. Rank-0-only would very likely have measured nothing:
+# a >ceiling event hits a median of 2 of 12 ranks in an iteration, so rank 0 is
+# in the stalling set roughly one time in six and a whole rung could come back
+# clean while the tail was happening two ranks over. The cap is what keeps this
+# from becoming the log funnel that cost job 8730678 its MASTER_ADDR host -- 12
+# ranks emitting one table per 200 samples is bounded and small; 3072 ranks
+# emitting per-sample lines is not. Default 12 = one node's worth.
 _DECODE_PROFILE = os.environ.get("VJEPA_DECODE_PROFILE", "0") == "1"
 _DECODE_EVERY = int(os.environ.get("VJEPA_DECODE_PROFILE_EVERY", "200"))
+_DECODE_RANKS = int(os.environ.get("VJEPA_DECODE_PROFILE_RANKS", "12"))
 _decode_prof = {"n": 0, "last_exit": None, "by_src": {}}
+
+
+def _is_profiling_worker():
+    """True on worker 0 of the first _DECODE_RANKS ranks.
+
+    Worker 0 only: `gap` is measured against module state that is per-process,
+    so two workers in one process would interleave their exits and corrupt each
+    other's gap. One worker per rank keeps the gap meaningful.
+    """
+    rank = os.environ.get("RANK", os.environ.get("PMI_RANK",
+           os.environ.get("PALS_RANKID", "0")))
+    try:
+        if int(rank) >= _DECODE_RANKS:
+            return False
+    except (TypeError, ValueError):
+        return False
+    info = torch.utils.data.get_worker_info()
+    return info is None or info.id == 0
 
 
 def _record_decode(source_name, decode_s, gap_s):
@@ -601,7 +638,7 @@ class _PerSampleDecode:
         self.source_name = source_name
 
     def __call__(self, sample):
-        if not (_DECODE_PROFILE and _is_canonical_worker()):
+        if not (_DECODE_PROFILE and _is_profiling_worker()):
             return self.decoder.decode(sample, self.fpc, source_name=self.source_name)
         # gap = time since the PREVIOUS sample left this worker, i.e. everything
         # upstream of us (tar read / DAOS / shuffle buffer refill). decode = our

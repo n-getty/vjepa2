@@ -232,7 +232,7 @@ run_rung () {
     # barrier is supposed to be free (it sits where ranks already synchronize at
     # forward's first FSDP all-gather), but if it is not, the ladder is measuring
     # the probe. Run `16 16:probe0` in one allocation and require overlapping IQRs.
-    local R="${spec%%:*}" nw="$VJEPA_NUM_WORKERS" probe="$VJEPA_SCALE_PROBE"
+    local R="${spec%%:*}" nw="$VJEPA_NUM_WORKERS" probe="$VJEPA_SCALE_PROBE" prof=0
     local rest="${spec#*:}" fld
     if [ "$rest" != "$spec" ]; then
         local IFS=:
@@ -240,12 +240,26 @@ run_rung () {
             case "$fld" in
                 nw*)    nw="${fld#nw}" ;;
                 probe*) probe="${fld#probe}" ;;
+                prof*)  prof="${fld#prof}" ;;
                 *) echo "  rung $spec: unknown field '$fld'"; return 1 ;;
             esac
         done
     fi
     local name="n${R}_nw${nw}"
     [ "$probe" = "1" ] || name="${name}_probe${probe}"
+    # prof<0|1>: per-source decode/gap profiling (src/datasets/webdataset.py).
+    # This exists because the tail has outgrown the explanation we had for it.
+    # The sparse-keyframe finding reproduces the BODY of the per-rank dataload
+    # distribution -- mixture-predicted p50 1.38 s vs observed 1.20 s, mean 2.66
+    # vs 3.10 -- but not the tail that actually drives the order statistic:
+    # 8.7% of samples exceed 10.74 s, which is 2x the slowest per-clip decode
+    # ever measured offline (lapgyn6_events 5.37 s) and therefore UNREACHABLE by
+    # any mixture of measured decode costs at bs=2. The excess is present at ONE
+    # node, so it is not fabric. decode_ms vs gap_ms separates the two live
+    # candidates: CPU/codec cost we mis-measured offline (lands in decode) versus
+    # a storage-side stall offline benchmarks structurally cannot see (lands in
+    # gap). Rank-0-gated and off by default; see the log-funnel note above.
+    [ "$prof" = "1" ] && name="${name}_prof"
     if [ "$R" -gt "$NNODES" ]; then
         echo "SKIP rung $spec: needs $R nodes, allocation has $NNODES"; return 0
     fi
@@ -314,6 +328,7 @@ PY
     WORLD_SIZE=$W \
     VJEPA_NUM_WORKERS=$nw \
     VJEPA_SCALE_PROBE=$probe \
+    VJEPA_DECODE_PROFILE=$prof \
     mpiexec -n $W -ppn $PPN --hostfile "$nf" --cpu-bind depth --depth 16 --no-vni \
         -o "$dir/rank.%r.out" -e "$dir/rank.%r.err" \
         python -m app.main_dist_aurora --train_mode \

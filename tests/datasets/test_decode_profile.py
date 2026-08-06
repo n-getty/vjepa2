@@ -177,22 +177,45 @@ def test_reservoir_is_bounded_but_keeps_the_tail(monkeypatch):
     )
 
 
-def test_only_the_canonical_worker_profiles(monkeypatch):
-    """Non-zero ranks must stay silent -- the log funnel is a real failure mode.
+def test_profiling_is_capped_to_the_first_n_ranks(monkeypatch):
+    """Ranks below the cap profile; ranks above it stay silent.
 
-    Every rank's workers run this code. Job 8730678 lost its MASTER_ADDR host to
-    a DAOS ping timeout while ~58,000 setup lines funnelled through it; a
-    per-sample line from 3072 ranks is strictly worse.
+    Rank 0 alone is not enough to see this tail. A >ceiling dataload event hits
+    a median of 2 of the 12 ranks on a node, so rank 0 is in the stalling set
+    roughly one iteration in six -- a rung could come back clean while the tail
+    was happening two ranks over. Hence a cap, not a single rank.
+
+    But the cap has to bind. Job 8730678 lost its MASTER_ADDR host to a DAOS
+    ping timeout while ~58,000 setup lines funnelled through it, and that host
+    was also serving the rendezvous store. Per-sample logging from 3072 ranks is
+    strictly worse, so the ceiling on how many ranks emit is the safety property
+    -- test both sides of it.
     """
     wd = _fresh(monkeypatch)
-    monkeypatch.setenv("RANK", "7")
+    monkeypatch.setenv("VJEPA_DECODE_PROFILE_RANKS", "12")
+
+    monkeypatch.setenv("RANK", "7")  # inside the cap: must record
     p = wd._PerSampleDecode(_SleepDecoder(0.0), 16, source_name="sitl_2026")
     for _ in range(5):
         p({"__key__": "k"})
-    assert wd._decode_prof["n"] == 0, (
-        "a non-zero rank recorded profile samples; at scale this is the log "
-        "funnel that has already taken down a head node once"
+    assert wd._decode_prof["n"] == 5, (
+        "rank 7 is within the 12-rank cap and must profile; rank-0-only gating "
+        "would miss the stalling ranks this instrument exists to find"
     )
+
+    before = wd._decode_prof["n"]
+    monkeypatch.setenv("RANK", "12")  # first rank outside the cap
+    for _ in range(5):
+        p({"__key__": "k"})
+    assert wd._decode_prof["n"] == before, (
+        "rank 12 is outside the cap but recorded anyway -- the cap is what "
+        "stops this becoming the log funnel that has taken down a head node"
+    )
+
+    monkeypatch.setenv("RANK", "3071")
+    for _ in range(5):
+        p({"__key__": "k"})
+    assert wd._decode_prof["n"] == before, "a 3072-rank job must not profile at rank 3071"
 
 
 def test_profiling_does_not_alter_the_decoded_value(monkeypatch):
