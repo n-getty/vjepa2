@@ -101,6 +101,19 @@ launch-dfuse.sh ${POOL}:${CONT} || { echo "FATAL: launch-dfuse failed"; exit 1; 
 mount | grep -q "$CONT" || { echo "FATAL: container not mounted at $MNT"; exit 1; }
 echo "mounted $POOL:$CONT at $MNT"
 
+# Pool capacity, from a COMPUTE node -- the only place that can answer it. A
+# login shell has no /var/run/daos_agent/daos_agent.sock and `daos pool query`
+# dies with DER_AGENT_COMM(-2034), so this check cannot be done at submit time.
+#
+# Advisory, never fatal. The incremental g16 ingest adds ~1.8 TB (see the
+# INGEST_SOURCES note above -- the GOP twins are NET LARGER over the pure-GOP
+# sources), and a dsync that runs the pool out of space would fail deep into a
+# multi-TB copy with a confusing ENOSPC. Printing free space up front makes that
+# diagnosable from the job log alone rather than requiring a re-run to observe.
+echo "=== pool capacity before ingest ==="
+daos pool query "$POOL" 2>&1 | grep -iE 'Free|Total|NVMe|SCM|Pool space' || \
+  echo "  (pool query unavailable -- proceeding, this check is advisory)"
+
 # The 16 sources of the live corpus. pe_video lives outside SRC_ROOT and is a
 # symlink tree, so dsync must dereference (-L) or it copies dangling links.
 SOURCES=(small_surg sitl surgenet_robotic_clean surgtoolloc2022 surgvu24_clean
