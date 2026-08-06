@@ -568,13 +568,28 @@ def _make_stream(meta, dataset_dir, decoder, fpc, shuffle_buffer=1000,
         slice_rank, slice_ws = rank, world_size
 
     urls = [os.path.join(dataset_dir, u) for u in meta["shard_urls"]]
+    _n_total = len(urls)
+    _sliced = False
     if slice_rank is not None and slice_ws is not None and slice_ws > 1:
         if len(urls) >= slice_ws:
             urls = urls[slice_rank::slice_ws]
+            _sliced = True
         # else: keep full list — tiny dataset, every rank uses all shards.
         nodesplitter = None
     else:
         nodesplitter = wds.split_by_node
+    # Make the unsliced branch observable. It is silent by construction: a source
+    # with fewer shards than slice_ws is handed to every rank IN FULL, so ranks
+    # overlap on it with no error and no signal in the loss. At 3072 global ranks
+    # all 16 sources fall below the threshold. Rank-0-gated (see _is_rank0) --
+    # one line per source, not one per rank per source.
+    if _is_rank0():
+        logger.info(
+            f"[wds-slice] source={meta.get('name')} shards={_n_total} "
+            f"slice_rank={slice_rank} slice_ws={slice_ws} "
+            f"sliced={_sliced} per_rank_urls={len(urls)}"
+            + ("" if _sliced else "  <-- UNSLICED: every rank sees all shards")
+        )
     stream = wds.WebDataset(
         urls,
         resampled=True,

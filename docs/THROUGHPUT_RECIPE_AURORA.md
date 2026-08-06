@@ -6,6 +6,17 @@ Everything here carries a job ID so it can be re-checked rather than trusted.
 Companion docs: `SCALEOUT_256N_STATUS.md` (the 256-node path and its blockers),
 `vitG_2B_HSDP_findings.md` (the 16n campaign this builds on).
 
+> **READ THIS FIRST (2026-08-06).** Most of the levers below are comms levers, and
+> comms is **not** where the time goes. The ladder measured `iter −
+> max_over_ranks(dataload)` at **2.88 s (1n) / 3.74 s (2n) / 3.31 s (64n)** — the
+> compute-plus-comms floor is FLAT, with a 3.29–3.35 s IQR over 29 iterations at
+> 768 ranks. At 1 node, compute is 2.92 s of a 16.99 s iteration: **17%
+> utilization with no inter-node fabric in the picture at all.** The remaining 83%
+> is the intra-node decode tail (p10 0.48 s vs p90 13.88 s across 12 ranks on ONE
+> node), and it does not get worse with scale — the dataload p90 *falls* from
+> 13.88 s at 1n to 6.54 s at 256n, which rules out DAOS bandwidth saturation.
+> Before tuning another CCL knob, see the "Where the time actually goes" section.
+
 ---
 
 ## The recipe
@@ -178,6 +189,14 @@ These fail without an error, which is what makes them expensive.
   a DDP launcher.** The `vitG1B_capwd_*.sh` family sets
   `VJEPA_DIST_STRATEGY=ddp` and its `pmix`/`mpi` transport is correct as written
   — an audit flagged it as off-recipe and was wrong.
+- **The resolved `num_workers` used to be unrecoverable from a run's own
+  artifacts.** `scripts/lib/aurora_hsdp_env.sh:85` exports
+  `VJEPA_NUM_WORKERS=0`, which overrides config `num_workers: 2`, but
+  `params-pretrain.yaml` snapshots only the *config* value. So a finished run's
+  worker count could only be recovered from its launcher **at its submit-time
+  git revision**. Fixed 2026-08-06: `train.py` now prints the resolved
+  `num_workers=` and `pin_mem=` in the `THROUGHPUT KNOBS` line. Runs before that
+  date must have their launcher checked out at the submit commit.
 - **A launcher that rewrites `ipe` must preserve TOTAL STEPS.**
   `VJEPA_SUSTAINED=1` shortens the epoch so each one banks durably; it used to
   keep `epochs` while overwriting `ipe`, turning `lbA`'s 39 x 16 = 624 into
@@ -384,10 +403,27 @@ assuming it holds ([[scale-dependent-results-dont-transfer]]).
 
 ## Measurement notes (these bit repeatedly)
 
-- **Use wall-clock `iter-time(ms)`. Never `backward-ms`.** PhaseTimer takes XPU
-  event deltas and they go **negative** on stalled collectives (-139/-326/-277 s
-  at itrs 0/12/24 of job 8730919) — i.e. it breaks precisely on the iterations a
-  comms experiment is about.
+- **Use wall-clock `iter-time(ms)` for headline numbers** — but the phase columns
+  are usable, and an earlier version of this note wrongly said they were not.
+  **Negative XPU event deltas are a 32-bit counter wrap, not a broken timer**
+  (verified 2026-08-06). The counter ticks at 80 ns, so it rolls over every
+  `2**32 * 80e-9 = 343.597 s`; a delta spanning the rollover comes out short by
+  exactly one period. Add `WRAP_MS = 343597.38368` to recover it.
+  The evidence: across 176,640 rank-rows of the 64n and 256n runs, 6.3–6.6% of
+  rows had at least one negative phase, and after adding one period **zero
+  remained negative**, while `sum(phases) − gpu-time` kept the same ~0.5 ms
+  residual as the never-negative control rows (that residual is just the `"%d"`
+  truncation of `gpu-time`). Random garbage does not reconcile to half a
+  millisecond. Note the old note's own counter-example fits: −139/−326/−277 s all
+  lie inside the single-period range (−343.6, 0) s, which is what a bounded
+  artifact looks like.
+  `scripts/scaling_efficiency.py` now unwraps at parse time. **Do not oversell
+  the fix**: at 64n it moved `backward-ms` p50 12.19 → 12.30 s and the
+  max-over-ranks median not at all, because whether a phase wraps depends on
+  where the free-running counter sits, not on how long the phase took — so the
+  dropped samples were spread through the distribution, not concentrated in the
+  slow tail. The gain is closing a 4% silent coverage hole with a systematic low
+  bias, not recovering a hidden tail.
 - **Pair the arms in one allocation.** Within-run CV is ~81%. Across jobs the
   *median* reproduces to ~1% (21.68 s vs 21.40 s for the same config in jobs
   8731439 and 8732160), but pairing removes the fabric-hour confound for free.
@@ -398,6 +434,143 @@ assuming it holds ([[scale-dependent-results-dont-transfer]]).
   (job 8731332).
 - **Judge on CSV rows, not exit codes.** A `| tail` pipeline returns tail's
   status; runs have reported rc=0 with zero iterations.
+- **Count rank CSVs against the rank count you expected, from the topology —
+  not from the number of files present.** `arm_B_lr6e5` was read as a 1-node
+  baseline for a scaling table. It was `scripts/vitG384_v2_lr_ab_32n.sh`
+  (job 8681025): `-l select=32`, `WORLD_SIZE=192 mpiexec -n 192 -ppn 12` — a
+  **16-node/192-rank** run, of which only `log_r0..log_r11` exist (its mpiexec
+  was `Killed`). "Max over ranks" was therefore taken over 6% of ranks, which
+  makes a run look fast in exactly the way a straggler study cannot afford.
+  `scripts/scaling_efficiency.py --ladder` now derives the expected rank count
+  from the rung **directory name** (`n<NODES>_nw<N>`) and reports
+  `partial rank coverage` instead of a number.
+- **`fwd-target-ms` changed meaning on 2026-08-06.**
+  `phase_timer.mark("fwd_target_done")` was immediately followed by
+  `mark("fwd_context_done")` at all three call sites, so `fwd-context-ms` was
+  always ~0 and `fwd-target-ms` silently held the **entire** forward. The marks
+  now bracket real work. **For any CSV written before 2026-08-06, read
+  "forward" as `col6 + col7`**; after it the two columns are genuinely the
+  target encoder vs the context encoder + predictor.
+
+## Where the time actually goes — ladder result, 2026-08-06
+
+Job 8739625 (1n + 2n hold, `VJEPA_SCALE_PROBE=1`) plus re-analysis of the
+pre-existing 64n (8736153) and 256n (`daos_256n/vitG384_lbA8`) runs. Read
+`[[scaling-loss-is-decode-tail-not-fabric]]` for the short version.
+
+**1. The compute+comms floor does not grow with node count.**
+
+| | 1n | 2n | 64n |
+|---|---|---|---|
+| median `iter − max(dataload)` | 2.88 s | 3.74 s | 3.31 s |
+| IQR | 2.88–2.90 | 3.08–3.82 | **3.29–3.35** |
+
+A 60 ms IQR over 29 iterations at 768 ranks. Whatever scales with node count is
+already inside `max(dataload)`. Do not read a trend into the 2n value being
+highest — 0.9 s of spread across three points is not a trend; the finding is the
+*absence* of growth.
+
+**2. Only 17% of a single-node iteration is compute.**
+
+| | barrier | dataload | fwd-tgt | fwd-ctx | backward | opt | ema | **iter** |
+|---|---|---|---|---|---|---|---|---|
+| 1n | 12.60 | 14.11 | 0.67 | 1.00 | 1.22 | 0.03 | 0.00 | **16.99** |
+| 2n | 17.25 | 17.60 | 0.69 | 1.40 | 1.72 | 0.03 | 0.00 | **20.68** |
+
+1n→2n per-tile efficiency is 82%, but compute only grows 2.92→3.84 s against a
++3.69 s iteration, so **four fifths of that regression is not compute**. The
+backward part of it (1.22→1.72 s) is the HSDP replicate-dim allreduce appearing
+for the first time — real, and small.
+
+⚠️ **Do not sum `barrier` and `dataload`.** Both are wall clock and both measure
+largely the *same* wait from opposite ends, which is why `unacct` is −12.6 s at
+1n. They are two views of one stall, not two additive costs.
+⚠️ The 2n rung was still warming (trend 1.16), so its 20.68 s is a lower bound
+and 82% is an optimistic ceiling.
+
+**3. The dataload tail does not degrade with scale — it improves.**
+Per-rank-sample, iters > 0:
+
+| | 1n | 2n | 64n | 256n |
+|---|---|---|---|---|
+| p10 | 0.48 | 0.46 | 0.47 | 0.30 |
+| p50 | 1.79 | 2.03 | 1.26 | 4.08 |
+| p90 | 13.88 | 14.35 | 11.51 | **6.54** |
+| p99 | 24.18 | 28.48 | 22.84 | **11.52** |
+| mean | 5.29 | 5.28 | 3.62 | **3.52** |
+
+256× the concurrent readers, a *lower* tail than one node. DAOS bandwidth
+saturation cannot produce that.
+
+**4. The stalls are whole-node correlated, and present at 1 node.** Per-iteration
+at 1n: itr 2 = all 12 ranks 10.4–16.4 s together; itr 4 = 9 of 12 at ~12 s while
+ranks 3/6/11 sit at 1.0 s; itrs 3/9/10 = nobody over 10 s. Per-rank means are
+3.6–7.5 s with **no persistently slow tile**, so it is not a bad device, and the
+correlation rules out independent per-rank shard-content variation.
+
+Two hypotheses, **not yet separated** — do not label this until the arm reports:
+(a) CPU oversubscription from inline decode at `num_workers=0` (12 ranks ×
+`OMP_NUM_THREADS=16` = 192 threads on 104 physical cores, 1.85×);
+(b) shared per-node DAOS/dfuse client contention.
+The `nw2` arm discriminates: if cores, `num_workers=2` barely helps; if I/O
+latency, prefetch overlap hides it.
+
+**Why this is not a probe artifact.** The 64n and 256n CSVs are **16 columns** —
+they predate the barrier probe entirely — yet show the same flat floor and the
+same non-degrading tail. Findings 1 and 3 reproduce in probe-free data.
+
+**What it means for the levers above.** The comms levers in this doc are real but
+they are optimizing 17% of the iteration. Reporting dataload **p50** (~1–2 s at
+every scale) hides the cost completely: a synchronous step pays
+**max-over-ranks**, not the median. The "64n forward blowup" and "backward
+blowup" that motivated this study were skew absorbed by each phase's first
+collective — `target_encoder` is HSDP-wrapped, so forward's first FSDP all-gather
+eats every millisecond of skew the dataloader created.
+
+## Scaling ladder (`scripts/scaling_ladder.sh`)
+
+Measures per-tile efficiency across node counts in **one allocation**, so every
+rung shares a fabric hour, and separates straggler wait from compute.
+
+- Rungs are `<nodes>[:nw<N>]`, run serially, each in its own sub-world: private
+  nodefile + explicit `WORLD_SIZE` + offset `MASTER_PORT`. `WORLD_SIZE` takes
+  precedence over PMI `SIZE` (`src/utils/distributed.py:146-158`) and
+  `hsdp.py` derives `num_nodes = world_size // local_world_size`, so each rung
+  builds a correctly sized mesh from its own world.
+  ```
+  L1: qsub -l select=16 -v VJEPA_LADDER_RUNGS="1 2 4 8 16"   scripts/scaling_ladder.sh
+  L2: qsub -l select=32 -v VJEPA_LADDER_RUNGS="16 32"        scripts/scaling_ladder.sh
+  L3: qsub -l select=64 -v VJEPA_LADDER_RUNGS="16 64 16:nw2" scripts/scaling_ladder.sh
+  ```
+  16n repeats in every job as a **cross-job anchor**. If it moves by more than
+  its IQR between jobs, cross-job comparisons are void.
+- `VJEPA_SCALE_PROBE=1` adds an explicit pre-step `torch.distributed.barrier()`
+  (after a device sync) and logs it as **`barrier-ms`, CSV column 16**, appended
+  so pre-existing readers that index 0-15 are unaffected. Per rank it is how
+  much *earlier* that rank arrived than the last one: min-over-ranks ≈ 0,
+  **max-over-ranks is the skew**. Without it, skew hides inside forward's first
+  FSDP all-gather and manufactures an apparent forward blowup. Default OFF — it
+  is a real collective and must not be left on for production throughput runs.
+- Rungs skip the checkpoint load (`load_checkpoint: false`). Every rank reads
+  the 22.8 GB `.pt` independently: 5m26s to iter 0 at 64n, 8m57s at 256n, which
+  would eat the 1 h cap in startup. Shapes and FLOPs are identical from random
+  init. **Loss from a ladder run is meaningless and must never be reported as a
+  training signal.**
+- The nw arm is a **hazard arm, run last**: `train.py` forces `num_workers=0`
+  under HSDP because forking persistent workers after `init_device_mesh` can
+  inherit broken xccl state and deadlock on the first batch. Its output dir is
+  `n16_nw2/`, so a hang cannot be mistaken for a clean rung.
+- Analyse with `scripts/scaling_efficiency.py --ladder <root> --clips-per-rank 2`
+  (`lbA` is bs=2; the default 1 makes every throughput number 2x wrong). It
+  prints per-tile efficiency vs the smallest measured rung, a phase breakdown
+  taking max-over-ranks **per phase independently** (stragglers rotate), an
+  `unacct` residual, and a first-vs-last-quartile **trend**. A rung still
+  descending at the end of its window is a lower bound, not a median.
+- **Discard iteration 0** — at 256n it logged `gpu: -137918.2 ms`.
+
+`tests/test_phase_csv_contract.py` pins the 17-column order, that `barrier-ms`
+stays last, that `scaling_efficiency.py`'s indices agree, that the forward marks
+are not re-adjoined, and that the probe stays opt-in.
 
 ## Survivability is a throughput lever at scale
 

@@ -311,6 +311,15 @@ def main(args, resume_preempt=False):
         f"act_ckpt={use_activation_checkpointing} "
         f"wds_local_slicing={os.environ.get('WDS_LOCAL_SLICING', '0')} "
         f"xpu_flash={os.environ.get('VJEPA_USE_XPU_FLASH', '1')} "
+        # num_workers/pin_mem are RESOLVED values (config, possibly overridden by
+        # VJEPA_NUM_WORKERS / VJEPA_PIN_MEM above). Logged because the override is
+        # otherwise invisible: params-pretrain.yaml records only the CONFIG value,
+        # so a finished run's worker count is unrecoverable from its own artifacts
+        # -- you have to find its launcher at its submit-time git revision. That
+        # cost us the baseline row of a scaling table (2026-08-06): a "1n, fast
+        # dataload" run turned out to be nw=2, and every nw=0 run shows ~1 s in
+        # dataload-time purely because decode runs inline instead of prefetched.
+        f"num_workers={num_workers} pin_mem={pin_mem} "
         f"-> effective global batch "
         f"{world_size * batch_size * true_accum} "
         f"({world_size} ranks x bs {batch_size} x accum {true_accum})"
@@ -470,6 +479,12 @@ def main(args, resume_preempt=False):
         # (grad_accum is then the legitimate mitigation, not a band-aid).
         ("%.1f", "l0-free-mib"),
         ("%.1f", "l0-ext-mib"),
+        # Rank-skew probe, populated only when VJEPA_SCALE_PROBE=1 (else 0.0).
+        # APPENDED, never inserted: every reader indexes positionally into 0..15
+        # (scripts/scaling_efficiency.py p[3], scripts/weak_scaling_report.py
+        # parts[3]/parts[5]), so a 17th column is backward-compatible and an
+        # inserted one would silently corrupt them.
+        ("%.1f", "barrier-ms"),
     )
 
     # -- init model
@@ -956,6 +971,24 @@ def main(args, resume_preempt=False):
             + (f" per-rank dumps -> {_hang_dir}/stack_rank*.txt" if _dump_fh else "")
         )
 
+    # -- SCALE PROBE (diagnostic; env-gated, default OFF, same contract as the
+    # watchdog above: the proven recipe must be byte-identical unless asked).
+    # Why it exists: target_encoder is HSDP-wrapped, so the first collective of an
+    # iteration is an FSDP all-gather INSIDE forward. Any rank skew accumulated
+    # during dataload is therefore paid inside fwd-target-ms, and a single slow
+    # loader rank manufactures an apparent forward blowup on all 768 ranks. With
+    # the probe on, an explicit pre-step barrier moves that wait into its own
+    # column: per rank, barrier-ms is how much EARLIER it arrived than the last
+    # rank, so min-over-ranks ~ 0 and MAX-over-ranks is the skew. After it the
+    # step begins synchronized and the phase columns measure compute.
+    _scale_probe = os.environ.get("VJEPA_SCALE_PROBE") == "1"
+    if _scale_probe:
+        logger.info(
+            "[scale-probe] VJEPA_SCALE_PROBE=1: explicit pre-step barrier ON. "
+            "Adds a real collective per iteration -- diagnostic only, do NOT "
+            "leave it on for production throughput runs."
+        )
+
     def _watchdog_arm():
         if _watchdog_on:
             if _dump_fh is not None:
@@ -1034,6 +1067,23 @@ def main(args, resume_preempt=False):
 
             clips, masks_enc, masks_pred = load_clips()
             data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
+
+            # Pre-step barrier (no-op unless VJEPA_SCALE_PROBE=1). Placed OUTSIDE
+            # train_step so the true_accum path -- which fetches its extra batches
+            # mid-step -- is unaffected. Synchronize the device first: without it
+            # this would time the drain of our own async H2D copies rather than the
+            # wait for other ranks. Safe on XPU mid-training (train.py already
+            # barriers during startup); the known XPU barrier hazard is early
+            # bootstrap before device pinning.
+            barrier_ms = 0.0
+            if _scale_probe and world_size > 1:
+                if device.type == "xpu":
+                    torch.xpu.synchronize()
+                elif device.type == "cuda":
+                    torch.cuda.synchronize()
+                _b0 = time.time()
+                torch.distributed.barrier()
+                barrier_ms = (time.time() - _b0) * 1000.0
 
             if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
                 logger.info("Running garbage collection...")
@@ -1145,10 +1195,23 @@ def main(args, resume_preempt=False):
                 # so XPU/CUDA both take the bf16 path. torch.cuda.amp.autocast
                 # silently disables autocast when CUDA is absent (measured on
                 # Aurora), falling back to fp32 and tanking throughput.
-                def _forward_losses(clips_mb, menc_mb, mpred_mb):
+                # `mark_fwd`: only the FIRST micro-batch is timed (callers pass
+                # j == 0), matching the pre-existing convention that fwd-* columns
+                # describe micro-batch 0 while backward-ms covers the whole step.
+                def _forward_losses(clips_mb, menc_mb, mpred_mb, mark_fwd=True):
                     with torch.amp.autocast(device_type=device.type, dtype=dtype,
                                             enabled=mixed_precision):
                         h = forward_target(clips_mb)
+                        # Split the forward here rather than after it. Every caller
+                        # used to fire fwd_target_done and fwd_context_done on
+                        # adjacent lines AFTER this function returned, so
+                        # fwd-context-ms was always ~0 and fwd-target-ms silently
+                        # held the ENTIRE forward. That made "the forward blew up at
+                        # 64n" un-attributable between the target encoder and the
+                        # context encoder + predictor. NOTE FOR HISTORICAL CSVs:
+                        # old fwd-target-ms == new (fwd-target-ms + fwd-context-ms).
+                        if mark_fwd:
+                            phase_timer.mark("fwd_target_done")
                         z_pred, z_context = forward_context(
                             clips_mb, menc_mb, mpred_mb
                         )
@@ -1176,6 +1239,8 @@ def main(args, resume_preempt=False):
                             else:
                                 lambda_value_step = lambda_value
                             loss = loss + loss_context * lambda_value_step
+                    if mark_fwd:
+                        phase_timer.mark("fwd_context_done")
                     return loss, loss_pred, loss_context, lambda_value_step
 
                 # Step 2. Backward & step.
@@ -1204,11 +1269,10 @@ def main(args, resume_preempt=False):
                             c_j, me_j, mp_j = clips, masks_enc, masks_pred
                         else:
                             c_j, me_j, mp_j = load_clips(fetch_sample())
-                        l, lp, lc, lvs = _forward_losses(c_j, me_j, mp_j)
+                        l, lp, lc, lvs = _forward_losses(
+                            c_j, me_j, mp_j, mark_fwd=(j == 0)
+                        )
                         lambda_value_step = lvs
-                        if j == 0:
-                            phase_timer.mark("fwd_target_done")
-                            phase_timer.mark("fwd_context_done")
                         l = l / true_accum
                         is_last = j == true_accum - 1
                         sync_ctx = (
@@ -1233,8 +1297,6 @@ def main(args, resume_preempt=False):
                     loss, loss_pred, loss_context, lambda_value_step = _forward_losses(
                         clips, masks_enc, masks_pred
                     )
-                    phase_timer.mark("fwd_target_done")
-                    phase_timer.mark("fwd_context_done")
                     if loss_reg_std_mult is not None:
                         meanval = np.mean(trailing_losses)
                         stdval = np.std(trailing_losses)
@@ -1287,11 +1349,10 @@ def main(args, resume_preempt=False):
                         clips_mb = [c[sl] for c in clips]
                         menc_mb = [[m[sl] for m in mm] for mm in masks_enc]
                         mpred_mb = [[m[sl] for m in mm] for mm in masks_pred]
-                        l, lp, lc, lvs = _forward_losses(clips_mb, menc_mb, mpred_mb)
+                        l, lp, lc, lvs = _forward_losses(
+                            clips_mb, menc_mb, mpred_mb, mark_fwd=(j == 0)
+                        )
                         lambda_value_step = lvs
-                        if j == 0:
-                            phase_timer.mark("fwd_target_done")
-                            phase_timer.mark("fwd_context_done")
                         l = l / grad_accum
                         is_last = j == grad_accum - 1
                         sync_ctx = (
@@ -1455,6 +1516,7 @@ def main(args, resume_preempt=False):
                     lambda_value_step_val,
                     l0_free_mib,
                     l0_ext_mib,
+                    barrier_ms,
                 )
                 if (
                     (itr % log_freq == 0)

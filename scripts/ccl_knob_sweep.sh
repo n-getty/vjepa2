@@ -197,7 +197,10 @@ if len(res) > 1:
             print(f"    {name:16s} {spd:5.2f}x   ({verdict})")
         print("\n  An overlapping IQR means this sample does not separate the arms.")
         print("  Do not report a winner from it -- lengthen the arms and repeat.")
-print("\n  Wall-clock iter time only. backward-ms is unusable: XPU event deltas")
-print("  go NEGATIVE on stalled collectives, i.e. exactly what this measures.")
+print("\n  Wall-clock iter time for the verdict above. backward-ms IS usable if you")
+print("  unwrap it: a negative XPU event delta is a 32-bit counter rollover")
+print("  (80 ns tick -> 343597.38368 ms period), not a broken timer. Add one")
+print("  period. See scripts/scaling_efficiency.py:unwrap and the measurement")
+print("  notes in docs/THROUGHPUT_RECIPE_AURORA.md (verified 2026-08-06).")
 PY
 echo "JOB END $(date)"
