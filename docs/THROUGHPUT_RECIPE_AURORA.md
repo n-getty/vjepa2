@@ -847,6 +847,36 @@ informative exception — already GOP-30, so its cost is pixels and it needs the
 was drawn from. Sample count and frame count are preserved exactly — this
 changes the *cost* of the corpus, not its content.
 
+#### ⚠️ At the corpus level the win is 1.6–3×, not 7–8×
+
+Every ratio above this line — the 8.2×/8.8×/4.4× intervention arm, the 3.16 s
+per-source table, and the 7.1× directly above — is **one clip** decoded with a
+**16-frame scatter across the whole video**. The trainer does not do that. It
+seeks once into a *single 64-frame window* and `linspace`s 16 frames inside it
+(`src/datasets/webdataset.py:375-383`). A scatter forces 16 independent seeks
+and is the access pattern GOP helps most; the predictor that fit best,
+`min(16·GOP, frames)` at r=0.70, only *means* anything for 16 independent seeks.
+
+Measured over n=200 paired clips per source (job 8740990 + follow-up, harness
+`scripts/decode_per_source_profile.py`, which mirrors the trainer's window):
+
+| source | p50 base | p50 g16 | **p50 ratio** | max base | max g16 | max ratio |
+|---|---|---|---|---|---|---|
+| cholec80 | 365 ms | 159 ms | **2.30×** | 2362 ms | 790 ms | 2.99× |
+| surgvu24_clean | 265 ms | 168 ms | **1.58×** | 997 ms | 218 ms | 4.57× |
+
+A backfill model accounts for it: cost ≈ decode(64-frame window) +
+decode(≈GOP/2 frames of backfill from the previous keyframe). Solving the two
+pairs gives a 64-frame window at 145/161 ms (2.26 and 2.52 ms/frame, two
+different resolutions landing in the same place) and backfill at 0.8–1.8
+ms/frame. GOP-249 → GOP-16 removes ~116 backfill frames, worth ~100–200 ms —
+which is the whole observed delta. **The re-encode did exactly what the
+mechanism predicts; the 7–8× expectation was measuring a different workload.**
+
+Take the corpus numbers, not the clip numbers, and note the tail improves more
+than the median (3.0–4.6× vs 1.6–2.3×) — consistent with GOP mainly buying back
+the unlucky-seek draws.
+
 Two process notes worth more than the numbers:
 
 - The first manifest recorded `short_side: 512` for an encode that ran at 0.
@@ -858,6 +888,20 @@ Two process notes worth more than the numbers:
 - Blanket downscaling would have been an *upscale* here: cholec80 is 854×480,
   below the 512 target. Check the source resolution before reaching for the
   pixel lever.
+- **The first corpus benchmark was not a paired comparison**, and it announced
+  itself as a content change rather than as a measurement bug.
+  `WebDataset(resampled=True)` reaches `ResampledShardList(urls)` through
+  `create_url_iterator()` **with no seed forwarded**, and `ResampledShards`
+  then mixes `time_ns()`, `getpid()` and `os.urandom(4)` into its own — so
+  neither `seed=` nor `np.random.seed()` pins it, and a source and its `_g16`
+  twin streamed *different videos*. The visible symptom was `frac<1.0` going
+  0.015 → 0.000 and clip-std min 0.00 → 28.72 across the surgvu24 pair, i.e.
+  exactly the signature of "the re-encode altered corpus content" — the one
+  thing this intervention promised not to do — and in fact 3 different clips
+  out of 200. Now `resampled=False` plus a seeded frame window (`520e0ce`);
+  verified paired on cholec80 with identical frame counts and clip std matching
+  to 2 dp. The paired ratio moved 2.30× → ~3.0×, so the defect was also
+  *understating* the win.
 
 **Scope.** This moves the body of the dataload distribution — p50, mean, p90 —
 permanently and offline. It does not touch the tail, for the reason the next
