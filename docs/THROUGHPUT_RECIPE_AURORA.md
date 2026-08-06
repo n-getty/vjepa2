@@ -16,8 +16,10 @@ Companion docs: `SCALEOUT_256N_STATUS.md` (the 256-node path and its blockers),
 > node), and it does not get worse with scale — the dataload p90 *falls* from
 > 13.88 s at 1n to 6.54 s at 256n, which rules out DAOS bandwidth saturation.
 > The stall is **overlappable I/O latency**: `num_workers=2` is **2.00× total
-> wall** at 2n — but it currently **hangs on teardown**, so it is not yet a
-> default. Before tuning another CCL knob, read "Where the time actually goes".
+> wall** at 2n — but two of its 24 ranks did not reach a clean process exit, so
+> it is not yet a default. A `VJEPA_HARD_EXIT` fix is in but **not yet
+> hardware-validated**. Before tuning another CCL knob, read "Where the time
+> actually goes".
 
 ---
 
@@ -535,32 +537,62 @@ prefetch queue runs dry. Consequences, all of which bit here:
   2.00× with overlapping ones ([[ab-window-truncation-trap]]).
 A synchronous run pays the **sum** of its iterations, so total wall governs.
 
-🛑 **`num_workers=2` is NOT a default — the arm hung on teardown.** All 24 ranks
-wrote all 40 rows (training completed everywhere) but the rung never returned.
-Ranks 12 and 15, both on node 2, died with an uncaught
-`terminate called after throwing an instance of 'std::system_error' / what(): No
-such file or directory`, and the survivors blocked forever on the dead peers.
-**Zero ranks in the `nw0` arm showed it.** An unattended run would burn its
-remaining allocation on the hang.
+🛑 **`num_workers=2` is NOT a default — the arm did not exit.** Read the full
+timeline before theorising; a first pass over these artifacts got it wrong twice.
 
-Cause is a hypothesis, not a diagnosis — the throw was not traced. That errno is
-what a DataLoader worker's shm/socket file already being unlinked at parent
-teardown looks like, which fits the forking arm showing it and the non-forking
-arm not. It is *distinct* from the `xccl`-fork deadlock `train.py:207-211` guards
-against; don't conflate them.
+| time | event |
+|---|---|
+| 15:46:53 | all 24 ranks write CSV row 39 — **training completed everywhere** |
+| 15:47:02-03 | ranks 12 and 15 (node 2) throw and die |
+| 15:47:12 | rank 0 finishes `latest.pth.tar`, 15.0 GB — **checkpoint completed too**, 9 s after those ranks were already gone |
+| 16:25:45 | PBS SIGTERM at the walltime cap; rank 0 throws the **same** exception |
+
+The exception in every case is
+`terminate called after throwing an instance of 'std::system_error' / what(): No
+such file or directory`.
+
+Two corrections to the obvious reading:
+- **Three ranks threw, not two.** Rank 0 — which finished the checkpoint and
+  looked like a clean survivor — threw the identical exception when PBS killed it.
+  So that text is what an ordinary signal-kill produces on this stack, **not a
+  signature unique to forked DataLoader workers.**
+- **Nothing was blocked by the deaths.** Rank 0 wrote a complete, correctly-sized
+  checkpoint after ranks 12/15 were dead.
+
+What is actually specific to `nw2`: **two ranks exited early, on their own, after
+their work was done.** Zero `nw0` ranks did. State it that way. Whether the throw
+is causal or is itself a symptom of the shutdown path is **not established** — it
+was never traced to a frame.
 
 **Do not propose the two obvious mitigations — they were already on.**
 `app/main_dist_aurora.py:39` sets `MP_SOCKET_DIR=/tmp` at module load under
 `--train_mode`, and `:357` calls `set_sharing_strategy("file_system")` inside
-`run_training()`, the ladder's path. The crash happens despite both. The
-untested lever is **`persistent_workers`**: `app/vjepa_2_1/train.py:217` records
-that it is not plumbed through `init_data`, so it is effectively False and
-workers are re-forked around each epoch — and the crash landed exactly at
-teardown. `app/vjepa/train.py:260` and `app/vjepa_droid/droid.py:66` both pass it
-(default True); the 2.1 trainer is the outlier.
+`run_training()`, the ladder's path. The crash happens despite both.
+
+**Fix shipped (not yet hardware-validated): `VJEPA_HARD_EXIT`, default on.**
+`run_training()`'s `finally` now calls `os._exit()` after
+`destroy_process_group()`. A throw out of a C++ destructor at interpreter
+shutdown cannot be caught in Python, so the fix leaves *before* the destructors
+run — everything durable (checkpoint, per-rank CSV, logs) is fsynced by then.
+The exit code comes from `sys.exc_info()`, never a literal 0: this sits in a
+`finally`, so a hardcoded `os._exit(0)` would report every real crash as rc=0.
+Set `VJEPA_HARD_EXIT=0` for a normal exit when debugging the throw.
+
+Remaining untested lever if the hard exit proves insufficient:
+**`persistent_workers`**. `app/vjepa_2_1/train.py:217` records that it is not
+plumbed through `init_data`, so it is effectively False and workers are re-forked
+around each epoch. `app/vjepa/train.py:260` and `app/vjepa_droid/droid.py:66`
+both pass it (default True); the 2.1 trainer is the outlier.
 
 Also unproven at scale: the failure appeared on node 2 of 2, so it is not
 obviously scale-free and needs a 64n hazard arm ([[scale-dependent-results-dont-transfer]]).
+
+⚠️ **The ladder's watchdog never armed for either rung** — `pid=$(start_watchdog)`
+blocks until the backgrounded subshell exits, so it returned a corpse's pid. That
+is why nothing reaped this hang and why the job's third rung was lost; an armed
+watchdog would have killed it at 15:53:53. Fixed (`RUNG_WD_PID=$!` + a start grace
+period + a `kill -0` arming check). Both fixes are pinned by
+`tests/test_aurora_teardown_and_watchdog.py`, mutation-verified.
 
 **Why this is not a probe artifact.** The 64n and 256n CSVs are **16 columns** —
 they predate the barrier probe entirely — yet show the same flat floor and the

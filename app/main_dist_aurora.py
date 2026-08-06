@@ -43,6 +43,7 @@ import datetime
 import pprint
 import shutil
 import subprocess
+import traceback
 from pathlib import Path
 
 import yaml
@@ -433,6 +434,53 @@ def run_training(args):
         import torch.distributed as dist
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()
+
+        # Aurora teardown guard. Job 8739712's num_workers=2 arm did all its work
+        # and still never returned: all 24 ranks wrote all 40 CSV rows at 15:46:53
+        # and rank 0 finished the 15.0 GB checkpoint at 15:47:12. Ranks 12 and 15
+        # had already exited at 15:47:02-03 with an uncaught
+        #   terminate called after throwing an instance of 'std::system_error'
+        #   what():  No such file or directory
+        # thrown from a C++ destructor at interpreter shutdown. The rung then sat
+        # until the walltime cap.
+        #
+        # Read that exception carefully: rank 0 threw the SAME one at 16:25:45,
+        # when PBS sent SIGTERM. So it is what an ordinary signal-kill looks like
+        # on this stack, not a signature unique to forked DataLoader workers, and
+        # it was never traced to a frame -- whether it is causal or itself a
+        # symptom of the shutdown path is not established. What IS specific to the
+        # nw2 arm is that two ranks left early, on their own, after their work was
+        # done; zero nw0 ranks in the same allocation did.
+        #
+        # `MP_SOCKET_DIR=/tmp` (module top) and set_sharing_strategy("file_system")
+        # (below) were BOTH already active -- do not re-propose them as the fix.
+        #
+        # A throw out of a destructor during shutdown cannot be caught in Python,
+        # so this does not try. It leaves the interpreter before the destructors
+        # run: everything that must be durable (checkpoint, per-rank CSV, logs) is
+        # already fsynced by this point, and destroy_process_group() above has
+        # released the collectives. os._exit skips atexit handlers and static
+        # destructors by design -- that is the entire point here.
+        #
+        # Opt-out with VJEPA_HARD_EXIT=0 if you need a normal exit to debug the
+        # throw (e.g. under gdb, or to let faulthandler dump).
+        #
+        # The exit CODE must not be hardcoded to 0. This runs in a `finally`, so
+        # it also executes while a real exception is propagating -- exiting 0
+        # there would turn every crash into a silent success and mpiexec would
+        # report rc=0 on a run that trained nothing. sys.exc_info() is still
+        # populated during finally-on-exception, so use it to pick the code, and
+        # print the traceback first since os._exit skips Python's own handler.
+        if os.environ.get("VJEPA_HARD_EXIT", "1") == "1":
+            _exc = sys.exc_info()[0]
+            if _exc is not None:
+                traceback.print_exc()
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(1 if _exc is not None else 0)
 
 
 if __name__ == "__main__":

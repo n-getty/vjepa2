@@ -172,11 +172,28 @@ RUNTIME_CFG=$ROOT/.runtime_configs/n${NNODES}g${PPN}_weak/configs/vitg16_surg_vi
 # Per-rung stall watchdog. Same shape as vitG384_256n_daos.sh:297-331, but scoped
 # to ONE rung: it must not outlive its rung or it would kill the next one, so it
 # is started before mpiexec and killed after.
+#
+# Returns the pid in the GLOBAL `RUNG_WD_PID`, never on stdout. This is not
+# style. `pid=$(start_rung_watchdog ...)` -- the obvious spelling, and what this
+# function did through job 8739712 -- silently disarms the watchdog: command
+# substitution reads until the pipe closes, and the backgrounded subshell holds
+# that pipe open for as long as it lives, so the caller blocks until the subshell
+# EXITS. At rung start no `app.main_dist_aurora` is running yet, so the first
+# pgrep below fails 30 s later, the subshell exits 0, and the substitution hands
+# back the pid of a corpse. Job 8739712 ran both rungs completely unwatched and
+# burned 25 min of its slot on a hang nothing reaped. Assign from $! instead.
+#
+# The grace period exists for the same reason: mpiexec needs time to start python
+# on every node, and a watchdog whose liveness test is "is the trainer running"
+# must not run that test before the trainer can possibly exist.
+RUNG_WD_PID=""
+WD_START_GRACE=${VJEPA_LADDER_WD_START_GRACE:-180}
 start_rung_watchdog () {
     local csv="$1" tag="$2" diag="$3"
     mkdir -p "$diag"
     (
         start=$(date +%s); last_rows=-1; last_change=$start
+        sleep $WD_START_GRACE
         while true; do
             sleep 30
             pgrep -f "app.main_dist_aurora" >/dev/null 2>&1 || exit 0
@@ -205,7 +222,7 @@ start_rung_watchdog () {
             fi
         done
     ) &
-    echo $!
+    RUNG_WD_PID=$!
 }
 
 run_rung () {
@@ -275,7 +292,17 @@ PY
     [ $? -eq 0 ] || { echo "  rung $spec: config rewrite FAILED"; return 1; }
 
     echo "===== RUNG $name : ${R}n x ${PPN} = ${W} ranks, ipe=$ipe, num_workers=$nw, scale_probe=$probe ====="
-    local wd_pid; wd_pid=$(start_rung_watchdog "$dir/log_r0.csv" "$name" "$dir/hang_diag")
+    # Sets RUNG_WD_PID -- see the note on start_rung_watchdog for why this must
+    # not be a command substitution. Verify it armed: a silently-dead watchdog is
+    # exactly the failure that cost job 8739712 half its slot, and it is
+    # invisible unless something checks.
+    start_rung_watchdog "$dir/log_r0.csv" "$name" "$dir/hang_diag"
+    local wd_pid=$RUNG_WD_PID
+    if kill -0 "$wd_pid" 2>/dev/null; then
+        echo "  watchdog armed pid=$wd_pid (grace ${WD_START_GRACE}s, stall ${STALL_DEADLINE}s, first-iter ${FIRST_ITER_DEADLINE}s)"
+    else
+        echo "  WARNING: watchdog for $name did NOT arm -- rung runs unwatched" >&2
+    fi
     local t0=$(date +%s)
     # --no-vni: DAOS RPCs fail NA_HOSTUNREACH without it.
     # -o/-e per rank: never funnel 3072 ranks' stdout through the head node,
