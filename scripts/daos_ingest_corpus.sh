@@ -106,6 +106,21 @@ echo "mounted $POOL:$CONT at $MNT"
 SOURCES=(small_surg sitl surgenet_robotic_clean surgtoolloc2022 surgvu24_clean
          grasp_noleak cholec80 sitl_2026 lemon heichole_512 multibypass140
          gynsurg lapgyn6_events surgenet_lap openh)
+# Override for an INCREMENTAL ingest, e.g. adding only the GOP re-encoded twins:
+#   -v INGEST_SOURCES="cholec80_g16 surgvu24_clean_g16 lemon_g16 sitl_2026_g16_512"
+# The g16 set is a NET -82 GB against the originals (1999 -> 1917 GB), so it adds
+# no capacity pressure even while both copies coexist -- and both must coexist,
+# because the swap has to be revertible and A/B-able against the originals.
+#
+# pe_video is appended by the batch farm and by the verifier unconditionally
+# below, which is wrong for a subset ingest: it would re-copy a source that is
+# already in the container and then report it as part of this job's result.
+# INGEST_PE=0 suppresses it.
+if [[ -n "${INGEST_SOURCES:-}" ]]; then
+  read -r -a SOURCES <<< "$INGEST_SOURCES"
+  echo "SOURCE OVERRIDE: ingesting ${#SOURCES[@]} source(s): ${SOURCES[*]}"
+fi
+INGEST_PE=${INGEST_PE:-1}
 
 T0=$(date +%s)
 FAILED=0
@@ -161,9 +176,15 @@ if [[ "${INGEST_BATCH:-1}" == "1" ]]; then
   for s in "${SOURCES[@]}"; do
     [[ -d "$SRC_ROOT/$s" ]] && ln -s "$SRC_ROOT/$s" "$FARM/$s"
   done
-  [[ -d "$PE_SRC" ]] && ln -s "$PE_SRC" "$FARM/pe_video"
+  [[ "$INGEST_PE" == "1" && -d "$PE_SRC" ]] && ln -s "$PE_SRC" "$FARM/pe_video"
   echo "=== BATCH MODE: one dsync over $(ls "$FARM" | wc -l) linked sources ==="
   t=$(date +%s)
+  # NEVER add -D/--delete here. dsync's job is to make the target MATCH the
+  # source, and in batch mode the target is the whole container while the source
+  # is a farm holding only the sources THIS invocation was asked for. With -D, an
+  # incremental ingest (INGEST_SOURCES=...) would delete every source not in the
+  # farm -- i.e. the entire live corpus -- and dsync would exit 0 having done it.
+  # Copy-only is load-bearing, not an oversight.
   mpiexec -n $((NODES * PPN)) -ppn $PPN --cpu-bind none --no-vni \
       dsync --progress 30 --bufsize 64MB --dereference "$FARM" "$MNT" \
     || { echo "  DSYNC FAILED (batch)"; FAILED=1; }
@@ -171,7 +192,7 @@ if [[ "${INGEST_BATCH:-1}" == "1" ]]; then
   rm -rf "$FARM"
 else
   for s in "${SOURCES[@]}"; do copy_one "$s" "$SRC_ROOT/$s"; done
-  copy_one pe_video "$PE_SRC"
+  [[ "$INGEST_PE" == "1" ]] && copy_one pe_video "$PE_SRC"
 fi
 
 DT=$(( $(date +%s) - T0 ))
@@ -185,7 +206,9 @@ DT=$(( $(date +%s) - T0 ))
   echo "elapsed ${DT}s on ${NODES} nodes x ${PPN} ranks"
   echo
   bad=0
-  for s in "${SOURCES[@]}" pe_video; do
+  VERIFY_LIST=("${SOURCES[@]}")
+  [[ "$INGEST_PE" == "1" ]] && VERIFY_LIST+=(pe_video)
+  for s in "${VERIFY_LIST[@]}"; do
     d=$MNT/$s
     [[ -d "$d" ]] || { echo "  MISSING  $s"; bad=1; continue; }
     src=$SRC_ROOT/$s; [[ "$s" == "pe_video" ]] && src=$PE_SRC
