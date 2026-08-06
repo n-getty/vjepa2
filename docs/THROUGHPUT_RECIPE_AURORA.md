@@ -15,7 +15,9 @@ Companion docs: `SCALEOUT_256N_STATUS.md` (the 256-node path and its blockers),
 > is the intra-node decode tail (p10 0.48 s vs p90 13.88 s across 12 ranks on ONE
 > node), and it does not get worse with scale — the dataload p90 *falls* from
 > 13.88 s at 1n to 6.54 s at 256n, which rules out DAOS bandwidth saturation.
-> Before tuning another CCL knob, see the "Where the time actually goes" section.
+> The stall is **overlappable I/O latency**: `num_workers=2` is **2.00× total
+> wall** at 2n — but it currently **hangs on teardown**, so it is not yet a
+> default. Before tuning another CCL knob, read "Where the time actually goes".
 
 ---
 
@@ -508,12 +510,57 @@ ranks 3/6/11 sit at 1.0 s; itrs 3/9/10 = nobody over 10 s. Per-rank means are
 3.6–7.5 s with **no persistently slow tile**, so it is not a bad device, and the
 correlation rules out independent per-rank shard-content variation.
 
-Two hypotheses, **not yet separated** — do not label this until the arm reports:
-(a) CPU oversubscription from inline decode at `num_workers=0` (12 ranks ×
-`OMP_NUM_THREADS=16` = 192 threads on 104 physical cores, 1.85×);
-(b) shared per-node DAOS/dfuse client contention.
-The `nw2` arm discriminates: if cores, `num_workers=2` barely helps; if I/O
-latency, prefetch overlap hides it.
+**5. RESOLVED — it is overlappable I/O latency, not CPU starvation** (job
+8739712, rungs `2 2:nw2`, 38 commonly-covered iters, `scripts/nw_arm_report.py`):
+
+| arm | median iter | **total wall** | dataload | iters at 3.6 s floor |
+|---|---|---|---|---|
+| n2_nw0 | 14.76 s | **624 s** | 11.71 s | **0/38** |
+| n2_nw2 | 3.43 s | **312 s** | 0.00 s | **21/38** |
+
+Adding worker processes to a node already running 192 threads on 104 physical
+cores made it **2.00× faster in total wall**. If cores were the binding
+constraint that could not happen, so hypothesis (a), CPU oversubscription, is
+dead. `iter − dataload` is unmoved (3.09 → 3.18 s): compute untouched, prefetch
+simply hides the wait.
+
+**Quote total wall (2.00×), not the median (4.30×).** `nw2` is bimodal — a hard
+3.2 s floor with dataload exactly 0.00 on 26 of 38 iterations, spiking when the
+prefetch queue runs dry. Consequences, all of which bit here:
+- the median sits on the floor and overstates the win;
+- the **IQR rule reports "not separated"** (9.63–22.19 vs 3.19–11.88) even though
+  the arm is twice as fast — that rule assumes unimodal arms. The floor counts
+  (21/38 vs 0/38) are the statistic that is not fooled;
+- a 21-iteration window said 4.59× with *disjoint* IQRs. The full window said
+  2.00× with overlapping ones ([[ab-window-truncation-trap]]).
+A synchronous run pays the **sum** of its iterations, so total wall governs.
+
+🛑 **`num_workers=2` is NOT a default — the arm hung on teardown.** All 24 ranks
+wrote all 40 rows (training completed everywhere) but the rung never returned.
+Ranks 12 and 15, both on node 2, died with an uncaught
+`terminate called after throwing an instance of 'std::system_error' / what(): No
+such file or directory`, and the survivors blocked forever on the dead peers.
+**Zero ranks in the `nw0` arm showed it.** An unattended run would burn its
+remaining allocation on the hang.
+
+Cause is a hypothesis, not a diagnosis — the throw was not traced. That errno is
+what a DataLoader worker's shm/socket file already being unlinked at parent
+teardown looks like, which fits the forking arm showing it and the non-forking
+arm not. It is *distinct* from the `xccl`-fork deadlock `train.py:207-211` guards
+against; don't conflate them.
+
+**Do not propose the two obvious mitigations — they were already on.**
+`app/main_dist_aurora.py:39` sets `MP_SOCKET_DIR=/tmp` at module load under
+`--train_mode`, and `:357` calls `set_sharing_strategy("file_system")` inside
+`run_training()`, the ladder's path. The crash happens despite both. The
+untested lever is **`persistent_workers`**: `app/vjepa_2_1/train.py:217` records
+that it is not plumbed through `init_data`, so it is effectively False and
+workers are re-forked around each epoch — and the crash landed exactly at
+teardown. `app/vjepa/train.py:260` and `app/vjepa_droid/droid.py:66` both pass it
+(default True); the 2.1 trainer is the outlier.
+
+Also unproven at scale: the failure appeared on node 2 of 2, so it is not
+obviously scale-free and needs a 64n hazard arm ([[scale-dependent-results-dont-transfer]]).
 
 **Why this is not a probe artifact.** The 64n and 256n CSVs are **16 columns** —
 they predate the barrier probe entirely — yet show the same flat floor and the
