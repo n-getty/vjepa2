@@ -96,6 +96,37 @@ Indistinguishable, which is what a refactor that preserves the recipe should
 look like. See `THROUGHPUT_RECIPE_AURORA.md` for the table and the note that the
 headroom difference is tail, not level.
 
+**Validated at 256 nodes** (job 8736390, `debug-scaling`, rc=0, **50 iters in
+1780 s, all 3072 ranks logging every iteration**). This is the run the promotion
+was for, and the first time the global-batch assertion passed *on its own*:
+`3072 ranks x bs 2 x accum 1 = 6144` against `lbA`'s derived 6148. At 2n it had
+to be overridden, because 24 ranks cannot produce 6144.
+
+| | value | note |
+|---|---|---|
+| iter time, max over 3072 ranks | 23.55 s median (IQR 19.27-27.17), iters 3-49 | 41.4 s worst |
+| clips/s | **260.9** at gb 6144 | 0.085 clips/s/tile |
+| min `l0-free` over all ranks | **7.11 GiB** | vs 7.82 at 64n — did NOT fall |
+| median `l0-free` | 14.20 GiB | rank 0 alone said 13.97 |
+| loss | 0.3401 → 0.3452, min 0.3131, all finite | 50 iters is noise, not a curve |
+| hangs | **none** — watchdog never fired, all 3072 stack dumps 0 bytes | |
+
+Two readings that would be wrong. First, **do not compare 260.9 clips/s to the
+64n run's 61.0** — different global batch and different rank count; the
+comparable figure is per-tile, 0.0736 vs 0.0794 on the matched window 3-21
+(93%), and even that is a 19-iteration shakeout against the same, so it is a
+sanity check rather than a scaling measurement. Second, **the 7.11 GiB floor is
+not a transient**: 8 ranks of 3072 sit at 7-9 GiB for all 50 iterations (rank
+2735 at 7276 MiB on every one) while the other 3064 sit near 14.2. A stable
+per-rank offset is the better version of that news — nothing is eating headroom
+as the run proceeds — but it is those 8 ranks that bound the batch.
+
+Two decode errors (`DECORDError`, corrupt clip) appeared across 3072 ranks and
+are benign: `src/datasets/webdataset.py:383` catches them, returns `None`, and
+the resampled stream draws the next sample. They log a full traceback at ERROR
+level, so a naive `grep -c Traceback` over the rank logs reports a failure that
+did not happen.
+
 Whether gb=6144 *trains* as well as gb=3072 is a separate, still-open question —
 the `lbA`/`lbB` capacity A/B. This change only makes the schedule self-consistent
 at whatever batch is run.

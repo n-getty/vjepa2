@@ -241,11 +241,26 @@ crop / fpcs / mask / loss / ckpt), min over ranks:
 | 2 | 2 | off | **11.9 GiB** | 8736104 |
 | 16 | 2 | off | **1.8 GiB** | v2 |
 | 64 | 2 | off | **4.6 GiB** | 8735877 |
+| 64 | 2 | off | **7.8 GiB** | 8736153 |
+| 256 | 2 | off | **7.1 GiB** | 8736390 |
 
 HSDP shards optimizer state intra-node (12 tiles) and replicates inter-node, so
 what grows with node count is the replicate dim and its fabric transients. A
 2-node run is the *most* headroom that will ever be observed — sizing a batch off
 it is [[scale-dependent-results-dont-transfer]] in its most expensive form.
+
+**What 256n actually showed (job 8736390), which is narrower than "headroom
+shrinks":** the floor did *not* keep falling — 7.1 GiB at 3072 ranks against
+7.8 GiB at 768 in the run right before it. The pessimistic reading of the table
+above would have predicted worse. What the 256n data adds is the *shape* of the
+distribution: the per-rank median is 14.2 GiB and 3064 of 3072 ranks sit near it,
+while **8 ranks sit at 7-9 GiB for all 50 iterations** — a stable per-rank offset,
+not a transient dip (rank 2735 was at 7276 MiB on every single iteration). So the
+spread is ~7 GiB wide and one-sided, and it is those 8 ranks, not the median, that
+a bigger batch has to fit. The 2n → 16n → 64n column is best read as "the minimum
+is set by a few persistently-tight ranks whose number grows with scale", which is
+why min-over-ranks is the only safe statistic. bs=3 needs ~9 GiB more than bs=2
+per point 1; the tight ranks do not have it at any measured scale.
 
 **3. Read the MIN over ranks, not rank 0.** On job 8736104 rank 0 reported 14,564
 MiB while the tightest rank (12) held 11,943 MiB — a 2.6 GiB spread across 24
