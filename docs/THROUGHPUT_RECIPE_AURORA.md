@@ -15,11 +15,12 @@ Companion docs: `SCALEOUT_256N_STATUS.md` (the 256-node path and its blockers),
 > is the intra-node decode tail (p10 0.48 s vs p90 13.88 s across 12 ranks on ONE
 > node), and it does not get worse with scale — the dataload p90 *falls* from
 > 13.88 s at 1n to 6.54 s at 256n, which rules out DAOS bandwidth saturation.
-> The stall is **overlappable I/O latency**: `num_workers=2` is **2.00× total
-> wall** at 2n — but two of its 24 ranks did not reach a clean process exit, so
-> it is not yet a default. A `VJEPA_HARD_EXIT` fix is in but **not yet
-> hardware-validated**. Before tuning another CCL knob, read "Where the time
-> actually goes".
+> The stall is **overlappable I/O latency**: `num_workers=2` is **1.95× total
+> wall** at 2n (reproduced on a second allocation), and the barrier column proves
+> it — at nw0 ranks wait 11.35 s in the pre-step barrier against an 11.71 s
+> dataload. Still **not a default**: 2 of 24 ranks throw at teardown (0 of 24 at
+> nw0), and on short rungs the worker-fork overhead cuts the win to 1.27×.
+> Before tuning another CCL knob, read "Where the time actually goes".
 
 ---
 
@@ -569,16 +570,37 @@ was never traced to a frame.
 `--train_mode`, and `:357` calls `set_sharing_strategy("file_system")` inside
 `run_training()`, the ladder's path. The crash happens despite both.
 
-**Fix shipped (not yet hardware-validated): `VJEPA_HARD_EXIT`, default on.**
-`run_training()`'s `finally` now calls `os._exit()` after
-`destroy_process_group()`. A throw out of a C++ destructor at interpreter
-shutdown cannot be caught in Python, so the fix leaves *before* the destructors
-run — everything durable (checkpoint, per-rank CSV, logs) is fsynced by then.
-The exit code comes from `sys.exc_info()`, never a literal 0: this sits in a
-`finally`, so a hardcoded `os._exit(0)` would report every real crash as rc=0.
-Set `VJEPA_HARD_EXIT=0` for a normal exit when debugging the throw.
+**Fix shipped: `VJEPA_HARD_EXIT`, default on.** `run_training()`'s `finally`
+calls `os._exit()` after `destroy_process_group()`. The exit code comes from
+`sys.exc_info()`, never a literal 0: this sits in a `finally`, so a hardcoded
+`os._exit(0)` would report every real crash as rc=0. Set `VJEPA_HARD_EXIT=0` for
+a normal exit when debugging the throw.
 
-Remaining untested lever if the hard exit proves insufficient:
+### Hardware validation, job 8739914 (2n, `2:nw2 2 2:probe0`) — partial
+
+The rung **returns** now (`rc=0 in 554s`, 24/24 rank CSVs; previously it never
+returned). But the throw is **still there**, and the hard exit is **not proven to
+be the reason** it now returns.
+
+- 2 of 24 ranks (0 and 22) threw the identical `std::system_error`.
+- Rank exits: 21 at 16:52:11, then :13, :24, **:42** — a 31 s straggle.
+- Rank 0's stdout logs `clip-diag` at 16:52:16-17, i.e. **DataLoader workers were
+  still decoding after `avg. loss` printed.**
+
+That contradicts the mechanism claimed above this section. If the throw came from
+a destructor at interpreter shutdown, `os._exit()` would skip it and rank 0 would
+have left with the other 21; it left 32 s later. The throw and the straggle occur
+during worker-pool teardown *inside* `app_main`, **before** the `finally` is
+reached — so the hard exit cannot be what clears them, and may be doing nothing
+here. One job cannot separate "the fix worked" from "this run differed"; do not
+write it up as validated.
+
+What this run *does* establish, controlled (same allocation, same hour): nw2 threw
+on **2/24** ranks, nw0 on **0/24**; exit spread 31 s vs 3 s. The earlier version
+of that claim compared across a job boundary.
+
+Remaining untested lever, now the leading candidate given where the throw
+actually occurs:
 **`persistent_workers`**. `app/vjepa_2_1/train.py:217` records that it is not
 plumbed through `init_data`, so it is effectively False and workers are re-forked
 around each epoch. `app/vjepa/train.py:260` and `app/vjepa_droid/droid.py:66`
@@ -593,6 +615,44 @@ is why nothing reaped this hang and why the job's third rung was lost; an armed
 watchdog would have killed it at 15:53:53. Fixed (`RUNG_WD_PID=$!` + a start grace
 period + a `kill -0` arming check). Both fixes are pinned by
 `tests/test_aurora_teardown_and_watchdog.py`, mutation-verified.
+**Watchdog fix is hardware-validated**: job 8739914 printed `watchdog armed
+pid=... (grace 180s, stall 420s, first-iter 900s)` on all three rungs and
+completed its whole rung list — the first ladder job to do so. The arming line is
+part of the fix: this failure mode is silence, so it has to announce itself.
+
+### Controlled nw2-vs-nw0 numbers (job 8739914, 39 common iters, max-over-ranks)
+
+| arm | med iter | **total wall** | med dataload | dl==0 | med barrier | throws |
+|---|---|---|---|---|---|---|
+| n2_nw2 | 3.45 s | **302 s** | 0.00 s | 21/39 | 0.10 s | **2/24** |
+| n2_nw0 | 14.89 s | **589 s** | 11.71 s | 0/39 | 11.35 s | 0/24 |
+
+**Quote both ratios.** Iteration total wall is **1.95×**, but the *rung* wall was
+554 s vs 704 s = **1.27×**: nw2 pays ~252 s of non-iteration overhead against
+nw0's ~115 s (worker fork + the 31 s teardown straggle). That fixed cost eats a
+third of the win over 40 iterations and amortizes away over production lengths.
+Citing only 1.95× oversells short jobs.
+
+**The barrier column settles H3.** At nw0 the median barrier (11.35 s) is
+essentially the whole dataload (11.71 s) — ranks sit in the pre-step barrier for
+the entire decode. At nw2 it is 0.10 s. So `num_workers=0` decode is *genuine
+serialized wait*, not a cost merely relocated into a visible column, which was
+the open question in "Where the time actually goes".
+
+### Probe-overhead gate: PASS
+
+`VJEPA_SCALE_PROBE`'s barrier is free, so ladder rungs measure the workload and
+not the instrument. Probe ON vs OFF, nw0, same allocation, 39 common iters:
+
+| arm | med | mean | IQR | total wall |
+|---|---|---|---|---|
+| n2_nw0 (ON) | 14.89 s | 15.11 s | 8.50–21.30 | 589 s |
+| n2_nw0_probe0 | 10.63 s | 14.50 s | 8.25–22.08 | 566 s |
+
+IQRs overlap heavily; means differ 4%; total wall 4.2%. **Ignore the median here**
+— both arms are bimodal (min 6.1 s, max 33.4 s), so it lands wherever the mode
+split falls and shows a 4.3 s "gap" the mean and sum both deny. This was the
+blocking gate for the L1/L2/L3 debug-scaling slots; it is cleared.
 
 **Why this is not a probe artifact.** The 64n and 256n CSVs are **16 columns** —
 they predate the barrier probe entirely — yet show the same flat floor and the
