@@ -59,6 +59,16 @@
 #   L1: qsub -l select=16 -v VJEPA_LADDER_RUNGS="1 2 4 8 16"   scripts/scaling_ladder.sh
 #   L2: qsub -l select=32 -v VJEPA_LADDER_RUNGS="16 32"        scripts/scaling_ladder.sh
 #   L3: qsub -l select=64 -v VJEPA_LADDER_RUNGS="16 64 16:nw2" scripts/scaling_ladder.sh
+#   L4: qsub -q debug -l select=1 \
+#         -v VJEPA_LADDER_RUNGS="1:prof1 1:nw2:prof1" scripts/scaling_ladder.sh
+#
+# L4 is the TAIL rung pair and needs only ONE node -- the >ceiling dataload
+# draws are present at 1n, so node count buys nothing here and the cheap queue
+# is the right place for it. It is a PAIR because the two profile columns are
+# not equally trustworthy at both worker settings (see _PerSampleDecode): at
+# nw=0 `decode` is clean but `gap` also contains the training step, so nw=0
+# alone can only confirm a codec tail, never exclude one. The nw=2 rung is what
+# makes `gap` a storage measurement. Read them in that order.
 #
 # L0 is the PROBE-OVERHEAD CHECK and gates the rest: if probe-ON and probe-OFF
 # do not have overlapping IQRs, the ladder is measuring its own barrier and the
@@ -258,7 +268,16 @@ run_rung () {
     # node, so it is not fabric. decode_ms vs gap_ms separates the two live
     # candidates: CPU/codec cost we mis-measured offline (lands in decode) versus
     # a storage-side stall offline benchmarks structurally cannot see (lands in
-    # gap). Rank-0-gated and off by default; see the log-funnel note above.
+    # gap). Off by default and capped to the first VJEPA_DECODE_PROFILE_RANKS
+    # ranks (default 12 = one node) -- not rank 0 alone, because a >ceiling event
+    # hits a median of 2 of 12 ranks, so rank-0 gating sits out ~5 iterations in
+    # 6 and the rung could come back clean while the tail happened two ranks over.
+    # The CAP, not the rank-0 identity, is the log-funnel safety property.
+    #
+    # The emission period must be set against the rung length, not left at its
+    # default: a rung is ipe x bs samples per rank (80 x 2 = 160 here), so the
+    # default period of 200 would emit NOTHING and be indistinguishable from a
+    # clean result. Hence the explicit value below.
     [ "$prof" = "1" ] && name="${name}_prof"
     if [ "$R" -gt "$NNODES" ]; then
         echo "SKIP rung $spec: needs $R nodes, allocation has $NNODES"; return 0
@@ -329,6 +348,8 @@ PY
     VJEPA_NUM_WORKERS=$nw \
     VJEPA_SCALE_PROBE=$probe \
     VJEPA_DECODE_PROFILE=$prof \
+    VJEPA_DECODE_PROFILE_EVERY=${VJEPA_DECODE_PROFILE_EVERY:-40} \
+    VJEPA_DECODE_PROFILE_RANKS=${VJEPA_DECODE_PROFILE_RANKS:-12} \
     mpiexec -n $W -ppn $PPN --hostfile "$nf" --cpu-bind depth --depth 16 --no-vni \
         -o "$dir/rank.%r.out" -e "$dir/rank.%r.err" \
         python -m app.main_dist_aurora --train_mode \

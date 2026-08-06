@@ -218,6 +218,38 @@ def test_profiling_is_capped_to_the_first_n_ranks(monkeypatch):
     assert wd._decode_prof["n"] == before, "a 3072-rank job must not profile at rank 3071"
 
 
+def test_enabling_announces_itself_on_the_first_sample(monkeypatch, caplog):
+    """An instrument that can be ON and silent is worse than no instrument.
+
+    A ladder rung is `ipe x batch_size` samples per rank -- 80 x 2 = 160 -- and
+    the default emission period is 200. Set that way, a `1:prof1` rung would burn
+    a debug slot, produce an empty log, and be indistinguishable from "the tail
+    did not happen this time". The announce line makes the ON state observable
+    independently of whether any table is ever due, so an empty profile can be
+    read as a real null rather than a misconfiguration.
+    """
+    import logging
+
+    wd = _fresh(monkeypatch, every=1000)  # period far above any rung's sample count
+    with caplog.at_level(logging.INFO, logger=wd.logger.name):
+        p = wd._PerSampleDecode(_SleepDecoder(0.0), 16, source_name="sitl_2026")
+        p({"__key__": "k"})
+
+    hits = [r for r in caplog.records if "ENABLED" in r.getMessage()]
+    assert len(hits) == 1, (
+        "profiling must announce itself exactly once on the first sample; "
+        f"got {len(hits)} announcements"
+    )
+
+    caplog.clear()
+    for _ in range(10):
+        p({"__key__": "k"})
+    assert not [r for r in caplog.records if "ENABLED" in r.getMessage()], (
+        "the announcement must not repeat -- at 12 ranks x thousands of samples "
+        "a per-sample banner is the log funnel this module exists to avoid"
+    )
+
+
 def test_profiling_does_not_alter_the_decoded_value(monkeypatch):
     """An instrument that changes the data is not an instrument.
 

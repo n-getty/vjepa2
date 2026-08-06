@@ -140,6 +140,16 @@ def _record_decode(source_name, decode_s, gap_s):
         if len(d[k]) > 512:
             del d[k][0]
     _decode_prof["n"] += 1
+    if _decode_prof["n"] == 1:
+        # Announce on the first sample. Without this the instrument can be ON and
+        # emit nothing, with no way to tell that from "the tail did not happen":
+        # a ladder rung is 80 iters x bs=2 = 160 samples per rank, below the
+        # default period of 200, so the first attempt at this measurement would
+        # have produced an empty log and looked like a clean result.
+        logger.info(
+            "[decode-prof] ENABLED: table every %d samples, ranks < %d",
+            _DECODE_EVERY, _DECODE_RANKS,
+        )
     if _decode_prof["n"] % _DECODE_EVERY:
         return
     rows = []
@@ -644,6 +654,20 @@ class _PerSampleDecode:
         # upstream of us (tar read / DAOS / shuffle buffer refill). decode = our
         # own demux+extract. Splitting them is what separates a payload-cost tail
         # from a storage-stall tail; see _record_decode.
+        #
+        # READ THE TWO COLUMNS DIFFERENTLY DEPENDING ON num_workers.
+        #   decode  always clean. It is one call, in this process, either way.
+        #   gap     clean at nw>0 only. With workers, this process does nothing
+        #           but decode in a loop, so a gap IS upstream wait. At nw=0
+        #           decode runs inline in the training process, so the gap across
+        #           a batch boundary also contains the entire training step
+        #           (~3.4 s of compute here) and is NOT a storage measurement.
+        #           At bs=2 that makes the nw=0 gap bimodal by construction:
+        #           within-batch gaps are real, across-batch gaps are compute.
+        # So the discriminator is run as a PAIR of rungs. If the tail lands in
+        # `decode` at nw=0, it is codec cost and we are done -- gap is irrelevant.
+        # If it does not, the tail is upstream, and only the nw=2 rung can say
+        # whether upstream means storage.
         _t0 = time.time()
         _gap = 0.0 if _decode_prof["last_exit"] is None else _t0 - _decode_prof["last_exit"]
         out = self.decoder.decode(sample, self.fpc, source_name=self.source_name)

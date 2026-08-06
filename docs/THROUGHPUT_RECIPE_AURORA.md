@@ -871,7 +871,39 @@ a codec tail (lives in `decode`, sorts by source) is distinguishable from a
 storage stall (lives in `gap`, does not). Gated to the first
 `VJEPA_DECODE_PROFILE_RANKS` ranks (default 12 = one node) rather than rank 0:
 a >ceiling event hits a median of 2 of 12 ranks, so rank-0-only gating would
-sit out roughly five iterations in six. Run it as a ladder rung: `1:prof1`.
+sit out roughly five iterations in six.
+
+Run it as a **pair** of one-node rungs, and read them in order:
+
+```
+qsub -q debug -l select=1 \
+     -v VJEPA_LADDER_RUNGS="1:prof1 1:nw2:prof1" scripts/scaling_ladder.sh
+python scripts/decode_prof_report.py <outroot>/n1_nw0_prof <outroot>/n1_nw2_prof
+```
+
+One node is enough — the >ceiling draws are present at 1n, so node count buys
+nothing and the cheap queue is the right place for it.
+
+**The two columns are not equally trustworthy at both worker settings, and the
+verdicts are asymmetric because of it.** `decode` is one call in one process
+either way, so it is clean at any `num_workers`. `gap` is only clean at nw>0,
+where the profiled process does nothing but decode in a loop; at nw=0 decode runs
+inline in the training process, so every batch-boundary gap also contains the
+whole training step (~3.4 s here) and is bimodal by construction at bs=2. So:
+
+| observation | rung needed | verdict |
+|---|---|---|
+| live `decode` max > 10.74 s ceiling | nw=0 alone suffices | tail is codec cost the offline bench under-measured; re-encode is the direct fix |
+| tail not in `decode`, large `gap` | **nw=2 required** | tail is upstream of decode; storage remains a hypothesis until traced DAOS-side |
+| tail not in `decode`, large `gap`, nw=0 | — | **inconclusive**, not a storage result: gap contains compute |
+
+⚠️ **Set `VJEPA_DECODE_PROFILE_EVERY` against the rung's length.** A rung emits
+`ipe × batch_size` samples per rank — 80 × 2 = 160 — and the module default
+period is 200, so the obvious invocation produces an *empty log* that looks
+exactly like "the tail did not happen". The ladder now passes 40, and the module
+logs a one-time `[decode-prof] ENABLED` banner on the first sample so ON-and-
+silent is distinguishable from OFF. `decode_prof_report.py` reports those two
+cases differently and refuses to call either one a null result.
 
 ## Scaling ladder (`scripts/scaling_ladder.sh`)
 
