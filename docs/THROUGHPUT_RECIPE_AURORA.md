@@ -816,18 +816,62 @@ measured heichole re-encode (1080p high-bitrate sparse-keyframe → 512p/crf23/
 **g16**: decode 1765 → 182 ms, `scripts/reencode_source_reshard.py`) — the same
 intervention, on a different source, for the same stated reason.
 
-Two reasons this is a lead and not yet a finding: r=0.70 over 12 points is not
-decisive, and `sitl_2026` (7.3 ms per decoded frame vs a ~1 ms median) shows
-resolution confounds GOP — it is 1080p. **Both are settled by intervention, not
-correlation:** re-encode one slow source at native resolution with `g16` and at
-512p with `g16`, decode the *same clip*, and the two arms separate GOP from
-pixels. That test is running.
+The intervention arm confirms GOP, at unchanged pixels — re-encode the *same
+clip*, decode it again:
 
-**Instrument for the live path** — `VJEPA_DECODE_PROFILE=1` (default OFF,
-canonical-worker-gated) logs per source the decode call's own time and the gap
-since the previous sample, so a payload/codec tail (lives in `decode`, sorts by
-source) is distinguishable from a DAOS stall (lives in `gap`, does not). Offline
-benchmarks cannot see DAOS; this closes that gap.
+| source | orig GOP | orig | **g16 @native** | g16 @512 |
+|---|---|---|---|---|
+| surgvu24_clean | 250 | 3.38 s | **0.41 s (8.2×)** | 0.26 s (13.1×) |
+| cholec80 | 249 | 3.04 s | **0.35 s (8.8×)** | 0.40 s (7.6×) |
+| lemon | 96 | 2.77 s | **0.63 s (4.4×)** | 0.41 s (6.8×) |
+| sitl_2026 | 30 | 3.55 s | 2.35 s (1.5×) | **0.61 s (5.8×)** |
+
+GOP alone buys 4.4–8.8× with resolution untouched. `sitl_2026` is the
+informative exception — already GOP-30, so its cost is pixels and it needs the
+512p arm. Both levers are real and separable.
+
+### …but keyframe spacing does not own the TAIL
+
+Take that per-source table as a mixture, weight it by the run's own realized
+T=0.5 fractions, and draw bs=2 clips per batch. It reproduces the body of the
+per-rank dataload distribution and misses the tail entirely:
+
+| quantile | predicted from mixture | observed on-node |
+|---|---|---|
+| p50 | 1.38 s | 1.20 s |
+| p90 | 5.75 s | **9.58 s** |
+| p99 | 8.61 s | **22.99 s** |
+| mean | 2.66 s | 3.10 s |
+| p(>3 s) | 0.449 | 0.232 |
+| p(>10 s) | **0.002** | **0.095** |
+
+**A ceiling argument makes this decisive.** At bs=2 no pure-decode story can
+exceed twice the slowest per-clip decode ever measured — `lapgyn6_events` at
+5.37 s, so 10.74 s. **8.7% of 18,252 observed samples are above that ceiling**,
+median 15.1 s and max 67.8 s = 6.3× it. No mixture of measured decode costs can
+produce those draws.
+
+What the excess is *not*: it is not fabric (it is present at **one node**), not
+a bad node (the argmax rank rotates), and not payload. Offline benchmarks
+structurally cannot see it, because they do not read through DAOS. It is
+node-clustered — at 16n a stall hits a median of 11 ranks across 7 nodes where
+iid over the same rank count predicts 8.1 — which is consistent with a shared
+per-node DAOS client but **not traced, and therefore a hypothesis**.
+
+So GOP re-encoding is worth doing on its own terms (it moves p50, mean, and the
+whole body, permanently and offline) but **must not be sold as the fix for the
+scaling asymptote**. The projected "1.18 s → 0.42 s" mixture-expected decode is
+a body statistic; the asymptote is set by the tail above the ceiling, which the
+re-encode does not address because the re-encode cannot make a clip decode
+faster than a clip decodes.
+
+**Instrument for the live path** — `VJEPA_DECODE_PROFILE=1` (default OFF) logs
+per source the decode call's own time and the gap since the previous sample, so
+a codec tail (lives in `decode`, sorts by source) is distinguishable from a
+storage stall (lives in `gap`, does not). Gated to the first
+`VJEPA_DECODE_PROFILE_RANKS` ranks (default 12 = one node) rather than rank 0:
+a >ceiling event hits a median of 2 of 12 ranks, so rank-0-only gating would
+sit out roughly five iterations in six. Run it as a ladder rung: `1:prof1`.
 
 ## Scaling ladder (`scripts/scaling_ladder.sh`)
 
@@ -873,6 +917,57 @@ rung shares a fabric hour, and separates straggler wait from compute.
 `tests/test_phase_csv_contract.py` pins the 17-column order, that `barrier-ms`
 stays last, that `scaling_efficiency.py`'s indices agree, that the forward marks
 are not re-adjoined, and that the probe stays opt-in.
+
+### Ladder result: the curve, and what `num_workers=2` does to it
+
+L1a (job 8740093, rungs `1 2 4 8`) and L1b (job 8740311, rungs `8 16 8:nw2`),
+full rank coverage at every rung, 39 common iters, iteration 0 dropped. The
+**cross-job anchor passed** — 8n reads 19.01 s in L1a and 20.49 s in L1b, 7.8%
+apart with each median inside the other's IQR — so the two jobs compose into one
+curve.
+
+| rung | ranks | med iter | max dl | floor | p(>10 s) | stall iters | clips/s/tile | eff |
+|---|---|---|---|---|---|---|---|---|
+| 1n | 12 | 10.84 s | 7.91 s | 2.93 s | 0.098 | 18/39 | 0.1846 | 100% |
+| 2n | 24 | 14.01 s | 10.89 s | 3.05 s | 0.098 | 20/39 | 0.1427 | 77% |
+| 4n | 48 | 16.04 s | 12.90 s | 3.14 s | 0.099 | 26/39 | 0.1247 | 68% |
+| 8n | 96 | 19.01 s | 15.64 s | 3.22 s | 0.096 | 31/39 | 0.1052 | 57% |
+| 8n\* | 96 | 20.49 s | 17.24 s | 3.23 s | 0.094 | 32/39 | 0.0976 | 53% |
+| 16n | 192 | 24.79 s | 21.46 s | 3.26 s | 0.095 | 33/39 | 0.0807 | 44% |
+
+(\* = L1b's anchor rung.) The per-rank *marginal* is unchanged out to 192 ranks
+— p50 1.19 s, p99 24.0 s, p(>10 s) 0.095, statistically identical to 1n's. The
+compute+comms **floor moves only 2.93 → 3.26 s across a 16× node jump**: 11%.
+Everything else is the order statistic.
+
+**`num_workers=2` is the single largest throughput lever measured on this
+model.** Same 8 nodes, same allocation, same fabric hour:
+
+| arm | med iter | IQR | total wall | max dl | floor | clips/s/tile |
+|---|---|---|---|---|---|---|
+| 8n nw0 | 20.49 s | [15.91, 24.24] | 785 s | 17.24 s | 3.23 s | 0.0976 |
+| 8n **nw2** | **3.83 s** | [3.50, 8.83] | **401 s** | **0.00 s** | 3.40 s | **0.5222** |
+
+**5.35× on the median, 1.96× on total wall**, and the 30 clean iterations run at
+3.57 s against a 3.40 s floor — dataload fully hidden. The gap between the two
+multipliers is the whole story: prefetch does not remove the tail, it makes it
+**rarer**. nw2's per-rank max is 44.2 s, *higher* than nw0's 35.1 s; what falls
+is the rate, p(>10 s) 0.094 → 0.014 (6.7×). Median-only reporting would claim
+5.35× for a lever that delivers 1.96× — quote total wall.
+
+Consequence for scale-out: nw2 does not escape the order statistic, it moves the
+knee. p(≥1 stalling rank) reaches 1.00 by 32 nodes at nw2 versus by 4 nodes at
+nw0. **Shrinking the tail remains the only thing that changes the asymptote**,
+and 8.7% of draws are still above what any measured decode cost can explain.
+
+⚠️ **nw2 is not yet production-safe.** The rung completed rc=0 with 96/96 rank
+CSVs and a full 15 GB checkpoint written, but **85 of 96 ranks then aborted at
+exit** with `terminate called after throwing an instance of 'std::system_error'
+— No such file or directory`, after `avg. loss` and after the checkpoint. The 11
+survivors are exactly ranks 1–11: node 0's non-zero ranks. Nothing is lost at a
+rung boundary; under `VJEPA_SUSTAINED` self-resubmit, an aborting exit path is a
+different matter and needs to be closed before nw>0 becomes a default. It also
+has no 64n hazard arm yet.
 
 ## Survivability is a throughput lever at scale
 
