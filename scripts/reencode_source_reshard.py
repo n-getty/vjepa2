@@ -223,11 +223,32 @@ def process_range(args, shards, lo, hi):
               f"enc_fail={enc_fail} size={bytes_in/1e6:.0f}->{bytes_out/1e6:.0f}MB "
               f"({ratio:.0f}%)", flush=True)
     partial = os.path.join(args.output, f"_partial_{lo}_{hi}.json")
+    # MERGE with any prior partial for this same range, do not overwrite it.
+    # A resume re-runs with the SAME layout, so it writes the SAME filename --
+    # but every shard the first pass finished takes the `continue` above, which
+    # skips the per_shard entry. Overwriting would leave a partial describing
+    # only the shards the RESUME did. finalize() derives sample_count by summing
+    # per_shard across partials, so a job resumed to a complete shard set would
+    # stamp a complete corpus with a badly undercounted manifest -- and per the
+    # cholec80 note in finalize(), a wrong manifest is the worse failure,
+    # because bad pixels get noticed and a bad manifest gets believed.
+    prior = {}
+    if os.path.exists(partial):
+        try:
+            prior = json.load(open(partial)).get("per_shard", {})
+        except (OSError, ValueError) as e:
+            # Do not silently start from {}: that is the undercount this guard
+            # exists to prevent, arriving by a different route.
+            print(f"WARNING: could not read prior {partial} ({e}); its shards will "
+                  "be missing from the manifest. Re-run this range with --force.",
+                  file=sys.stderr, flush=True)
+    prior.update(per_shard)
     with open(partial, "w") as f:
         json.dump({"range": [lo, hi], "elapsed_s": time.time() - t0,
                    "short_side": args.short_side, "crf": args.crf, "gop": args.gop,
-                   "per_shard": per_shard}, f, indent=2)
-    print(f"wrote {partial}", flush=True)
+                   "per_shard": prior}, f, indent=2)
+    print(f"wrote {partial} ({len(per_shard)} this pass, {len(prior)} total in range)",
+          flush=True)
 
 
 def finalize(args, shards):
@@ -282,6 +303,23 @@ def finalize(args, shards):
     if len(merged) != len(shards):
         print(f"WARNING: processed {len(merged)} of {len(shards)} input shards — "
               "some ranges may be missing.", file=sys.stderr)
+    # The check that matters most: a COMPLETE shard set described by an
+    # INCOMPLETE manifest. That is the silent failure -- a full-looking corpus
+    # whose sample_count is short, which downstream reads as "this source is
+    # smaller than it is" with no error anywhere. It arises when a resume runs
+    # at a DIFFERENT node count: the partials are named _partial_{lo}_{hi}, so a
+    # relayout writes new filenames with overlapping ranges, and the per-range
+    # merge on the write side cannot see them. Shards on disk are the ground
+    # truth here, because they are written atomically via os.replace.
+    if len(out_shards) == len(shards) and len(merged) < len(shards):
+        print(f"ERROR: all {len(out_shards)} output shards exist but only "
+              f"{len(merged)} are described by _partial_*.json, so sample_count="
+              f"{int(total_samp)} UNDERCOUNTS the corpus. This happens when a job "
+              "is resumed at a different node count (different _partial_ range "
+              "names). metadata.json was still written -- do NOT trust its "
+              "sample_count. Re-derive it by counting samples in the output "
+              "shards, or re-run --finalize after restoring the missing partials.",
+              file=sys.stderr)
 
 
 def main():
