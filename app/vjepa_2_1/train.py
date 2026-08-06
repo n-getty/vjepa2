@@ -48,6 +48,35 @@ CHECKPOINT_FREQ = 1
 GARBAGE_COLLECT_ITR_FREQ = 50
 MAX_REPEAT_COUNTS = 10
 
+# Keeps the training DataLoader reachable past main()'s return.
+#
+# `unsupervised_loader` and its iterator are LOCALS of main(). When main()
+# returns, CPython drops their refcount to zero right there and
+# _MultiProcessingDataLoaderIter.__del__ -> _shutdown_workers runs INSIDE
+# app_main -- upstream of app/main_dist_aurora.py's `finally`, so the
+# VJEPA_HARD_EXIT os._exit() in that finally can never get in front of it.
+#
+# That teardown is where job 8739914's nw=2 arm lost 31 s and threw
+# `std::system_error: No such file or directory` on 2 of 24 ranks, with every
+# rank's 40th CSV row already written. Retaining the loader here means the
+# destructor never runs at return; the process leaves through the hard exit
+# instead, and the daemonic workers are reaped by the kernel.
+#
+# THIS ONLY WORKS WITH persistent_workers=True, and that is not a style
+# preference -- the two changes are one fix. The worker pool does not hang off
+# the DataLoader, it hangs off `DataLoader._iterator`, and
+# `DataLoader.__iter__` only stores the iterator there when
+# `persistent_workers and num_workers > 0` (torch/utils/data/dataloader.py:485).
+# At persistent_workers=False every `iter()` returns a fresh, unreferenced
+# iterator, so retaining the loader retains nothing that owns a worker and the
+# destructor still fires at main()'s return. Verified empirically through the
+# real _LenWrapper -> WebLoader -> DataLoader chain, not inferred.
+#
+# Pinned by tests/test_loader_teardown_survival.py, including that coupling.
+# Also requires VJEPA_HARD_EXIT=1 (the default) -- on a normal interpreter exit
+# module globals are cleared and the destructor runs anyway, just later.
+_LOADER_KEEPALIVE = []
+
 _GLOBAL_SEED = 0
 random.seed(_GLOBAL_SEED)
 np.random.seed(_GLOBAL_SEED)
@@ -212,10 +241,23 @@ def main(args, resume_preempt=False):
     _nw_override = os.environ.get("VJEPA_NUM_WORKERS")
     if _nw_override is not None:
         num_workers = int(_nw_override)
+    # persistent_workers. Every other trainer in the repo passes this
+    # (app/vjepa/train.py:116, app/vjepa_droid/train.py:117); 2.1 was the only
+    # one that dropped it, so init_data's signature default (False, see
+    # src/datasets/data_manager.py) silently won and the worker pool was torn
+    # down and re-forked at every epoch boundary --- i.e. at exactly the moment
+    # train.py re-creates the iterator (:872, :1030). Forking after
+    # init_device_mesh has built the inter-node xccl subgroups is the documented
+    # PRISM hazard the VJEPA_NUM_WORKERS override above exists to dodge, so
+    # doing it repeatedly mid-run is the worst version of it. True keeps one
+    # pool for the life of the run. Downstream this is ANDed with
+    # (num_workers > 0) (src/datasets/webdataset.py:787), so it is inert at nw=0.
+    persistent_workers = cfgs_data.get("persistent_workers", True)
+    _pw_override = os.environ.get("VJEPA_PERSISTENT_WORKERS")
+    if _pw_override is not None:
+        persistent_workers = _pw_override == "1"
     # Env override for pin_memory — a Mode-A (DataLoader shm-crash) isolation knob.
-    # VJEPA_PIN_MEM=0 disables the pinned-host-memory staging buffer. (Note:
-    # persistent_workers is NOT plumbed through init_data here, so it is already
-    # effectively False regardless of config — not a Mode-A variable.)
+    # VJEPA_PIN_MEM=0 disables the pinned-host-memory staging buffer.
     _pin_override = os.environ.get("VJEPA_PIN_MEM")
     if _pin_override is not None:
         pin_mem = _pin_override == "1"
@@ -320,6 +362,7 @@ def main(args, resume_preempt=False):
         # dataload" run turned out to be nw=2, and every nw=0 run shows ~1 s in
         # dataload-time purely because decode runs inline instead of prefetched.
         f"num_workers={num_workers} pin_mem={pin_mem} "
+        f"persistent_workers={persistent_workers} "
         f"-> effective global batch "
         f"{world_size * batch_size * true_accum} "
         f"({world_size} ranks x bs {batch_size} x accum {true_accum})"
@@ -586,8 +629,13 @@ def main(args, resume_preempt=False):
         collator=mask_collator,
         num_workers=num_workers,
         pin_mem=pin_mem,
+        persistent_workers=persistent_workers,
         log_dir=None,
     )
+    # See _LOADER_KEEPALIVE at module top: without this the loader dies at
+    # main()'s return and its worker-shutdown destructor runs before any exit
+    # path we control.
+    _LOADER_KEEPALIVE.append(unsupervised_loader)
     try:
         _dlen = len(unsupervised_loader)
     except Exception:
