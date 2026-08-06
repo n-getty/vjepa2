@@ -34,8 +34,18 @@ if "--train_mode" in sys.argv:
         if var in os.environ:
             os.environ["ZE_AFFINITY_MASK"] = os.environ[var]
             break
-    # Aurora workaround: torch multiprocessing's file_descriptor sharing
-    # exhausts file handles under XPU; the file_system strategy stays bounded.
+    # MP_SOCKET_DIR IS A NO-OP with this torch build -- verified 2026-08-06, the
+    # string appears nowhere in the install: 0 hits across the python tree,
+    # libshm.so, and the torch_shm_manager binary. It was inherited from the
+    # earlier XPU port and credited in comments as an active mitigation for the
+    # DataLoader-worker failures, which sent at least one investigation looking
+    # past a knob that was never connected to anything.
+    #
+    # Kept, set-only-if-unset, purely because it is free and some future torch or
+    # a wrapper may read it. It must NOT be cited as a fix. The strategy that IS
+    # in effect is set_sharing_strategy("file_system") below (~:358): the default
+    # file_descriptor sharing exhausts file handles under XPU; file_system stays
+    # bounded.
     os.environ.setdefault("MP_SOCKET_DIR", "/tmp")
 
 import copy
@@ -452,8 +462,18 @@ def run_training(args):
         # nw2 arm is that two ranks left early, on their own, after their work was
         # done; zero nw0 ranks in the same allocation did.
         #
-        # `MP_SOCKET_DIR=/tmp` (module top) and set_sharing_strategy("file_system")
-        # (below) were BOTH already active -- do not re-propose them as the fix.
+        # set_sharing_strategy("file_system") (~:358) was already active -- do not
+        # re-propose it as the fix. `MP_SOCKET_DIR=/tmp` was ALSO listed here as an
+        # active mitigation; that was wrong. It is a no-op with this torch build
+        # (see the module-top note), so it never mitigated anything and cannot be
+        # counted as ruled out on the strength of having been set.
+        #
+        # A SECOND, different nw2 symptom exists and must not be conflated with
+        # this one: 8740716/n1_nw2_prof failed at STARTUP, zero iterations, all 12
+        # ranks dying in worker spawn with `torch_shm_manager: Invalid argument`
+        # (libshm/core.cpp:62). This block is about the opposite case -- ranks that
+        # finished all their work and threw on the way out.
+        # scripts/repro_nw_exit_throw_pbs.sh bisects both.
         #
         # A throw out of a destructor during shutdown cannot be caught in Python,
         # so this does not try. It leaves the interpreter before the destructors
