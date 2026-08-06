@@ -98,24 +98,41 @@ len=$(printf %s "$TMPDIR" | wc -c) chars"
 # A unix socket path is capped at 108 bytes of sun_path including the NUL, and
 # OVERFLOWING IT IS REPORTED AS EINVAL -- the exact error symptom (B) shows.
 #
-# THIS ESTIMATE IS FOR THE torch_shm_manager SOCKET ONLY, AND IT FITS: TMPDIR is
-# 68 chars, torch appends /torch-shm-dir-XXXXXX/manager.sock (34), giving 102 of
-# 107. Keep it, because the margin is 5 bytes and a longer jobid or hostname
-# would push an identical run over.
+# MEASURED (job 8740830), from inside the ranks -- this is symptom (B)'s cause:
 #
-# BUT IT IS NOT THE ONLY AF_UNIX PATH IN PLAY, and job 8740789 died on the other
-# one: `OSError: AF_UNIX path too long` from multiprocessing/connection.py:608,
-# in Python's own resource_sharer, whose listener path is built from
-# get_temp_dir() + a random name -- a different, longer construction than
-# torch's. So a PASS on the line below does not clear the job: read the
-# per-stage `af_unix=` counter and the worker's printed `listener=` length,
-# which are measured from inside the process that fails rather than estimated
-# here. (Do not compute either off-node: tempfile.gettempdir() falls back to
-# /tmp when TMPDIR does not exist, so a login-node probe measures 36 bytes and
-# silently answers a different question.)
+#   PBS TMPDIR (job shell)  /var/tmp/pbs.<jobid>.<server>          68
+#   + PALS per-launch uuid  .../<uuid>/tmp                        109   (+41)
+#   + /pymp-XXXXXXXX                                              123
+#   + /listener-XXXXXXXX                                          141   cap 107
+#                                                                       OVER BY 34
+#
+# Headroom for TMPDIR is 107-32 = 75 chars. PBS alone (68) FITS; PALS's UUID is
+# what breaks it. Verified two ways: a synthetic 68-char TMPDIR constructs a
+# 100-byte listener and binds fine, and every rank here printed 141/107.
+#
+# ALCF documents this: user-guides/docs/aurora/known-issues.md #7, "Set TMPDIR
+# to avoid AF_UNIX path too long", naming python multiprocessing and pytorch,
+# and scoping it to mpiexec ON A SINGLE NODE -- which matches the asymmetry
+# (1n rung failed, 8n rung worked). Fix per ALCF: export TMPDIR=/tmp before the
+# launch, or mpiexec --env TMPDIR=/tmp.
+#
+# TWO WAYS THIS GOT MISREAD BEFORE, both worth not repeating:
+#   * the torch_shm_manager socket is a DIFFERENT path and it FITS (102/107).
+#     Reasoning about it answers a question nobody asked.
+#   * anything computed off-node is void: tempfile.gettempdir() falls back to
+#     /tmp when TMPDIR does not exist, so a login-node probe returns 36 bytes,
+#     and the job shell misses the UUID and returns 102. Only the ranks' own
+#     printed listener= length is evidence.
+# DO NOT TRUST THIS NUMBER -- it is computed in the JOB SHELL, and the job shell
+# does not see the TMPDIR the ranks get. Job 8740830 printed "~102 / 107" here,
+# no warning, while every rank was at 141/107 and every worker was failing.
+# PALS appends a per-mpiexec-launch UUID: the ranks run under
+#   $PBS_TMPDIR/<uuid>/tmp    68 -> 109 chars (+41)
+# so any estimate made before mpiexec understates by 41. The authoritative
+# numbers are the `listener=` lengths the ranks and workers print themselves.
 _sockguess=$(( $(printf %s "$TMPDIR" | wc -c) + 34 ))
-echo "       est. shm socket path len ~${_sockguess} / 107 usable sun_path bytes\
-$( [ "$_sockguess" -gt 107 ] && echo '  <-- OVER THE LIMIT: EINVAL is explained' )"
+echo "       job-shell est. ~${_sockguess}/107 -- UNDERSTATED by ~41: PALS adds"
+echo "       /<uuid>/tmp per mpiexec launch. Read the ranks' own listener= lines."
 echo "shm  : $(ls -ld /dev/shm 2>/dev/null); df /dev/shm: $(df -h /dev/shm | tail -1)"
 echo "ulimit -n: $(ulimit -n)   -c: $(ulimit -c)"
 # Symptom (B) is a socket/FD-creation failure, so capture the limits and the
