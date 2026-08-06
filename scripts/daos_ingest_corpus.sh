@@ -108,9 +108,26 @@ SOURCES=(small_surg sitl surgenet_robotic_clean surgtoolloc2022 surgvu24_clean
          gynsurg lapgyn6_events surgenet_lap openh)
 # Override for an INCREMENTAL ingest, e.g. adding only the GOP re-encoded twins:
 #   -v INGEST_SOURCES="cholec80_g16 surgvu24_clean_g16 lemon_g16 sitl_2026_g16_512"
-# The g16 set is a NET -82 GB against the originals (1999 -> 1917 GB), so it adds
-# no capacity pressure even while both copies coexist -- and both must coexist,
-# because the swap has to be revertible and A/B-able against the originals.
+# Both copies must coexist: the swap has to be revertible and A/B-able against
+# the originals. Cost of doing so, measured 2026-08-06 (du -sh, GB):
+#
+#   cholec80         70 ->   43   -27   0.61x
+#   surgvu24_clean  320 ->  594  +274   1.86x   <-- nearly doubles
+#   lemon           922 ->  983   +61   1.07x
+#   sitl_2026       551 ->  167  -384   0.30x   <-- GOP *and* short-side 512
+#   ------------------------------------------
+#   all four       1863 -> 1787   -76
+#
+# The -76 GB net is NOT a property of the GOP re-encode and must not be read as
+# one. Over the three pure-GOP sources the twins ADD 308 GB (1312 -> 1620); the
+# only reason the total goes negative is sitl_2026's downscale, which is a
+# resolution change, not a keyframe change (reencode_gop_pbs.sh:106). Denser
+# keyframes cost bits -- that is the trade the re-encode is buying.
+#
+# So this ingest ADDS ~1787 GB to the container rather than being free. That is
+# still small against the pool (corpus 4.5 TB / 259 TB free at container
+# creation), but check `daos pool query AuroraGPT` from a compute node before
+# submitting -- the login node has no daos_agent socket and cannot answer it.
 #
 # pe_video is appended by the batch farm and by the verifier unconditionally
 # below, which is wrong for a subset ingest: it would re-copy a source that is
