@@ -830,6 +830,40 @@ GOP alone buys 4.4–8.8× with resolution untouched. `sitl_2026` is the
 informative exception — already GOP-30, so its cost is pixels and it needs the
 512p arm. Both levers are real and separable.
 
+**Executed for cholec80** (job 8740763, 8 nodes × 32 workers, ~6 min wall).
+`cholec80_g16` is the whole source re-encoded at `--short-side 0 --gop 16
+--crf 23`, and it holds up on the corpus rather than on one hand-picked clip:
+
+| check | original | `_g16` |
+|---|---|---|
+| shards | 256 | 256 |
+| samples | 2916 | **2916** |
+| on disk | 70 G | 43 G |
+| clip `video02_clip_0027` frames | 1622 | **1622** |
+| …resolution | 480×854 | **480×854** (untouched) |
+| …decode, 16-frame scatter | 3.19 s | **0.45 s (7.1×)** |
+
+7.1× measured against 8.8× predicted, on a different clip than the prediction
+was drawn from. Sample count and frame count are preserved exactly — this
+changes the *cost* of the corpus, not its content.
+
+Two process notes worth more than the numbers:
+
+- The first manifest recorded `short_side: 512` for an encode that ran at 0.
+  `--finalize` is a separate invocation, callers do not repeat the encode flags,
+  and it stamped argparse's default. The pixels were correct; only the
+  provenance lied — the worse failure, because bad pixels get noticed and a bad
+  manifest gets believed. Finalize now merges the settings the workers actually
+  recorded in `_partial_*.json` and warns if partials disagree.
+- Blanket downscaling would have been an *upscale* here: cholec80 is 854×480,
+  below the 512 target. Check the source resolution before reaching for the
+  pixel lever.
+
+**Scope.** This moves the body of the dataload distribution — p50, mean, p90 —
+permanently and offline. It does not touch the tail, for the reason the next
+section gives: a re-encode cannot make a clip decode faster than a clip decodes.
+Do not report it as the scaling fix.
+
 ### …but keyframe spacing does not own the TAIL
 
 Take that per-source table as a mixture, weight it by the run's own realized
