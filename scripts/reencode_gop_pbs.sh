@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# PBS launcher: GOP re-encode the sparse-keyframe sources (dense keyframes, so a
-# 16-frame scatter-seek stops walking hundreds of frames per sample).
+# PBS launcher: GOP re-encode the sparse-keyframe sources, so a 16-frame
+# scatter-seek stops walking hundreds of frames per sample.
 #
 # WHY, and WHAT THIS DOES NOT BUY
 # --------------------------------
@@ -19,24 +19,35 @@
 # report this as the scaling fix.
 #
 # TWO SEPARABLE LEVERS, and the source list is split on which one it needs:
-#   --short-side 0  = GOP only, pixels untouched. Correct for the sparse-GOP
-#                     sources. Verified on a real cholec80 clip: 3.93 -> 0.43 s
-#                     (9.2x), 1742 frames preserved, 20.9 -> 13.8 MB.
-#   --short-side 512 = also downscale. Needed ONLY by sitl_2026, which is already
-#                     GOP-30, so its cost is pixels: g16 alone is 3.55 -> 2.35 s
-#                     (1.5x) but 512p reaches 0.61 s (5.8x).
+#   --short-side 0   GOP only, pixels untouched. Correct for the sparse-GOP
+#                    sources. Verified on a real cholec80 clip: 3.93 -> 0.43 s
+#                    (9.2x), 1742 frames preserved, 20.9 -> 13.8 MB.
+#   --short-side 512 also downscale. Needed ONLY by sitl_2026, which is already
+#                    GOP-30, so its cost is pixels: g16 alone is 3.55 -> 2.35 s
+#                    (1.5x) but 512p reaches 0.61 s (5.8x).
 # Blanket downscaling would be wrong: cholec80 is 854x480, below the 512 target,
 # so --short-side 512 would UPSCALE it -- more disk and slower decode.
 #
-# Submit ONE source per job (each is sized differently; see the table below):
-#   qsub -A AuroraGPT -q debug -l select=1 -l walltime=01:00:00 \
+# ONE SOURCE PER JOB, sized to the source. heichole (the precedent this is
+# derived from) was 256 shards / 14 GB and fit one node; these are 100x that in
+# bytes, so the fan-out is over nodes as well as cores:
+#
+#   source          shards   size   GOP   arm          predicted     suggested
+#   cholec80           256    70G   249   native g16   3.04->0.35 s   8 nodes
+#   surgvu24_clean    2000   320G   250   native g16   3.38->0.41 s  32 nodes
+#   lemon              528   922G    96   native g16   2.77->0.63 s  16 nodes
+#   sitl_2026         1454   551G    30   512p  g16    3.55->0.61 s  45 nodes
+#
+#   qsub -A AuroraGPT -q debug-scaling -l select=8 -l walltime=01:00:00 \
 #        -l filesystems=home:flare -v SRC=cholec80 scripts/reencode_gop_pbs.sh
 #
-#   source          shards   size   GOP   arm            measured decode
-#   cholec80           256    70G   249   native g16     3.04 -> 0.35 s (8.8x)
-#   surgvu24_clean    2000   320G   250   native g16     3.38 -> 0.41 s (8.2x)
-#   lemon              528   922G    96   native g16     2.77 -> 0.63 s (4.4x)
-#   sitl_2026         1454   551G    30   512p g16       3.55 -> 0.61 s (5.8x)
+# Node counts above assume NW=32 workers/node; useful parallelism CAPS at
+# TOT/NW nodes because a worker's unit of work is one shard (lemon's 528 shards
+# cannot use more than 16 nodes at NW=32). The script clamps and says so.
+#
+# CPU-only -- no XPU, no CCL, no distributed bootstrap. mpiexec is used purely
+# as a process launcher; ranks never talk to each other. They coordinate only by
+# writing disjoint shard ranges into a shared output directory.
 #
 # Idempotent (existing output shards are skipped), sample COUNT is preserved, and
 # a failed encode copies the ORIGINAL bytes through rather than dropping data. So
@@ -75,19 +86,40 @@ TOT=$(ls "$IN"/*.tar 2>/dev/null | wc -l)
 LOGDIR=/flare/ModCon/ngetty/logs/reenc_${SRC}_workers
 mkdir -p "$LOGDIR" "$OUT" /flare/ModCon/ngetty/logs
 cd "$ROOT"
-export PYTHONPATH="$ROOT:$PYTHONPATH"
 
+NNODES=$(sort -u "$PBS_NODEFILE" | wc -l)
 # Aurora compute node = 104 cores / 208 threads. 32 workers x 4 x264 threads =
 # 128 threads, ~60% of the node, leaving headroom for tar I/O. Same shape as
-# reencode_heichole_pbs.sh, which ran this to completion.
+# reencode_heichole_pbs.sh, which ran this to completion on one node.
 NW=${NW:-32}
 FFT=${FFT:-4}
-STEP=$(( (TOT + NW - 1) / NW ))
 
-echo "=== $SRC re-encode: $TOT shards, $NW workers x $STEP, ${FFT} x264 threads ==="
-echo "arm: short_side=$SHORT (0 = native pixels, GOP only)  gop=16 crf=23"
-echo "in : $IN"
-echo "out: $OUT"
+NPROC=$(( NNODES * NW ))
+if [ "$NPROC" -gt "$TOT" ]; then
+  # A worker's unit of work is one shard, so more workers than shards leaves the
+  # surplus idle -- harmless, but it means the extra nodes bought nothing and the
+  # job should have asked for fewer. Say so rather than let it look like it scaled.
+  echo "NOTE: $NPROC workers > $TOT shards. Useful parallelism caps at"
+  echo "      $(( (TOT + NW - 1) / NW )) nodes at NW=$NW; $NNODES were allocated."
+  NPROC=$TOT
+fi
+STEP=$(( (TOT + NPROC - 1) / NPROC ))
+# Integer chunking rounds STEP up, so the last ranks can fall off the end: at
+# 528 shards over 512 procs, STEP=2 and only 264 procs get work while 248 exit
+# immediately. Coverage is still exact -- but the allocation is half idle, and a
+# log line saying "512 procs" would hide that. Report what actually runs.
+USED=$(( (TOT + STEP - 1) / STEP ))
+
+echo "=== $SRC re-encode ==="
+echo "shards : $TOT"
+echo "layout : $NNODES nodes x $NW workers = $NPROC procs, $STEP shards each, ${FFT} x264 threads"
+if [ "$USED" -lt "$NPROC" ]; then
+  echo "         ...but only $USED procs get work (integer chunking at STEP=$STEP);"
+  echo "         $(( NPROC - USED )) idle. $(( (USED + NW - 1) / NW )) nodes would do the same job."
+fi
+echo "arm    : short_side=$SHORT (0 = native pixels, GOP only)  gop=16 crf=23"
+echo "in     : $IN"
+echo "out    : $OUT"
 date
 
 # Stale .tmp from an interrupted run would otherwise be mistaken for output.
@@ -96,23 +128,29 @@ rm -f "$OUT"/*.tmp 2>/dev/null || true
 DONE_BEFORE=$(ls "$OUT"/*.tar 2>/dev/null | wc -l)
 echo "already done: $DONE_BEFORE / $TOT (idempotent resume)"
 
-pids=()
-for i in $(seq 0 $((NW-1))); do
-  lo=$(( i*STEP )); hi=$(( lo+STEP )); [ $hi -gt $TOT ] && hi=$TOT
-  [ $lo -ge $TOT ] && break
-  "$PY" scripts/reencode_source_reshard.py --input "$IN" --output "$OUT" \
-      --short-side "$SHORT" --crf 23 --gop 16 --ffmpeg-threads "$FFT" \
-      --shard-start "$lo" --shard-end "$hi" \
-      > "$LOGDIR/w_${lo}_${hi}.log" 2>&1 &
-  pids+=($!)
-done
-echo "launched ${#pids[@]} workers"
+# Each rank derives its own disjoint shard range from its MPI rank id. Nothing is
+# communicated; PALS_RANKID is read inside the spawned shell, not here.
+# --cpu-bind depth --depth 4 gives each worker its own 4 hardware threads, which
+# is what FFT=4 x264 threads expect; without it ffmpeg instances collide on core 0.
+cat > "$PBS_O_WORKDIR/.reenc_worker_$SRC.sh" <<WORKER
+#!/usr/bin/env bash
+R=\${PALS_RANKID:-\${PMI_RANK:-\${OMPI_COMM_WORLD_RANK:-0}}}
+lo=\$(( R * $STEP )); hi=\$(( lo + $STEP ))
+[ \$hi -gt $TOT ] && hi=$TOT
+[ \$lo -ge $TOT ] && exit 0
+export PYTHONPATH="$ROOT:\$PYTHONPATH"
+cd "$ROOT"
+exec "$PY" scripts/reencode_source_reshard.py --input "$IN" --output "$OUT" \\
+    --short-side $SHORT --crf 23 --gop 16 --ffmpeg-threads $FFT \\
+    --shard-start \$lo --shard-end \$hi \\
+    > "$LOGDIR/w_\${lo}_\${hi}.log" 2>&1
+WORKER
+chmod +x "$PBS_O_WORKDIR/.reenc_worker_$SRC.sh"
 
-fail=0
-for p in "${pids[@]}"; do
-  wait "$p" || { echo "worker pid $p exited nonzero"; fail=1; }
-done
-echo "=== workers done (fail=$fail) ==="
+mpiexec -n "$NPROC" -ppn "$NW" --cpu-bind depth --depth 4 --no-vni \
+    "$PBS_O_WORKDIR/.reenc_worker_$SRC.sh"
+rc=$?
+echo "=== mpiexec rc=$rc ==="
 
 NDONE=$(ls "$OUT"/*.tar 2>/dev/null | wc -l)
 echo "output shards: $NDONE / $TOT  (this job added $(( NDONE - DONE_BEFORE )))"
