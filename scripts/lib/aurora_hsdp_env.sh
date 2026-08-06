@@ -39,7 +39,28 @@ export FI_CXI_RX_MATCH_MODE=hybrid
 export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export PYTHONFAULTHANDLER=1
-export TMPDIR=${TMPDIR:-/tmp}
+# HARD-SET, and it is the same `:-` trap as the FI_* block above: this line used
+# to read ${TMPDIR:-/tmp}, and PBS ALWAYS sets TMPDIR, so the guard never fired
+# and the intended /tmp was never applied. Required for num_workers>0:
+#
+#   PBS TMPDIR              /var/tmp/pbs.<jobid>.<server>       68 chars
+#   + PALS per-launch uuid  .../<uuid>/tmp                     109   (+41)
+#   + /pymp-XXXXXXXX/listener-XXXXXXXX                         141   cap 107
+#
+# AF_UNIX sun_path is capped at 108 incl. NUL, so python multiprocessing's
+# resource_sharer listener cannot bind: `OSError: AF_UNIX path too long`. It is
+# raised on the non-fatal queue feeder THREAD, so the loader never delivers a
+# batch and the run HANGS rather than erroring -- that is symptom (B), job
+# 8740716's n1_nw2_prof rung, 0 iterations. Measured from inside the ranks in
+# job 8740830; do NOT re-derive it from a login or job shell, both of which
+# miss the UUID and report a passing ~102.
+#
+# TMPDIR headroom is 107-32 = 75 chars. /tmp leaves 71 spare even after PALS.
+# ALCF documents this (user-guides aurora/known-issues.md #7, "Set TMPDIR to
+# avoid AF_UNIX path too long"), and all four BaseMM_PRISM Aurora launchers
+# already export TMPDIR=/tmp. /tmp on Aurora compute is a 504 G node-local
+# tmpfs, so nothing is lost by moving off the PBS dir.
+export TMPDIR=/tmp
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
 export http_proxy="http://proxy.alcf.anl.gov:3128"
 export https_proxy="http://proxy.alcf.anl.gov:3128"

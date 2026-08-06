@@ -363,6 +363,18 @@ def main(args, resume_preempt=False):
         # dataload-time purely because decode runs inline instead of prefetched.
         f"num_workers={num_workers} pin_mem={pin_mem} "
         f"persistent_workers={persistent_workers} "
+        # TMPDIR AS THE RANK SEES IT, which is not what the launcher exported:
+        # PALS appends a per-mpiexec-launch /<uuid>/tmp, adding ~41 chars. At
+        # num_workers>0 that is load-bearing -- python multiprocessing builds an
+        # AF_UNIX listener at TMPDIR + 32 chars against a 107-byte cap, so a
+        # TMPDIR over 75 chars makes the loader silently never deliver a batch
+        # (the OSError lands on a non-fatal feeder thread; the run just hangs).
+        # PBS's default is 68 and becomes 109 under PALS. Logged for the same
+        # reason as num_workers above: otherwise a hung run's TMPDIR is
+        # unrecoverable from its own artifacts.
+        f"tmpdir={os.environ.get('TMPDIR', '')!r}"
+        f"({len(os.environ.get('TMPDIR', ''))}"
+        f"{'>75 AF_UNIX RISK at nw>0' if len(os.environ.get('TMPDIR', '')) > 75 else ''}) "
         f"-> effective global batch "
         f"{world_size * batch_size * true_accum} "
         f"({world_size} ranks x bs {batch_size} x accum {true_accum})"

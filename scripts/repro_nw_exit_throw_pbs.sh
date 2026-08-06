@@ -205,7 +205,13 @@ $( [ "$rc" -eq 137 ] && echo "  <-- TIMED OUT after ${STAGE_TIMEOUT}s (hung)" )"
   # RuntimeError at import killed all 12 ranks in every stage in <1s, and the
   # summary reported four stages of "no symptom" -- an absence of evidence
   # printed as evidence of absence. Never let that render as a result again.
-  ran=$(grep -l "stage=$stage" "$OUT/$stage.rank."*.out 2>/dev/null | wc -l)
+  # Match on $pystage, not $stage: the fix arms run the `bare` stage under a
+  # different arm name, so the banner they print says `stage=bare`. Matching
+  # the arm name found 0 and cried STAGE DID NOT RUN over bare_tmpdir -- the
+  # one arm that fully passed (rc=0, 12/12 batches). A guard against
+  # nothing-happened rendering as a result must not itself render a result as
+  # nothing-happened.
+  ran=$(grep -l "stage=$pystage" "$OUT/$stage.rank."*.out 2>/dev/null | wc -l)
   if [ "$ran" -eq 0 ]; then
     echo "  !! STAGE DID NOT RUN -- 0/12 ranks reached the banner. The counters"
     echo "     above are meaningless. First error:"
