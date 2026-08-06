@@ -59,14 +59,18 @@ import sys
 import time
 
 # Arm BEFORE torch is imported, so a crash during import is still caught.
+# enable() ALREADY covers the fatal four (SIGABRT/SIGSEGV/SIGBUS/SIGFPE), and
+# SIGABRT is what `terminate called after throwing` raises -- so this one call is
+# the whole abort-time dump. Calling faulthandler.register() on them instead
+# raises `RuntimeError: signal 6 cannot be registered, use enable() instead`,
+# which killed the first run of this script at import in every rank before any
+# stage did work. Only SIGTERM needs register(), and only because enable() does
+# not cover non-fatal signals.
 faulthandler.enable(all_threads=True)
-# SIGABRT is what `terminate called after throwing` raises. Without this the
-# Python side of the stack is lost and only the C++ message survives.
-for _sig in ("SIGABRT", "SIGSEGV", "SIGBUS", "SIGFPE"):
-    try:
-        faulthandler.register(getattr(signal, _sig), all_threads=True, chain=True)
-    except (AttributeError, ValueError):
-        pass
+try:
+    faulthandler.register(signal.SIGTERM, all_threads=True, chain=True)
+except (AttributeError, ValueError, RuntimeError):
+    pass
 
 import torch  # noqa: E402
 import torch.multiprocessing as mp  # noqa: E402

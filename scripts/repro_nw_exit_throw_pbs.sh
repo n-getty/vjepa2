@@ -85,7 +85,30 @@ cd "$OUT"   # cores land here, not in the repo
 
 echo "=== nw throw bisect, jobid=$PBS_JOBID ==="
 echo "node : $(hostname)"
+# TMPDIR is deliberately NOT overridden. PBS sets it per-job to
+# /var/tmp/pbs.<jobid>..., and torch derives the shm socket path from it, so the
+# directory that torch_shm_manager tries to create its socket in is job-scoped
+# and torn down with the job. That is a candidate for symptom (B) EINVAL worth
+# recording at every run -- but only a candidate: the ladder rung that FAILED and
+# the 8n rung that WORKED were both ordinary PBS jobs with the same scheme, so
+# TMPDIR alone does not separate them. Print it, do not assume it.
 echo "tmp  : TMPDIR=$TMPDIR  df /tmp: $(df -h /tmp | tail -1)"
+echo "       TMPDIR writable: $(test -w "$TMPDIR" && echo yes || echo NO)  \
+len=$(printf %s "$TMPDIR" | wc -c) chars"
+# A unix socket path is capped at 108 bytes of sun_path including the NUL, and
+# OVERFLOWING IT IS REPORTED AS EINVAL -- the exact error symptom (B) shows. Worth
+# measuring, because Aurora's PBS TMPDIR is long: the failing job's was
+#   /var/tmp/pbs.8740716.aurora-pbs-0001.hostmgmt.cm.aurora.alcf.anl.gov  (68 ch)
+# and torch appends /torch-shm-dir-XXXXXX/manager.sock (34), giving 102.
+#
+# 102 < 107, so IT FITS, and this is NOT by itself the explanation -- said
+# plainly so the next reader does not spend the slot re-deriving it. It is
+# printed anyway because the margin is 5 bytes: a longer hostname, jobid, or
+# server name pushes an otherwise-identical run over, and then the failure would
+# be real and would look like a mystery. The guard fires only on the real limit.
+_sockguess=$(( $(printf %s "$TMPDIR" | wc -c) + 34 ))
+echo "       est. shm socket path len ~${_sockguess} / 107 usable sun_path bytes\
+$( [ "$_sockguess" -gt 107 ] && echo '  <-- OVER THE LIMIT: EINVAL is explained' )"
 echo "shm  : $(ls -ld /dev/shm 2>/dev/null); df /dev/shm: $(df -h /dev/shm | tail -1)"
 echo "ulimit -n: $(ulimit -n)   -c: $(ulimit -c)"
 # Symptom (B) is a socket/FD-creation failure, so capture the limits and the
@@ -109,6 +132,22 @@ for stage in sigterm bare xpu dist; do
   cln=$(grep -l "exiting main" "$OUT/$stage.rank."*.out 2>/dev/null | wc -l)
   rel=$(grep -l "loader released cleanly" "$OUT/$stage.rank."*.out 2>/dev/null | wc -l)
   echo "  ranks: exit-throw=$thr/12  shm-spawn-fail=$shm/12  reached-exit=$cln/12  loader-released=$rel/12"
+
+  # DID THE STAGE ACTUALLY RUN? Every rank prints a banner as its first act. If
+  # none did, the script died before doing any work and all four counters above
+  # are zeros-because-nothing-happened, which reads identically to
+  # zeros-because-clean. The first run of this job hit exactly that: a
+  # RuntimeError at import killed all 12 ranks in every stage in <1s, and the
+  # summary reported four stages of "no symptom" -- an absence of evidence
+  # printed as evidence of absence. Never let that render as a result again.
+  ran=$(grep -l "stage=$stage" "$OUT/$stage.rank."*.out 2>/dev/null | wc -l)
+  if [ "$ran" -eq 0 ]; then
+    echo "  !! STAGE DID NOT RUN -- 0/12 ranks reached the banner. The counters"
+    echo "     above are meaningless. First error:"
+    grep -hE "Error|Traceback" -A3 "$OUT/$stage.rank."*.err 2>/dev/null | head -8
+  elif [ "$ran" -lt 12 ]; then
+    echo "  !! only $ran/12 ranks started -- partial stage, treat counters as a lower bound"
+  fi
 done
 
 echo ""

@@ -234,8 +234,30 @@ def finalize(args, shards):
     name = os.path.basename(os.path.normpath(args.output))
     partials = sorted(glob.glob(os.path.join(args.output, "_partial_*.json")))
     merged = {}
+    # The encode settings must come from the PARTIALS, not from args. --finalize
+    # is a separate invocation and callers do not repeat the encode flags on it,
+    # so args.short_side/crf/gop are whatever argparse defaulted to -- which is
+    # how cholec80_g16 got stamped `short_side: 512` after being encoded at
+    # short_side=0. The files were correct (verified 480x854 native, unscaled);
+    # only the provenance record lied, which is the worse failure of the two:
+    # bad pixels get noticed, a bad manifest gets believed.
+    enc = {}
     for p in partials:
-        merged.update(json.load(open(p)).get("per_shard", {}))
+        d = json.load(open(p))
+        merged.update(d.get("per_shard", {}))
+        for k in ("short_side", "crf", "gop"):
+            if k in d:
+                enc.setdefault(k, set()).add(d[k])
+    # Disagreement across partials means the output dir mixes two encodes -- e.g.
+    # a resumed job run with different flags. Name it rather than silently pick.
+    mixed = {k: sorted(v) for k, v in enc.items() if len(v) > 1}
+    if mixed:
+        print(f"WARNING: partials disagree on encode settings {mixed}; this output "
+              "directory mixes encodes and its manifest cannot describe it.",
+              file=sys.stderr)
+    def _enc(key, fallback):
+        v = enc.get(key)
+        return sorted(v) if v and len(v) > 1 else (next(iter(v)) if v else fallback)
     out_shards = sorted(f for f in os.listdir(args.output) if f.endswith(".tar"))
     total_samp = sum(v["samples"] for v in merged.values())
     total_ok = sum(v["enc_ok"] for v in merged.values())
@@ -251,7 +273,8 @@ def finalize(args, shards):
                "enc_ok": total_ok, "enc_fail": total_fail,
                "bytes_in_gb": round(bytes_in / 1e9, 2), "bytes_out_gb": round(bytes_out / 1e9, 2),
                "size_pct": round(100 * bytes_out / bytes_in, 1) if bytes_in else 0.0,
-               "short_side": args.short_side, "crf": args.crf, "gop": args.gop,
+               "short_side": _enc("short_side", args.short_side),
+               "crf": _enc("crf", args.crf), "gop": _enc("gop", args.gop),
                "shards_processed": len(merged), "shards_expected": len(shards)}
     with open(os.path.join(args.output, "reshard_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
