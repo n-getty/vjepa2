@@ -51,7 +51,40 @@
 #
 # Idempotent (existing output shards are skipped), sample COUNT is preserved, and
 # a failed encode copies the ORIGINAL bytes through rather than dropping data. So
-# a job that runs out of walltime is resumed by resubmitting it unchanged.
+# a job that runs out of walltime is resumed by resubmitting it -- but
+#
+#   *** A RESUME MUST REUSE THE SAME select= AND NW= AS THE RUN IT RESUMES. ***
+#
+# Shards are safe at any layout (written .tmp then os.replace, so a killed shard
+# leaves a .tmp the resume does not skip). The MANIFEST is not. Provenance lives
+# in _partial_{lo}_{hi}.json, whose name is the shard range a proc owned, and
+# the range is derived from nodes x NW. Resume at a different layout and the
+# ranges are renamed and overlapping, so finalize() cannot match the new
+# partials against the old ones -- it sums per_shard for sample_count and
+# silently reports only the shards the RESUME touched. Measured on a 4-shard
+# fixture: sample_count 4 against a truth of 8, with shard_count correct and
+# nothing on stderr (fixed 0626c19: same-layout resumes now merge, and finalize
+# hard-errors on all-shards-present-but-fewer-described). A complete corpus with
+# a short manifest is the worst outcome here -- bad pixels get noticed, a bad
+# manifest gets believed.
+#
+# SIZING, measured rather than predicted (cholec80 job 8740763, surgvu24
+# 8740788): cost is ~23 s PER SAMPLE (cholec80 21.2, surgvu24 25.2) and
+# bytes/sample does NOT predict it -- cholec80 is 3x the bytes per sample and
+# FASTER. Size a job by samples/shard, not by GB:
+#
+#   source          samples/shard   -> ~single-shard wall at FFT=4
+#   sitl_2026                 8.0      ~3 min
+#   cholec80                 11.4      ~4 min
+#   surgvu24_clean           20.2      ~8 min
+#   lemon                   101.6      ~39 min      <-- against a 1 h cap
+#
+# A shard is INDIVISIBLE, so single-shard wall is a floor no node count lowers.
+# When it approaches the cap, spend the node's threads on latency instead of
+# throughput: NW=16 FFT=8 is the same 128 threads/node as the default NW=32
+# FFT=4, but halves the time for any one shard. That is why lemon runs
+# select=33 NW=16 FFT=8 (528 procs = exactly 1 shard each) rather than the
+# 16 nodes the table below suggests.
 #
 # NOTE: no `set -u` (memory set-u-module-load-trap: Lmod init trips it).
 #
@@ -120,6 +153,35 @@ fi
 echo "arm    : short_side=$SHORT (0 = native pixels, GOP only)  gop=16 crf=23"
 echo "in     : $IN"
 echo "out    : $OUT"
+
+# RESUME LAYOUT GUARD. Provenance lives in _partial_{lo}_{hi}.json and the range
+# width is STEP, so resuming at a different STEP renames every partial. The old
+# ones then describe shards that finalize() cannot match to the new ranges, and
+# sample_count silently reports only what the resume touched -- a complete shard
+# set with a short manifest. Guard on STEP rather than on nodes/NW: STEP is what
+# the names are actually derived from, so a resume at half the nodes and double
+# NW is legal and correctly passes.
+PRIOR_STEP=""
+for f in "$OUT"/_partial_*.json; do
+  [ -e "$f" ] || break
+  b=$(basename "$f" .json); b=${b#_partial_}
+  PRIOR_STEP=$(( ${b#*_} - ${b%_*} ))
+  break
+done
+if [ -n "$PRIOR_STEP" ] && [ "$PRIOR_STEP" -ne "$STEP" ]; then
+  echo
+  echo "FATAL: $OUT already holds partials at STEP=$PRIOR_STEP; this job would"
+  echo "       write STEP=$STEP. Resuming at a different layout renames the"
+  echo "       _partial_ ranges, and finalize() would then undercount"
+  echo "       sample_count while reporting a complete shard set -- a corpus"
+  echo "       that looks whole with a manifest that is short."
+  echo
+  echo "       Resubmit with the layout that produced the existing partials"
+  echo "       (STEP=$PRIOR_STEP, i.e. $(( (TOT + PRIOR_STEP - 1) / PRIOR_STEP )) procs:"
+  echo "       e.g. -l select=$(( ((TOT + PRIOR_STEP - 1) / PRIOR_STEP + NW - 1) / NW )) with NW=$NW),"
+  echo "       or start clean by removing $OUT."
+  exit 1
+fi
 date
 
 # Stale .tmp from an interrupted run would otherwise be mistaken for output.
