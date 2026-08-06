@@ -10,6 +10,7 @@ import os
 import pathlib
 import tarfile
 import tempfile
+import time
 from logging import getLogger
 
 import numpy as np
@@ -54,6 +55,72 @@ _DEFAULT_MIN_CLIP_STD = float(os.environ.get("VJEPA_MIN_CLIP_STD", "1.0"))
 _LOG_FIRST_N = int(os.environ.get("VJEPA_LOG_FIRST_N", "64"))
 _DIAG_EVERY = int(os.environ.get("VJEPA_DIAG_EVERY", "500"))
 _clip_diag = {"seen": 0, "dropped": {}, "kept": {}}
+
+# --- Per-source decode timing (VJEPA_DECODE_PROFILE=1, default OFF) --------
+# The 1n->8n scaling loss is an order statistic over a heavy per-rank dataload
+# tail: the per-rank distribution is IDENTICAL at every rung (p50 1.2 s, p99
+# ~22 s, p(>10 s) 0.098) and only max-over-ranks grows. Reducing that tail is
+# the only lever that changes the asymptote, so the tail's OWNER has to be
+# identified rather than guessed.
+#
+# The standing candidate is source heterogeneity. Per-clip payload spans ~45x
+# across the 16 sources (metadata + on-disk shard sizes): sitl_2026 51 MB/clip,
+# grasp_noleak 83, multibypass140 30, against pe_video's 1.6. Under the
+# realized T=0.5 mixture, p(a clip is drawn from a >30 MB/clip source) = 0.1037
+# -- suspiciously close to the measured p(dataload > 10 s) = 0.098. That
+# numerical agreement is a COINCIDENCE UNTIL MEASURED: it is consistent with a
+# payload-driven tail, and equally consistent with a DAOS-side stall that has
+# nothing to do with which source was drawn. Two numbers matching is not
+# evidence of a mechanism.
+#
+# This records, per source, the wall time of the decode call itself and the
+# gap since the previous sample left this worker. The split is the point:
+#   * decode_ms  -- demux + frame extraction, i.e. CPU-side payload cost;
+#   * gap_ms     -- time upstream (tar read / DAOS / shuffle buffer) to produce
+#                   the next sample, i.e. storage-side cost.
+# A payload story predicts the tail lives in decode_ms and tracks MB/clip. A
+# storage story predicts it lives in gap_ms and does NOT sort by source. They
+# are distinguishable, which is the whole reason to split them.
+#
+# Canonical-worker only and OFF by default: this is one time.time() pair per
+# sample, but the log line is what costs, and at 3072 ranks any per-sample line
+# is what took out job 8730678's head node.
+_DECODE_PROFILE = os.environ.get("VJEPA_DECODE_PROFILE", "0") == "1"
+_DECODE_EVERY = int(os.environ.get("VJEPA_DECODE_PROFILE_EVERY", "200"))
+_decode_prof = {"n": 0, "last_exit": None, "by_src": {}}
+
+
+def _record_decode(source_name, decode_s, gap_s):
+    """Accumulate per-source decode/gap timings; emit a table periodically."""
+    src = source_name or "?"
+    d = _decode_prof["by_src"].setdefault(src, {"n": 0, "dec": [], "gap": []})
+    d["n"] += 1
+    # Bounded memory: keep a reservoir of the most recent samples per source.
+    # Percentiles of the tail are the point, so a plain cap (not a mean) is
+    # required -- a running mean would average the tail away.
+    for k, v in (("dec", decode_s), ("gap", gap_s)):
+        d[k].append(v)
+        if len(d[k]) > 512:
+            del d[k][0]
+    _decode_prof["n"] += 1
+    if _decode_prof["n"] % _DECODE_EVERY:
+        return
+    rows = []
+    for s, v in _decode_prof["by_src"].items():
+        dec, gap = sorted(v["dec"]), sorted(v["gap"])
+        if not dec:
+            continue
+        q = lambda a, p: a[min(len(a) - 1, int(p * (len(a) - 1)))]  # noqa: E731
+        rows.append((s, v["n"], q(dec, 0.5), q(dec, 0.99), max(dec),
+                     q(gap, 0.5), q(gap, 0.99), max(gap)))
+    rows.sort(key=lambda r: -r[4])
+    logger.info(
+        "[decode-prof] n=%d  src / n / decode p50,p99,max s / gap p50,p99,max s\n%s",
+        _decode_prof["n"],
+        "\n".join(
+            "  %-24s %6d  %6.2f %6.2f %6.2f   %6.2f %6.2f %6.2f" % r for r in rows
+        ),
+    )
 
 
 def _is_canonical_worker():
@@ -534,7 +601,19 @@ class _PerSampleDecode:
         self.source_name = source_name
 
     def __call__(self, sample):
-        return self.decoder.decode(sample, self.fpc, source_name=self.source_name)
+        if not (_DECODE_PROFILE and _is_canonical_worker()):
+            return self.decoder.decode(sample, self.fpc, source_name=self.source_name)
+        # gap = time since the PREVIOUS sample left this worker, i.e. everything
+        # upstream of us (tar read / DAOS / shuffle buffer refill). decode = our
+        # own demux+extract. Splitting them is what separates a payload-cost tail
+        # from a storage-stall tail; see _record_decode.
+        _t0 = time.time()
+        _gap = 0.0 if _decode_prof["last_exit"] is None else _t0 - _decode_prof["last_exit"]
+        out = self.decoder.decode(sample, self.fpc, source_name=self.source_name)
+        _t1 = time.time()
+        _decode_prof["last_exit"] = _t1
+        _record_decode(self.source_name, _t1 - _t0, _gap)
+        return out
 
 
 def _make_stream(meta, dataset_dir, decoder, fpc, shuffle_buffer=1000,
