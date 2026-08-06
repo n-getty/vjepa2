@@ -96,16 +96,23 @@ echo "tmp  : TMPDIR=$TMPDIR  df /tmp: $(df -h /tmp | tail -1)"
 echo "       TMPDIR writable: $(test -w "$TMPDIR" && echo yes || echo NO)  \
 len=$(printf %s "$TMPDIR" | wc -c) chars"
 # A unix socket path is capped at 108 bytes of sun_path including the NUL, and
-# OVERFLOWING IT IS REPORTED AS EINVAL -- the exact error symptom (B) shows. Worth
-# measuring, because Aurora's PBS TMPDIR is long: the failing job's was
-#   /var/tmp/pbs.8740716.aurora-pbs-0001.hostmgmt.cm.aurora.alcf.anl.gov  (68 ch)
-# and torch appends /torch-shm-dir-XXXXXX/manager.sock (34), giving 102.
+# OVERFLOWING IT IS REPORTED AS EINVAL -- the exact error symptom (B) shows.
 #
-# 102 < 107, so IT FITS, and this is NOT by itself the explanation -- said
-# plainly so the next reader does not spend the slot re-deriving it. It is
-# printed anyway because the margin is 5 bytes: a longer hostname, jobid, or
-# server name pushes an otherwise-identical run over, and then the failure would
-# be real and would look like a mystery. The guard fires only on the real limit.
+# THIS ESTIMATE IS FOR THE torch_shm_manager SOCKET ONLY, AND IT FITS: TMPDIR is
+# 68 chars, torch appends /torch-shm-dir-XXXXXX/manager.sock (34), giving 102 of
+# 107. Keep it, because the margin is 5 bytes and a longer jobid or hostname
+# would push an identical run over.
+#
+# BUT IT IS NOT THE ONLY AF_UNIX PATH IN PLAY, and job 8740789 died on the other
+# one: `OSError: AF_UNIX path too long` from multiprocessing/connection.py:608,
+# in Python's own resource_sharer, whose listener path is built from
+# get_temp_dir() + a random name -- a different, longer construction than
+# torch's. So a PASS on the line below does not clear the job: read the
+# per-stage `af_unix=` counter and the worker's printed `listener=` length,
+# which are measured from inside the process that fails rather than estimated
+# here. (Do not compute either off-node: tempfile.gettempdir() falls back to
+# /tmp when TMPDIR does not exist, so a login-node probe measures 36 bytes and
+# silently answers a different question.)
 _sockguess=$(( $(printf %s "$TMPDIR" | wc -c) + 34 ))
 echo "       est. shm socket path len ~${_sockguess} / 107 usable sun_path bytes\
 $( [ "$_sockguess" -gt 107 ] && echo '  <-- OVER THE LIMIT: EINVAL is explained' )"
@@ -116,22 +123,63 @@ echo "ulimit -n: $(ulimit -n)   -c: $(ulimit -c)"
 echo "stale torch-shm dirs in /tmp: $(ls -d /tmp/torch-shm-dir-* 2>/dev/null | wc -l)"
 date
 
-for stage in sigterm bare xpu dist; do
+# Stage list. Beyond the four layer stages, two FIX ARMS run at the end against
+# whichever layer failed -- `bare`, the smallest thing that reproduces it.
+#
+# ARM 1 winit: re-apply set_sharing_strategy INSIDE the worker. Job 8740789
+#   showed the parent's setting does not cross the spawn boundary: the worker
+#   traceback reaches reductions.py:616 DupFd, which is in the `else` branch and
+#   is unreachable under file_system (that returns at :603). So the parent ran
+#   file_system and the workers ran file_descriptor. main_dist_aurora.py:358
+#   therefore protects the parent and not the population that fails.
+# ARM 2 tmpdir: force a short TMPDIR. Independent of strategy -- it shortens the
+#   AF_UNIX path instead of avoiding the socket. Run both: if only winit fixes
+#   it the cause is the strategy, if only tmpdir does it is the path length, and
+#   if both do then either is a valid fix and we pick on other grounds.
+STAGES="sigterm bare xpu dist bare_winit bare_tmpdir"
+
+# A hung stage must cost only itself. Stage `bare` in 8740789 hung on the
+# non-fatal feeder-thread exception and consumed the remaining walltime, so
+# three stages never ran and the job produced one usable line.
+STAGE_TIMEOUT=${STAGE_TIMEOUT:-180}
+
+for stage in $STAGES; do
   echo ""
   echo "########## STAGE $stage ##########"
+  extra=""
+  pystage="$stage"
+  case "$stage" in
+    bare_winit)  pystage=bare; extra="--worker-init 1" ;;
+    bare_tmpdir) pystage=bare; extra="--short-tmpdir /tmp" ;;
+  esac
   t0=$(date +%s)
+  timeout -s KILL "$STAGE_TIMEOUT" \
   mpiexec -n 12 -ppn 12 --cpu-bind depth --depth 16 --no-vni \
       -o "$OUT/$stage.rank.%r.out" -e "$OUT/$stage.rank.%r.err" \
       python "$ROOT/scripts/repro_nw_exit_throw.py" \
-          --stage "$stage" --num-workers 2
+          --stage "$pystage" --num-workers 2 $extra
   rc=$?
-  echo "stage $stage rc=$rc in $(( $(date +%s) - t0 ))s"
+  echo "stage $stage rc=$rc in $(( $(date +%s) - t0 ))s\
+$( [ "$rc" -eq 137 ] && echo "  <-- TIMED OUT after ${STAGE_TIMEOUT}s (hung)" )"
+  # Stray ranks from a killed mpiexec would poison the next stage's port and
+  # core count, so clear them before moving on.
+  pkill -9 -f repro_nw_exit_throw.py 2>/dev/null
 
   thr=$(grep -l "std::system_error" "$OUT/$stage.rank."*.err 2>/dev/null | wc -l)
   shm=$(grep -l "torch_shm_manager" "$OUT/$stage.rank."*.err 2>/dev/null | wc -l)
+  # AF_UNIX is the signature that actually appeared (48 hits, 12/12 ranks). It
+  # is raised on the queue feeder THREAD and is non-fatal, so it never reaches
+  # an exit code -- counting it explicitly is the only way it shows up.
+  afu=$(grep -l "AF_UNIX path too long" "$OUT/$stage.rank."*.err 2>/dev/null | wc -l)
   cln=$(grep -l "exiting main" "$OUT/$stage.rank."*.out 2>/dev/null | wc -l)
   rel=$(grep -l "loader released cleanly" "$OUT/$stage.rank."*.out 2>/dev/null | wc -l)
-  echo "  ranks: exit-throw=$thr/12  shm-spawn-fail=$shm/12  reached-exit=$cln/12  loader-released=$rel/12"
+  con=$(grep -l "consumed" "$OUT/$stage.rank."*.out 2>/dev/null | wc -l)
+  echo "  ranks: exit-throw=$thr/12  shm-spawn-fail=$shm/12  af_unix=$afu/12"
+  echo "         got-batches=$con/12  reached-exit=$cln/12  loader-released=$rel/12"
+  # What the workers resolved, first rank only -- 12 copies of the same line is
+  # noise, and any disagreement between ranks shows up in the counters above.
+  grep -h "^\[worker pid=" "$OUT/$stage.rank.0.out" 2>/dev/null | head -1
+  grep -h "TMPDIR=" "$OUT/$stage.rank.0.out" 2>/dev/null | head -1
 
   # DID THE STAGE ACTUALLY RUN? Every rank prints a banner as its first act. If
   # none did, the script died before doing any work and all four counters above
@@ -156,12 +204,26 @@ ls -la "$OUT"/core* 2>/dev/null || echo "(none -- check /proc/sys/kernel/core_pa
 cat /proc/sys/kernel/core_pattern 2>/dev/null
 echo ""
 echo "=== READING THIS ==="
-echo "shm-spawn-fail on a stage  -> symptom (B), worker spawn. That stage's layer owns it."
+echo "-- layer stages (sigterm/bare/xpu/dist), first one that fails names the layer:"
+echo "af_unix>0 + got-batches=0  -> symptom (B). The loader never delivers; the"
+echo "                              OSError is on the feeder thread so the process"
+echo "                              HANGS rather than exits. rc=137 confirms it."
+echo "shm-spawn-fail on a stage  -> symptom (B) via a different path, worker spawn."
 echo "exit-throw on sigterm      -> symptom (A) is generic signal-kill, NOT workers."
 echo "exit-throw first at bare   -> multiprocessing teardown, independent of XPU/xccl."
 echo "exit-throw first at xpu    -> XPU allocator/runtime destructor ordering."
 echo "exit-throw first at dist   -> xccl teardown vs worker processes."
 echo "loader-released < reached-exit -> the throw is in the loader destructor itself."
+echo ""
+echo "-- fix arms, both against \`bare\`. A fix arm is only meaningful if plain"
+echo "   \`bare\` FAILED in this same job; if bare passed, the arms prove nothing."
+echo "bare_winit  got-batches=12 -> the cause is the SHARING STRATEGY not crossing"
+echo "                              spawn. Fix: worker_init_fn in the real loader."
+echo "bare_tmpdir got-batches=12 -> the cause is TMPDIR LENGTH. Fix: short TMPDIR"
+echo "                              exported in the launcher, before python starts."
+echo "both pass                  -> either fix works; choose on blast radius."
+echo "neither passes             -> both candidates are wrong; the worker's own"
+echo "                              printed strategy/listener line says why."
 echo "no symptom in any stage    -> the repro is too small; it needs the real"
 echo "                              decode path or the 22.8 GB model, and the next"
 echo "                              step is a real rung at VJEPA_HARD_EXIT=0."

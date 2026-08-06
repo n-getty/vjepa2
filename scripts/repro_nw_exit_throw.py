@@ -77,6 +77,28 @@ import torch.multiprocessing as mp  # noqa: E402
 from torch.utils.data import DataLoader, Dataset  # noqa: E402
 
 
+_ANNOUNCED = False
+
+
+def _worker_init(_wid):
+    """Re-apply the sharing strategy INSIDE the worker.
+
+    This is the candidate fix, run as an arm (`--worker-init 1`) rather than
+    asserted. `mp.set_sharing_strategy` in the parent does not cross a `spawn`
+    boundary, so `main_dist_aurora.py:358` protects the parent process and
+    nothing else -- while the population that fails is the workers. DataLoader's
+    worker_init_fn runs in the child, which is the only place the setting can
+    take effect for them.
+
+    Why it should matter here: `file_descriptor` sends storages by passing an fd
+    over a `multiprocessing.resource_sharer` AF_UNIX socket, and it is that
+    socket's path that overflows. `file_system` passes a filename instead and
+    never constructs the listener at all -- so if the strategy is the cause, this
+    removes the failing code path rather than shortening its path.
+    """
+    mp.set_sharing_strategy("file_system")
+
+
 class TinyDataset(Dataset):
     """Deliberately trivial. The subject is worker teardown, not decode -- any
     real decode work would add ffmpeg/decord destructors to the suspect list."""
@@ -88,6 +110,29 @@ class TinyDataset(Dataset):
         return self.n
 
     def __getitem__(self, i):
+        # Report, ONCE per worker, what the sharing strategy actually is in the
+        # child. The parent's mp.set_sharing_strategy() is a process-local
+        # global; under `spawn` the child re-imports torch and gets the DEFAULT.
+        # Job 8740789's traceback proves the divergence: it reaches
+        # reductions.py:616 `DupFd`, which lives in the `else` branch --
+        # `file_system` returns at :603 via _share_filename_cpu_() and can never
+        # get there. So the parent said file_system and the worker did
+        # file_descriptor. Printed, not assumed, because that inference is the
+        # whole finding.
+        global _ANNOUNCED
+        if not _ANNOUNCED:
+            _ANNOUNCED = True
+            import multiprocessing.connection as _mc
+            import multiprocessing.util as _mu
+            try:
+                a = _mc.arbitrary_address("AF_UNIX")
+                d = _mu.get_temp_dir()
+            except Exception as e:
+                a, d = f"<{type(e).__name__}>", "<?>"
+            print(f"[worker pid={os.getpid()}] strategy="
+                  f"{mp.get_sharing_strategy()} TMPDIR={os.environ.get('TMPDIR')!r} "
+                  f"pymp={d!r} listener={a!r} ({len(a)}/107)"
+                  f"{' <-- OVER' if len(a) > 107 else ''}", flush=True)
         return torch.full((3, 8, 64, 64), float(i % 7))
 
 
@@ -107,7 +152,20 @@ def main():
     ap.add_argument("--persistent", type=int, default=1)
     ap.add_argument("--sharing", default="file_system",
                     choices=["file_system", "file_descriptor"])
+    # The two candidate fixes, as arms. Neither is applied by default: the point
+    # is to see the failure first, then see it go away, one lever at a time.
+    ap.add_argument("--worker-init", type=int, default=0,
+                    help="re-apply set_sharing_strategy inside each worker")
+    ap.add_argument("--short-tmpdir", default="",
+                    help="override TMPDIR to this (e.g. /tmp) before any "
+                         "multiprocessing import caches gettempdir()")
     args = ap.parse_args()
+
+    # Must happen before anything calls tempfile.gettempdir(), which memoizes.
+    if args.short_tmpdir:
+        os.environ["TMPDIR"] = args.short_tmpdir
+        import tempfile as _t
+        _t.tempdir = None  # drop any memoized value
 
     rank, world, local = rank_env()
     tag = f"[repro r{rank}]"
@@ -124,6 +182,32 @@ def main():
     print(f"{tag} stage={args.stage} nw={args.num_workers} "
           f"persistent={bool(args.persistent)} sharing={args.sharing} "
           f"world={world} local={local}", flush=True)
+
+    # THE PATHS, AS THE RANK ACTUALLY RESOLVES THEM.
+    #
+    # Job 8740789 stage `bare` died 48 times with `OSError: AF_UNIX path too
+    # long` from multiprocessing/connection.py:608 -- and the same computation
+    # run on a LOGIN node gives a 36-byte path, 71 bytes under the cap. The two
+    # disagree because `tempfile.gettempdir()` probes TMPDIR for writability and
+    # silently falls back to /tmp when it is absent: on a login node the job's
+    # /var/tmp/pbs.<jobid>... does not exist, so the offline number measured a
+    # different program than the one that failed.
+    #
+    # So print it from inside the rank, where TMPDIR is real. Anything derived
+    # off-node about these paths is not evidence.
+    import multiprocessing.connection as _mc
+    import multiprocessing.util as _mu
+    import tempfile as _tf
+    try:
+        _dir = _mu.get_temp_dir()
+        _addr = _mc.arbitrary_address("AF_UNIX")
+        _over = " <-- OVER" if len(_addr) > 107 else ""
+        print(f"{tag} TMPDIR={os.environ.get('TMPDIR')!r} "
+              f"({len(os.environ.get('TMPDIR', ''))}) "
+              f"gettempdir={_tf.gettempdir()!r} pymp={_dir!r} ({len(_dir)}) "
+              f"listener={_addr!r} ({len(_addr)}/107){_over}", flush=True)
+    except Exception as e:  # never let instrumentation be the failure
+        print(f"{tag} path probe failed: {type(e).__name__}: {e}", flush=True)
 
     if args.stage == "sigterm":
         # No DataLoader at all. If this throws, the exception is a property of
@@ -162,8 +246,15 @@ def main():
         num_workers=args.num_workers,
         persistent_workers=bool(args.persistent) and args.num_workers > 0,
         pin_memory=False,
+        worker_init_fn=_worker_init if args.worker_init else None,
+        timeout=120 if args.num_workers > 0 else 0,
     )
 
+    # A hang is the expected failure here, not an exception: the AF_UNIX error is
+    # raised on the queue FEEDER THREAD, which is not fatal, so the main thread
+    # simply waits for batches that never come. Job 8740789 stage `bare` sat that
+    # way for the rest of the walltime and starved the three stages behind it.
+    # DataLoader's own `timeout` turns that into a raised error at a known point.
     n = 0
     for batch in loader:
         if device is not None:
