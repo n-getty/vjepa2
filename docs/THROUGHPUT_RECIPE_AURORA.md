@@ -21,6 +21,16 @@ Companion docs: `SCALEOUT_256N_STATUS.md` (the 256-node path and its blockers),
 > dataload. Still **not a default**: 2 of 24 ranks throw at teardown (0 of 24 at
 > nw0), and on short rungs the worker-fork overhead cuts the win to 1.27×.
 > Before tuning another CCL knob, read "Where the time actually goes".
+>
+> **AND (2026-08-06, job 8740093, first valid 1n baseline):** the 1n→8n loss to
+> 57% per-tile is an **order statistic, not a degradation**. The per-rank dataload
+> distribution is *identical* at every rung (p50 1.12/1.21/1.18/1.20 s,
+> p(>10 s) ≈ 0.098 throughout); only max-over-ranks grows, because a synchronous
+> step waits for the slowest of N draws from a heavy tail. `max dataload + 3.2 s`
+> predicts the wall at every rung to within 3%. **Adding nodes buys more lottery
+> tickets on the same tail; it makes nothing slower.** Reducing the p99 decode is
+> the only lever that changes the asymptote — nw=2 lowers the stall *rate*
+> (0.098 → 0.030) but not the shape. See "L1a ladder, 1n→8n".
 
 ---
 
@@ -599,15 +609,44 @@ What this run *does* establish, controlled (same allocation, same hour): nw2 thr
 on **2/24** ranks, nw0 on **0/24**; exit spread 31 s vs 3 s. The earlier version
 of that claim compared across a job boundary.
 
-Remaining untested lever, now the leading candidate given where the throw
-actually occurs:
-**`persistent_workers`**. `app/vjepa_2_1/train.py:217` records that it is not
-plumbed through `init_data`, so it is effectively False and workers are re-forked
-around each epoch. `app/vjepa/train.py:260` and `app/vjepa_droid/droid.py:66`
-both pass it (default True); the 2.1 trainer is the outlier.
+### Root cause found, fix landed (98ca1ce) — not yet hardware-validated
 
-Also unproven at scale: the failure appeared on node 2 of 2, so it is not
-obviously scale-free and needs a 64n hazard arm ([[scale-dependent-results-dont-transfer]]).
+The hard exit could never have reached this. `unsupervised_loader`
+(`train.py:572`) and `loader` (`:861`) are **locals of `main()`**, so
+`_MultiProcessingDataLoaderIter.__del__ → _shutdown_workers` fires at `main()`'s
+return — inside `app_main`, **upstream of `run_training`'s `finally`**. The exit
+is not misplaced, it is *unreachable*. That is consistent with every observation
+above: the throw and the 31 s straggle happen while `avg. loss` has printed but
+workers are still decoding.
+
+Two changes that are **one fix**:
+
+- **A.** `_LOADER_KEEPALIVE` (module-level list in `train.py`) retains the loader
+  past `main()`'s return, so the destructor never runs there and the process
+  leaves through `VJEPA_HARD_EXIT` instead. Daemonic workers are then reaped by
+  the kernel.
+- **B.** `persistent_workers` is now passed to `init_data`, default `True`,
+  matching `app/vjepa/train.py:116` and `app/vjepa_droid/train.py:117` — 2.1 was
+  the only trainer dropping it, so `data_manager.py`'s `False` default silently
+  won and the pool was re-forked at every epoch boundary.
+
+⚠️ **A without B is a no-op, and that is not a style claim.** The worker pool
+does not hang off the DataLoader, it hangs off `DataLoader._iterator`, and
+`__iter__` only stores it there when `persistent_workers and num_workers > 0`
+(`torch/utils/data/dataloader.py:485`). At `persistent_workers=False` every
+`iter()` returns a fresh unreferenced iterator, so retaining the loader retains
+nothing that owns a worker. Verified empirically through the real
+`_LenWrapper → WebLoader → DataLoader` chain, and pinned as a test so B cannot be
+reverted as "unrelated tuning" while silently un-fixing A.
+
+Inert on the `nw=0` path — `webdataset.py:787` ANDs with `num_workers > 0`.
+`tests/test_loader_teardown_survival.py`: 6 tests, mutation-verified 3/3.
+
+**Still unvalidated on hardware.** In flight: job 8740311 rung `8:nw2`, the first
+nw>0 run of the fixed code, at 4× the node count the failure was seen at. And
+still needs 64n before nw>0 becomes a default — the failure appeared on node 2 of
+2, so it is not obviously scale-free
+([[scale-dependent-results-dont-transfer]]).
 
 ⚠️ **The ladder's watchdog never armed for either rung** — `pid=$(start_watchdog)`
 blocks until the backgrounded subshell exits, so it returned a corpse's pid. That
@@ -665,6 +704,77 @@ every scale) hides the cost completely: a synchronous step pays
 blowup" that motivated this study were skew absorbed by each phase's first
 collective — `target_encoder` is HSDP-wrapped, so forward's first FSDP all-gather
 eats every millisecond of skew the dataloader created.
+
+## L1a ladder, 1n→8n — the scaling loss is an order statistic
+
+Job 8740093 (`-q debug-scaling -l select=8`, rungs `1 2 4 8`, ipe=40, nw=0,
+DAOS, probe on). **Full rank coverage at every rung** (12/24/48/96), 39 common
+iterations, iteration 0 dropped. This is the **first valid 1n baseline** — the
+historical one was a 16n run with 6% rank coverage.
+
+| rung | ranks | med iter | mean | max dload | max barrier | fwd | bwd | clips/s/tile | eff |
+|---|---|---|---|---|---|---|---|---|---|
+| n1 | 12 | 10.84 s | 13.05 s | 7.91 s | 7.48 s | 1.70 s | 1.26 s | 0.1846 | 100% |
+| n2 | 24 | 14.01 s | 14.53 s | 10.89 s | 8.99 s | 1.70 s | 1.40 s | 0.1427 | 77% |
+| n4 | 48 | 16.04 s | 16.88 s | 12.90 s | 12.57 s | 1.71 s | 1.48 s | 0.1247 | 68% |
+| n8 | 96 | 19.01 s | 20.43 s | 15.64 s | 15.08 s | 1.72 s | 1.56 s | 0.1052 | 57% |
+
+**The per-rank dataload distribution is identical at every rung.** Pooling every
+(rank, iteration) sample:
+
+| rung | n | p10 | p50 | p90 | p99 | mean | p(>10 s) |
+|---|---|---|---|---|---|---|---|
+| n1 | 468 | 0.47 | **1.12** | 9.93 | 21.58 | 2.97 | 0.098 |
+| n2 | 936 | 0.45 | **1.21** | 9.72 | 25.25 | 3.19 | 0.098 |
+| n4 | 1872 | 0.46 | **1.18** | 9.84 | 22.32 | 3.13 | 0.099 |
+| n8 | 3744 | 0.47 | **1.20** | 9.61 | 22.12 | 3.08 | 0.096 |
+
+Nothing per-rank degrades. What grows is **max-over-ranks**, because a
+synchronous step waits for the slowest of N draws from a heavy tail. The
+fraction of iterations containing at least one >10 s rank goes
+0.46 → 0.51 → 0.67 → **0.79**, and `max dataload + 3.2 s floor` reproduces the
+measured wall at every rung to within 3% (11.11/14.09/16.10/18.84 predicted vs
+10.84/14.01/16.04/19.01 measured).
+
+**Adding nodes is not making anything slower — it is buying more lottery tickets
+on the same tail.** The compute+comms floor (`iter − dataload − barrier`, per
+rank) moves 2.93 → 3.07 → 3.15 → **3.22 s** across an 8× node jump. Fabric
+tuning cannot address a 0.29 s term, which is why
+[[ccl-knobs-settled-at-64n]] found nothing left to tune.
+
+**H6 (warmup transient) is REFUTED.** The per-iteration trace is bursty end to
+end, not decaying: n8 hits 47.1 s at iter 9, 3.1 s at iter 38, 20.9 s at iter 39.
+Quarter-binned max-dataload does not descend monotonically at any rung. **The
+`trend` column is measuring burstiness, not warmup** — it reads 2.89× at *1n*,
+where no fabric is involved. Do not read it as "not yet steady state."
+
+⚠️ **Do not sum max-over-ranks columns.** `dataload` and `barrier` are
+anti-correlated by construction — the rank that loads fast is the one that waits
+longest — so taking each column's max independently and subtracting gives a
+nonsense −7.5 s residual at 1n. Decompose **per rank**, then aggregate.
+
+⚠️ **Stalls are node-clustered, so the iid order-statistic model over-predicts**
+by 26–40%. At n8 a stall event hits a median of 6 ranks spread over only 4 nodes;
+iid would spread 6 over ~6. Consistent with a shared per-node DAOS client, but
+that is a hypothesis — not traced. Use the model for the shape of the argument,
+not as a quantitative predictor.
+
+**What this means for `num_workers`.** nw=2 does not remove the tail (p99 still
+19.1 s vs nw=0's 26.1 s) — it makes it **rarer**, p(>10 s) 0.098 → 0.030. Per
+iteration at 2n:
+
+| arm | iters with a >10 s rank | their median wall | others' median wall |
+|---|---|---|---|
+| nw2 | **5/39** | 30.79 s | **3.39 s** |
+| nw0 | **23/39** | 17.79 s | 7.56 s |
+
+When nw=2 does stall it is *worse*, but it stalls one sixth as often and clean
+iterations run at the 3.4 s floor instead of 7.6 s. Since the loss is
+`1−(1−p)^N` saturating, the nw=0 curve should flatten once nearly every iteration
+contains a stall — which is exactly the 64n≈256n flatness already on record.
+**nw=2 lowers p but does not change the shape**: it buys a constant factor and
+pushes the knee out. Reducing the *tail itself* (p99 ≈ 22 s per-rank decode) is
+the only lever that changes the asymptote.
 
 ## Scaling ladder (`scripts/scaling_ladder.sh`)
 
