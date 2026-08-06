@@ -364,6 +364,23 @@ def run_training(args):
 
     # torch.multiprocessing default sharing strategy exhausts FDs under XPU
     # dataloader workers; file_system is the documented Aurora fallback.
+    #
+    # SCOPE WARNING -- this call covers THIS PROCESS ONLY, not the DataLoader
+    # workers, which is the population it reads as protecting. The strategy is a
+    # process-local global in torch.multiprocessing, and the loader start method
+    # is `spawn` (train.py:329), so each worker re-imports torch and comes up
+    # with the DEFAULT strategy regardless of what was set here.
+    #
+    # Measured, not inferred (job 8740789): worker tracebacks reach
+    # torch/multiprocessing/reductions.py:616 `DupFd`, which sits in the
+    # `else` branch of reduce_storage -- unreachable under file_system, which
+    # returns at :603 via _share_filename_cpu_(). The workers were on
+    # file_descriptor while this process was on file_system.
+    #
+    # Keep the call (the parent does share storages, and it is free), but if a
+    # worker-side sharing problem is being chased, the fix belongs in
+    # `worker_init_fn`, which runs in the child. This is the second mitigation
+    # here found not to reach its intended target -- see MP_SOCKET_DIR at :39.
     try:
         torch.multiprocessing.set_sharing_strategy("file_system")
     except Exception:
@@ -462,18 +479,32 @@ def run_training(args):
         # nw2 arm is that two ranks left early, on their own, after their work was
         # done; zero nw0 ranks in the same allocation did.
         #
-        # set_sharing_strategy("file_system") (~:358) was already active -- do not
-        # re-propose it as the fix. `MP_SOCKET_DIR=/tmp` was ALSO listed here as an
-        # active mitigation; that was wrong. It is a no-op with this torch build
-        # (see the module-top note), so it never mitigated anything and cannot be
-        # counted as ruled out on the strength of having been set.
+        # TWO mitigations were listed here as "already active, do not re-propose".
+        # BOTH claims were wrong, and in the same way -- set, but never reaching
+        # the workers:
+        #   * MP_SOCKET_DIR=/tmp -- a no-op with this torch build. The string
+        #     appears nowhere in the install (see the module-top note).
+        #   * set_sharing_strategy("file_system") (~:368) -- process-local, and
+        #     does not cross the `spawn` boundary into the workers. Job 8740789
+        #     caught them running file_descriptor while the parent was on
+        #     file_system (see the scope warning at that call).
+        # Neither can be counted as ruled out on the strength of having been set.
         #
         # A SECOND, different nw2 symptom exists and must not be conflated with
         # this one: 8740716/n1_nw2_prof failed at STARTUP, zero iterations, all 12
         # ranks dying in worker spawn with `torch_shm_manager: Invalid argument`
         # (libshm/core.cpp:62). This block is about the opposite case -- ranks that
         # finished all their work and threw on the way out.
-        # scripts/repro_nw_exit_throw_pbs.sh bisects both.
+        #
+        # Symptom (B) now reproduces in a 12-rank toy with no XPU, no distributed
+        # and no decode (job 8740789, stage `bare`): 12/12 ranks raise
+        #   OSError: AF_UNIX path too long   (multiprocessing/connection.py:608)
+        # from Python's resource_sharer -- a DIFFERENT socket from torch's
+        # manager.sock, and a longer path. It is raised on the queue feeder
+        # THREAD, so it is non-fatal and the loader simply never delivers a
+        # batch: the visible failure is a HANG, not that OSError.
+        # scripts/repro_nw_exit_throw_pbs.sh bisects both symptoms and carries
+        # two fix arms (worker_init_fn strategy vs short TMPDIR).
         #
         # A throw out of a destructor during shutdown cannot be caught in Python,
         # so this does not try. It leaves the interpreter before the destructors
