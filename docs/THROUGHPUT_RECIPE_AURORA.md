@@ -1096,6 +1096,94 @@ measurement yet.
    it is a real input change and the only one in the file. Any quality delta
    attributed to "the re-encode" has to account for it.
 
+## 64n efficiency is 63%, and the dataload tail is only HALF of the loss
+
+Job 8741170, 2026-08-07. `vitG384_lbA`, DAOS, nw=2, `VJEPA_SCALE_PROBE=1`, both
+rungs in ONE allocation. 30 iters each, **full rank coverage** (12/12 and
+768/768), window itr>=7.
+
+This is the first ladder with a **valid 1n reference** — the historical 4.19 s
+"1n" was a 192-rank run with 12 CSVs written, and is void.
+
+| | 1n (12 tiles) | 64n (768 tiles) |
+|---|---|---|
+| compute floor (`iter − max dataload`) | 2.99 s | 4.21 s |
+| stall tax (mean − floor) | 1.49 s | 2.94 s |
+| **mean s/iter** | **4.48 s** | **7.15 s** |
+| median s/iter | 3.08 s | 4.56 s |
+
+**Per-tile efficiency 64n vs 1n = 63%** (means). Against the >80% bar.
+
+**Report the MEAN, not the median.** Dataload is bimodal — exactly 0.00 s on
+most iterations and multi-second on the rest — so the median silently prices the
+stall at zero. Median gives a flattering 68%. Wall-clock is the mean.
+
+**The loss splits almost evenly, and neither half alone is enough:**
+
+- **+1.22 s compute-floor growth, 94% of it backward.** Median-*over-ranks*
+  backward goes 1.23 s → 2.38 s. Stripping the straggler does not touch it, so
+  **every rank pays** — this is the HSDP replicate-dim all-reduce growing with
+  node count. **H1 confirmed, for backward only.**
+- **+1.45 s stall tax**, from the dataload tail.
+
+Killing the tail outright would leave 64n at its 4.21 s floor = **71%**. The
+all-reduce growth alone holds it under the bar. Both must be fixed.
+
+**The forward "blowup" is a straggler artifact — H1 refuted there.** Max-over-
+ranks `fwd-context` rises 1.07 → 1.83 s, but median-over-ranks is FLAT
+(1.03 → 1.01 s). No rank's forward got slower; the max is sampling skew that
+arrives *inside* forward's first FSDP all-gather. Any future claim of a "forward
+blowup" must be checked against the median-over-ranks column before it is
+believed. `barrier-ms` is only 0.14 s at the median, so ranks are well
+synchronized on ordinary iterations — **H2 is not the median story**; skew
+appears only on the 8/23 iterations where someone stalls.
+
+**Caveat:** both rungs ran ipe=**30**, not the budgeted 40, from the `local IFS`
+leak (fixed in `7d3666f`, after this job was submitted). 23 post-warmup
+iterations is thin for a mean that the spikes dominate. The split is large
+enough to survive that; the exact percentages are not precise to a point.
+
+### The tail is fully present at ONE node
+
+`n1_nw2` is the decisive rung, and it kills every node-count explanation: with
+prefetch on, one node, no inter-node fabric at all, dataload still shows p90
+6.32 s / max 15.16 s. Structure:
+
+- **itr 0-6: all 12 ranks spike together** (itr 0 = 12/12 at ~34 s). Prefetch
+  warmup. A window starting at itr>=5 still eats two of these.
+- **itr >=7: isolated single-rank events** — 5 of 23 iterations, 1-2 ranks each.
+  9 of 12 ranks show nothing at all past itr 6.
+
+At 64n the same shape scales as an order statistic: 8/23 iterations affected,
+max 12 of 768 ranks. Per-rank incidence is roughly constant; what grows is the
+chance that *somebody* is stalled, and the barrier makes all 768 pay it.
+
+### GOPEN_BUFFER / DAOS read granularity: REFUTED as a lever
+
+Job 8741245 measured **36-44x** on DAOS between a 4 KB and a 1 MB tar read
+buffer, with a FLAT curve on Lustre. Read granularity is genuinely a first-order
+cost on the DAOS client. It is **not** a win available to us:
+
+`buffering=-1` resolves to `st_blksize` **exactly** — verified by reading one
+byte through webdataset's own `gopen` and checking `f.raw.tell()`: unset gives
+4194304 against an st_blksize of 4194304, and `GOPEN_BUFFER=1048576` gives
+1048576. DAOS reports st_blksize = 2 MB, and 1 MB/4 MB are within 5% of each
+other. **Training already sits on the flat fast end.** `GOPEN_BUFFER` works, but
+on DAOS it can only make the buffer smaller.
+
+The 42x was the gap between a setting nothing uses and the one already in force.
+The first run of the probe reported it as a lever because the sweep omitted -1,
+so it could not locate the default on its own curve.
+
+What this *does* establish is a fragility: anything that shrinks the effective
+buffer — a mount reporting a small `st_blksize`, an explicit `GOPEN_BUFFER`, a
+library re-opening the shard — costs ~40x on DAOS, silently. That is why
+`train.py` now logs the resolved value in `THROUGHPUT KNOBS`.
+
+**The tail's owner remains unidentified.** Decode is exonerated (worst decode
+4.22 s vs worst gap 53.84 s), read granularity is exonerated, and it is not
+node-count. Do not write a cause into this doc without direct evidence.
+
 ## Scaling ladder (`scripts/scaling_ladder.sh`)
 
 Measures per-tile efficiency across node counts in **one allocation**, so every
