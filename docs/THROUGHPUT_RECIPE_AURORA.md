@@ -857,13 +857,32 @@ seeks once into a *single 64-frame window* and `linspace`s 16 frames inside it
 and is the access pattern GOP helps most; the predictor that fit best,
 `min(16·GOP, frames)` at r=0.70, only *means* anything for 16 independent seeks.
 
-Measured over n=200 paired clips per source (job 8740990 + follow-up, harness
-`scripts/decode_per_source_profile.py`, which mirrors the trainer's window):
+Measured over n=200 **paired** clips per source (job 8741066, harness
+`scripts/decode_per_source_profile.py`, which mirrors the trainer's window;
+`resampled=False` so each row is the same 200 clips before and after):
 
 | source | p50 base | p50 g16 | **p50 ratio** | max base | max g16 | max ratio |
 |---|---|---|---|---|---|---|
-| cholec80 | 365 ms | 159 ms | **2.30×** | 2362 ms | 790 ms | 2.99× |
-| surgvu24_clean | 265 ms | 168 ms | **1.58×** | 997 ms | 218 ms | 4.57× |
+| cholec80 | 355 ms | 154 ms | **2.31×** | 2887 ms | 787 ms | 3.67× |
+| surgvu24_clean | 266 ms | 168 ms | **1.58×** | 534 ms | 232 ms | 2.30× |
+| lemon | 356 ms | 229 ms | **1.55×** | 910 ms | 399 ms | 2.28× |
+| sitl_2026 → `_g16_512` | 612 ms | 156 ms | *3.92×* | 2129 ms | 249 ms | 8.55× |
+
+**The sitl_2026 row is not a GOP measurement** and must not be averaged with the
+other three. Its twin is `_g16_512`: `reencode_gop_pbs.sh:106` sets `SHORT=512`
+for that source alone, so it is GOP **and** a downscale, and the resolution line
+shows it — 1080×1920/720×1280 mixed → 512×910. Most of its 3.92× is pixels, not
+keyframes. Report it as "GOP+downscale" or not at all.
+
+The three pure-GOP sources land at **1.55–2.31× on p50**, dead centre of the
+1.6–3× predicted here and nowhere near the 7–8× per-clip figure.
+
+Pairing is verified in the output itself, not assumed: within every pair the
+`frames/video` triple and the resolution histogram are **identical** (cholec80
+1580/1703/1747 both sides; lemon 1823/1971/2039 both sides), and `frac<1.0(DROP)`
+is 0.000 on all eight arms. Sample count, frame count and drop rate are
+preserved exactly — the re-encode changed the *cost* of the corpus, not its
+content, on all four sources.
 
 A backfill model accounts for it: cost ≈ decode(64-frame window) +
 decode(≈GOP/2 frames of backfill from the previous keyframe). Solving the two
@@ -899,9 +918,17 @@ Two process notes worth more than the numbers:
   exactly the signature of "the re-encode altered corpus content" — the one
   thing this intervention promised not to do — and in fact 3 different clips
   out of 200. Now `resampled=False` plus a seeded frame window (`520e0ce`);
-  verified paired on cholec80 with identical frame counts and clip std matching
-  to 2 dp. The paired ratio moved 2.30× → ~3.0×, so the defect was also
-  *understating* the win.
+  the paired run proves itself by printing identical `frames/video` and
+  identical resolution histograms within each pair.
+  **The unpaired ratios turned out to be close to right anyway** — cholec80
+  2.30× unpaired vs 2.31× paired, surgvu24 1.58× both — so the defect cost
+  nothing in the headline number. It is recorded because of what it *looked*
+  like: an unpaired draw manufactured a fake corpus-content change on a
+  measurement whose entire promise was that content did not change. The error
+  was silent in the quantity being reported and loud in an unrelated one.
+  (An earlier note here claimed pairing moved cholec80 to ~3.0×; that came from
+  a partial read of the pairing fix and the completed paired run does not
+  support it.)
 
 **Scope.** This moves the body of the dataload distribution — p50, mean, p90 —
 permanently and offline. It does not touch the tail, for the reason the next
@@ -983,6 +1010,47 @@ logs a one-time `[decode-prof] ENABLED` banner on the first sample so ON-and-
 silent is distinguishable from OFF. `decode_prof_report.py` reports those two
 cases differently and refuses to call either one a null result.
 
+#### The pair ran (job 8741045): the tail is upstream of decode
+
+Both rungs, 1 node, 80 iters, 12 profiled ranks, `EVERY=20`. Worst values across
+all sources, in seconds, against the 10.74 s bs=2 pure-decode ceiling:
+
+| rung | worst `decode` | worst `gap` | verdict |
+|---|---|---|---|
+| `n1_nw0_prof` | 3.17 | 50.85 | INCONCLUSIVE by construction — gap holds the step |
+| `n1_nw2_prof` | **4.22** | **53.84** | **tail is upstream of decode** |
+
+**Decode is exonerated.** The worst single decode observed live, over 16
+sources, is 4.22 s — **39% of the ceiling**, and that on `cholec80` whose
+offline max is 3.04 s. No source's live decode came within 2.5× of the ceiling.
+Whatever produces the >10 s dataload draws, it is not the codec, and it is not
+the offline benchmark having under-measured the codec.
+
+**And at nw=2 the `gap` column is finally a clean storage measurement** — the
+profiled process is a worker that does nothing but decode in a loop, so a gap is
+time spent waiting on everything upstream: tar read, DAOS, shuffle-buffer
+refill. It reads 53.84 s worst, 5× the ceiling, on `grasp_noleak` (offline max
+0.56 s). Several sources show gap p50 in the 10–27 s range while their decode
+p50 is under 1.2 s.
+
+Two cautions on those numbers, neither of which changes the verdict:
+
+- **`gap` at nw=2 is upstream wait, not necessarily *storage* wait.** A worker
+  also blocks when the loader's output queue is full — i.e. when *training* is
+  the bottleneck and prefetch is doing its job. Since nw=2 shows `dataload-time`
+  = 0 ms at the median, that backpressure is present by design and inflates gap
+  p50. It cannot explain the >ceiling draws (the step is ~3 s), but read gap p50
+  as "worker was idle", not "DAOS was slow".
+- The per-source `n` counts are small (1–26 per source over the window), so
+  per-source ordering within the table is noise. The claim rests on the
+  aggregate: max decode 4.22 s vs max gap 53.84 s, an order of magnitude apart.
+
+This closes the "is it the codec?" branch that motivated the GOP re-encode as a
+*scaling* fix. The re-encode remains worth its cost for the body of the
+distribution (1.55–2.31× on p50, measured paired) — but the asymptote is set by
+the tail, the tail is upstream of decode, and **a per-node DAOS client stall
+remains the leading hypothesis and is still untraced on the DAOS side.**
+
 ## Scaling ladder (`scripts/scaling_ladder.sh`)
 
 Measures per-tile efficiency across node counts in **one allocation**, so every
@@ -1050,6 +1118,38 @@ curve.
 compute+comms **floor moves only 2.93 → 3.26 s across a 16× node jump**: 11%.
 Everything else is the order statistic.
 
+⚠️ **The `eff` column is a ratio to a 1n rung that does not reproduce.** A
+second 1n nw=0 rung (job 8741045, same config, same recipe, a different node six
+hours later) came back **~2× faster than the L1a anchor**, and the gap survives
+window-matching:
+
+| | iter p50 | max-dl p50 | floor | per-rank dl p50 | p(>10 s) |
+|---|---|---|---|---|---|
+| L1a 8740093 `n1_nw0` (the 100% anchor) | 10.19 s | 7.26 s | 2.94 s | 1.03 s | 0.050 |
+| L4 8741045 `n1_nw0_prof` | 5.40 s | 2.43 s | 2.92 s | 0.92 s | 0.015 |
+| same window, iters 20–39 | 10.19 → **6.35 s** | 7.26 → **3.42 s** | | | |
+
+What it is **not**: not compute (the floor is identical, 2.94 vs 2.92 s), not
+`num_workers` (both nw=0), and not the body of the dataload distribution (per-
+rank p25/p50/p75 agree within 11%: 572/1028/1901 vs 635/1144/1976 ms). The
+difference is entirely in **how the per-rank tails line up across ranks**. Both
+rungs have slow ranks; L1a's co-occur less. Shuffling each rank's samples
+independently — which destroys within-iteration co-occurrence while preserving
+every rank's marginal exactly — predicts a median max-over-ranks of 9.9 s for
+L1a and 8.2 s for L4, against observed 7.26 and 3.42. **Both are clustered
+relative to iid; L4 is far more so** (0.73× and 0.42× of the shuffled
+prediction). So the two rungs differ in the *correlation structure* of their
+stalls, not in their per-rank cost.
+
+No cause is assigned. The two rungs ran on different nodes (`x4115c6s0b0n0` vs
+`x4310c3s6b0n0`) at different times (17:54 vs 23:41) with different DAOS
+neighbours, and either is a candidate; neither is evidence. **Until a 1n rung
+reproduces, treat the `eff` column as showing the *shape* of the curve and not
+its level** — the shape (per-rank marginal flat, floor flat, loss all in the
+order statistic) is independently supported and does not depend on the anchor's
+absolute value. The multi-node rungs are unaffected relative to each other:
+they share an allocation, and the L1a↔L1b 8n anchor agreed to 7.8%.
+
 **`num_workers=2` is the single largest throughput lever measured on this
 model.** Same 8 nodes, same allocation, same fabric hour:
 
@@ -1070,14 +1170,20 @@ knee. p(≥1 stalling rank) reaches 1.00 by 32 nodes at nw2 versus by 4 nodes at
 nw0. **Shrinking the tail remains the only thing that changes the asymptote**,
 and 8.7% of draws are still above what any measured decode cost can explain.
 
-⚠️ **nw2 is not yet production-safe.** The rung completed rc=0 with 96/96 rank
-CSVs and a full 15 GB checkpoint written, but **85 of 96 ranks then aborted at
-exit** with `terminate called after throwing an instance of 'std::system_error'
-— No such file or directory`, after `avg. loss` and after the checkpoint. The 11
-survivors are exactly ranks 1–11: node 0's non-zero ranks. Nothing is lost at a
-rung boundary; under `VJEPA_SUSTAINED` self-resubmit, an aborting exit path is a
-different matter and needs to be closed before nw>0 becomes a default. It also
-has no 64n hazard arm yet.
+⚠️ **nw2 was not production-safe when this rung ran — the exit abort is now
+fixed; the 64n hazard arm is still owed.** The rung completed rc=0 with 96/96
+rank CSVs and a full 15 GB checkpoint written, but **85 of 96 ranks then aborted
+at exit** with `terminate called after throwing an instance of
+'std::system_error' — No such file or directory`, after `avg. loss` and after
+the checkpoint. The 11 survivors are exactly ranks 1–11: node 0's non-zero
+ranks. Nothing is lost at a rung boundary; under `VJEPA_SUSTAINED`
+self-resubmit, an aborting exit path is a different matter.
+
+**This job predates the `TMPDIR=/tmp` fix** (`a31e1f1`, 22:16; this rung
+submitted 19:48). With the fix live, job 8741045's nw=2 rung threw on **0 of 12
+ranks** — see "The decisive test ran" below for the before/after table. The
+remaining gate on nw>0 as a default is the 64n hazard arm, for the separate
+xccl-fork deadlock, which is `O(ranks)` and does not transfer from 8n.
 
 ### Two nw>0 failures, not one — and only the second is fixed
 
@@ -1206,6 +1312,67 @@ that the 3-of-24 rank distribution follows from it. Both need the decisive test:
 **nw=2 in the real trainer with the fix live**. If the throw is gone, (A) was
 downstream of (B); if it survives, the libshm story is wrong and the next step
 is `catchsegv`/`gdb` on the aborting rank, not more arithmetic.
+
+#### The decisive test ran: (A) is gone, and it was downstream of (B)
+
+Job **8741045**, 1 node, rungs `n1_nw0_prof` then `n1_nw2_prof`, 80 iters each,
+the `TMPDIR` fix live (`THROUGHPUT KNOBS … num_workers=2 pin_mem=True
+persistent_workers=True tmpdir='/tmp/af511f5e-…/tmp'(45)`). The nw=2 rung exited
+`rc=0` with 80 rows and 12/12 rank CSVs, and **zero of 12 ranks** threw.
+
+The throw rate tracks the fix and nothing else:
+
+| job | submitted | vs. `TMPDIR` fix (`a31e1f1`, 22:16) | ranks throwing `what(): No such file or directory` |
+|---|---|---|---|
+| 8739914 `n2_nw2` | 17:04 | before | 2 / 24 |
+| 8740311 `n8_nw2` | 19:48 | before | **85 / 96** |
+| 8741045 `n1_nw2_prof` | 23:54 | **after** | **0 / 12** |
+
+Note 8740311: **85 of 96 ranks**, which retires a side-worry the 2-of-24 rate
+invited — that this was a rare race on a few unlucky ranks. It is the common
+case, and the earlier 2/24 was the low draw. Under the fix, zero.
+
+So both symptoms of nw>0 have one cause, the `sun_path` cap, reached by two
+routes: multiprocessing's `listener-` socket (141/107 → hang) and libshm's
+`manager.sock` (143/107 → exit throw). One `export TMPDIR=/tmp` closes both.
+This is consistent with the libshm mechanism above but does not prove it — the
+fix removes every over-length path at once, so it cannot distinguish libshm from
+another ENOENT-raising `SYSCHECK` on the same cap. The distinction no longer
+blocks anything.
+
+**What this still does not license.** Node count is not controlled: the clean
+rung is 1n and the two throwing rungs were 2n and 8n. The fix is
+node-count-independent by construction — path length does not depend on world
+size — but per `[[scale-dependent-results-dont-transfer]]` that is an argument,
+not a measurement. The 64n hazard arm is still owed for the *separate*
+xccl-fork-deadlock risk, which genuinely is `O(ranks)`. Read this as "the throw
+is closed at 1n and its mechanism is node-independent", not "nw=2 is cleared at
+scale".
+
+#### What nw=2 buys, measured (1 node, same job, back-to-back)
+
+Same allocation, same node, same 80 iters. Window iters ≥ 20, max-over-12-ranks:
+
+| | iter p50 | iter **mean** | gpu p50 | max-dl p50 | per-rank dl p50 | dl > 1 s | dl > 10 s |
+|---|---|---|---|---|---|---|---|
+| `nw=0` | 5403 ms | 6717 ms | 2921 ms | 2433 ms | 919 ms | 46.5% | 1.5% |
+| `nw=2` | **3040 ms** | **5033 ms** | 2994 ms | **0 ms** | **0 ms** | 3.2% | 0.8% |
+| ratio | **1.78×** | **1.33×** | 0.98× (control) | | | | |
+
+The `gpu` column is the control and it is flat (2921 vs 2994 ms): same compute,
+same work, and the entire difference is dataload being *overlapped* instead of
+*serialized*. At the median prefetch hides it completely — `dataload-time` is
+**0 ms** on every rank.
+
+**Judge this on the mean, not the p50.** 1.78× at p50 is the best case; summed
+wall over the window improves **1.33×** (403 s → 302 s), because the tail is not
+prefetchable — 0.8% of samples still exceed 10 s at nw=2, and a stall deeper
+than the prefetch queue stalls the step no matter who is reading. Overhead over
+pure compute falls 130% → 66%: nw=2 removes about half the non-compute time and
+leaves the other half for the tail work to take.
+
+Same shape as the 8n result recorded above (5.35× median, 1.96× total wall),
+reproduced at a node count where fabric cannot be the explanation.
 
 ## Survivability is a throughput lever at scale
 
