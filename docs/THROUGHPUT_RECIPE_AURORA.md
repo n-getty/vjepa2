@@ -1351,7 +1351,7 @@ transferred. `n64_nw2` completed rc=0, 30 rows, **768/768 rank CSVs, no
 Measures per-tile efficiency across node counts in **one allocation**, so every
 rung shares a fabric hour, and separates straggler wait from compute.
 
-- Rungs are `<nodes>[:nw<N>][:probe<0|1>][:prof<0|1>][:cfg<NAME>]`, fields in any
+- Rungs are `<nodes>[:nw<N>][:probe<0|1>][:prof<0|1>][:cfg<NAME>][:omp<N>]`, fields in any
   order, run serially, each in its own sub-world: private nodefile + explicit
   `WORLD_SIZE` + offset `MASTER_PORT`. `WORLD_SIZE` takes precedence over PMI
   `SIZE` (`src/utils/distributed.py:146-158`) and `hsdp.py` derives
@@ -1373,6 +1373,24 @@ rung shares a fabric hour, and separates straggler wait from compute.
   `scaling_efficiency.py --ladder` discovery are unchanged. Unknown fields
   hard-reject: a typo'd `:cfg` that silently ran the default config would be
   indistinguishable from a real null result.
+- **`:omp<N>` sets `OMP_NUM_THREADS` and mpiexec's `--depth` together**, for the
+  CPU-oversubscription arm — decode is CPU work and 12 ranks share 104 cores.
+  Moving them together is deliberate: threads-per-node is the hypothesis, and
+  moving either half alone tests something else (`--depth` alone changes the
+  binding span, `OMP` alone changes contention within a fixed span). The valid
+  range is **4 / 8 / 16** — at 12 ranks/node, `--depth > 16` exceeds 208 HT and
+  mpiexec returns `rc=139` in 0 s. The rung dir is tagged `_omp<N>` only when it
+  differs from the job's resolved default, and that default is captured *after*
+  the env source rather than re-derived — writing it as
+  `${OMP_NUM_THREADS:-16}` is exactly the bug described in "Two rules for
+  editing the fragment", and it would make every rung look like the default.
+  ```
+  L6: qsub -q debug -l select=2 \
+       -v VJEPA_LADDER_RUNGS="2:nw2 2:nw2:omp8 2:nw2:omp4 2:nw2" scripts/scaling_ladder.sh
+  ```
+  Bracketed A/B/B/A so the anchor's own repeat spread is measured in the same
+  allocation — read with `scripts/tail_arm_compare.py`, which refuses to rank
+  arms whose delta is inside that spread.
 - **Rung ordering is a budget decision, not cosmetic.** Put the cheap
   irreplaceable rung first, the hazard arm next, its control after, and anything
   optional last. A hang burns `FIRST_ITER_DEADLINE` (900 s) of a 60 min cap, so
