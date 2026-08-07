@@ -269,6 +269,61 @@ def summarize(per, label):
     return out
 
 
+def warmup_only(ok):
+    """Salvage the one contrast a truncated sweep can still carry.
+
+    The plateau delta needs the closing anchor: without a measured noise floor
+    there is nothing to size a delta against ([[wallclock-kill-deletes-the-
+    closing-anchor]]). Warmup excess does not, for two reasons -- it is measured
+    against each arm's OWN floor rather than against another arm, and it has an
+    external bar (WARM_SPREAD, from four archived rungs) rather than an
+    in-allocation one. It is also ~90% dataload, i.e. the storage cost itself,
+    which is what these arms were built to separate.
+
+    This is a WEAKER instrument and is labelled as one: the archived spread comes
+    from other jobs on other nodes, so it prices cross-allocation drift into the
+    bar, and a null here bounds the effect more loosely than a null with a floor.
+    """
+    print("\n  ---- WARMUP-ONLY READ-OUT (no floor; weaker instrument) ----")
+    print("  Warmup excess = integral of (iter - that arm's own floor) over the")
+    print("  whole run. It needs no anchor and no convergence, and it is where a")
+    print("  storage path should show up: the cache is cold at every rung start")
+    print("  ([[host-memory-does-not-drive-dataload]]), so each arm pays it again.")
+    for d, kind, note in ARMS:
+        r = ok.get(d)
+        if r is None:
+            print(f"    {d:22s}{kind:14s}  -- absent --")
+            continue
+        print(f"    {d:22s}{kind:14s}{r['warm_excess']:8.0f} s"
+              f"  ({100*r['warm_frac_dl']:.0f}% dataload,"
+              f" plateau {r['plateau']:.2f} s)")
+
+    def wcontrast(x, y, lo, hi, owner):
+        if not (x and y):
+            print(f"\n    {lo} vs {hi}: arm missing -> not evaluable")
+            return
+        wd = (y["warm_excess"] - x["warm_excess"]) / max(x["warm_excess"], 1e-9)
+        tag = f"SIGNAL -> {owner}" if abs(wd) > WARM_SPREAD \
+            else f"NULL (inside the {100*WARM_SPREAD:.0f}% archived spread)"
+        print(f"\n    {lo} vs {hi}: {x['warm_excess']:.0f} -> {y['warm_excess']:.0f} s"
+              f" ({100*wd:+.0f}%, bar {100*WARM_SPREAD:.0f}%)   {tag}")
+        print(f"        %dataload {100*x['warm_frac_dl']:.0f} ->"
+              f" {100*y['warm_frac_dl']:.0f}"
+              f"   plateau {x['plateau']:.2f} -> {y['plateau']:.2f} s")
+
+    a1, a2, a3 = (ok.get("n2_nw2"), ok.get("n2_nw2_staged_cap24"),
+                  ok.get("n2_nw2_cap24"))
+    wcontrast(a3, a2, "arm3 daos-capped", "arm2 staged-capped",
+              "the storage path: DAOS agent / NIC")
+    wcontrast(a1, a3, "arm1 daos-full", "arm3 daos-capped",
+              "the working set: page cache")
+    print("\n    CONFOUND: capped arms read a fixed 24-shard window per source,")
+    print("    so a smaller warmup may be a smaller working set rather than a")
+    print("    faster path. arm3 exists to hold that fixed; arm1-vs-arm3 is the")
+    print("    contrast that prices the cap itself.")
+    print("    Do NOT convert any of this into a plateau claim.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root", help="job dir, e.g. .../scaling_ladder/8741855")
@@ -306,12 +361,13 @@ def main():
     # ---- the noise floor, before any comparison
     a1, a4 = ok.get("n2_nw2"), ok.get("n2_nw2_rep2")
     if not (a1 and a4):
-        print("\n  NO CLOSING ANCHOR -> NO VERDICT.")
-        print("  Both daos-full arms are required. The closing anchor is what")
-        print("  separates a real arm effect from allocation drift, and it is also")
-        print("  the only check that the arms in between were converged and")
+        print("\n  NO CLOSING ANCHOR -> NO PLATEAU VERDICT.")
+        print("  Both daos-full arms are required for a plateau delta. The closing")
+        print("  anchor is what separates a real arm effect from allocation drift,")
+        print("  and it is also the only check that the arms in between were")
         print("  comparable at all -- arm 4 runs last, so if it lands on arm 1 the")
         print("  whole sweep held still. Comparing to a single anchor cannot.")
+        warmup_only(ok)
         return
 
     floor = abs(a4["mean"] - a1["mean"]) / a1["mean"]
