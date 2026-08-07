@@ -354,7 +354,48 @@ runtime_cfg_for () {
 # The grace period exists for the same reason: mpiexec needs time to start python
 # on every node, and a watchdog whose liveness test is "is the trainer running"
 # must not run that test before the trainer can possibly exist.
+# Reaping is CLUSTER-WIDE, and that asymmetry is the point. The watchdog runs on
+# the head node only, so a bare `pkill -9` reaps 12 of a 2-node rung's 24 ranks
+# and leaves the rest holding XPU tiles, host memory and their half of the CCL
+# world. mpiexec then returns -- the launcher sees its ranks die -- and the NEXT
+# rung starts on nodes that still have the previous rung's orphans on them.
+#
+# Job 8741955 is what that looks like: rungs 1 and 2 clean (rc=0, 80 rows each),
+# rung 3 no-first-iter, rung 4 no-first-iter -- and rung 4 is the CLOSING ANCHOR,
+# byte-identical in config to rung 1 which had just succeeded. Positional, not
+# treatment-linked, which is the signature of state carried between rungs rather
+# than of the knob under test. Losing the closing anchor costs the whole
+# allocation ([[wallclock-kill-deletes-the-closing-anchor]]): with no measured
+# drift there is nothing to price the treatment against.
+#
+# The SIGUSR1 above already fans out via mpiexec; the kill must use the same
+# fanout or the forensics reach ranks the reaper cannot. Kept as a function so
+# the two call sites cannot drift apart.
+reap_rung_everywhere () {
+    # Scope to the RUNG's nodefile, not the allocation's. A `1:node1` sub-world
+    # rung occupies one node of many, and reaping the allocation would kill a
+    # concurrent rung if concurrency is ever added -- but more immediately, -n
+    # must match the hostfile's line count or mpiexec oversubscribes.
+    local _n; _n=$(wc -l < "$RUNG_NODEFILE" 2>/dev/null) || _n=0
+    if [ "${_n:-0}" -gt 0 ]; then
+        mpiexec -n "$_n" -ppn 1 --hostfile "$RUNG_NODEFILE" --cpu-bind none --no-vni \
+            bash -c "pkill -9 -f 'app[.]main_dist_aurora' 2>/dev/null; true" >/dev/null 2>&1 || true
+    fi
+    # Belt and braces: if that mpiexec itself cannot launch (the failure mode
+    # that most often coincides with a hang), still reap what is local.
+    #
+    # `app[.]main_dist_aurora` throughout, not `app.main_dist_aurora`. pkill -f
+    # matches the FULL command line, and the remote reaper's own `bash -c
+    # "pkill -f app.main_dist_aurora ..."` contains that literal string -- so
+    # the plain pattern makes the reaper a candidate for its own -9. The bracket
+    # is the standard escape: it matches the same processes but not the pattern
+    # itself. Harmless-looking, and it is the difference between a reaper that
+    # kills the orphans and one that kills itself first.
+    pkill -9 -f 'app[.]main_dist_aurora' 2>/dev/null || true
+}
+
 RUNG_WD_PID=""
+RUNG_NODEFILE=""
 WD_START_GRACE=${VJEPA_LADDER_WD_START_GRACE:-180}
 start_rung_watchdog () {
     local csv="$1" tag="$2" diag="$3"
@@ -375,18 +416,20 @@ start_rung_watchdog () {
                         > "$diag/stall_info.txt"
                     # SIGUSR1 -> the armed faulthandler dumps each rank's stacks and
                     # CONTINUES, so we learn which collective is blocked before the kill.
-                    mpiexec -n $NNODES -ppn 1 --cpu-bind none --no-vni \
-                        bash -c 'pkill -USR1 -f app.main_dist_aurora 2>/dev/null; true' >/dev/null 2>&1 || true
+                    mpiexec -n $(wc -l < "$RUNG_NODEFILE") -ppn 1 \
+                        --hostfile "$RUNG_NODEFILE" --cpu-bind none --no-vni \
+                        bash -c "pkill -USR1 -f 'app[.]main_dist_aurora' 2>/dev/null; true" >/dev/null 2>&1 || true
                     sleep 20
-                    pkill -9 -f "app.main_dist_aurora"; exit 1
+                    reap_rung_everywhere; exit 1
                 fi
             elif [ $((now-start)) -gt $FIRST_ITER_DEADLINE ]; then
                 echo "WATCHDOG[$tag]: NO FIRST ITER within ${FIRST_ITER_DEADLINE}s." >&2
                 echo "jobid=$PBS_JOBID rung=$tag no_first_iter" > "$diag/nofirstiter_info.txt"
-                mpiexec -n $NNODES -ppn 1 --cpu-bind none --no-vni \
-                    bash -c 'pkill -USR1 -f app.main_dist_aurora 2>/dev/null; true' >/dev/null 2>&1 || true
+                mpiexec -n $(wc -l < "$RUNG_NODEFILE") -ppn 1 \
+                    --hostfile "$RUNG_NODEFILE" --cpu-bind none --no-vni \
+                    bash -c "pkill -USR1 -f 'app[.]main_dist_aurora' 2>/dev/null; true" >/dev/null 2>&1 || true
                 sleep 20
-                pkill -9 -f "app.main_dist_aurora"; exit 1
+                reap_rung_everywhere; exit 1
             fi
         done
     ) &
@@ -630,6 +673,11 @@ PY
     # the pairing is on the record -- inferring it from the offset assumes the
     # allocation's node order, which is PBS's to choose.
     echo "  nodes: $(tr '\n' ' ' < "$nf")"
+    # Publish the rung's nodefile BEFORE arming the watchdog: the watchdog's
+    # SIGUSR1 fanout and its reaper both read it, and a watchdog armed against
+    # an empty RUNG_NODEFILE degrades to head-node-only -- which is the bug
+    # being fixed here, reintroduced by ordering.
+    RUNG_NODEFILE="$nf"
     # Sets RUNG_WD_PID -- see the note on start_rung_watchdog for why this must
     # not be a command substitution. Verify it armed: a silently-dead watchdog is
     # exactly the failure that cost job 8739712 half its slot, and it is
@@ -666,6 +714,30 @@ PY
             --local_data_root "$data_root"
     local rc=$?
     kill "$wd_pid" 2>/dev/null
+
+    # ORPHAN SWEEP. mpiexec returning does not mean every rank is gone: a rank
+    # blocked in a collective on a NON-head node outlives the launcher, and it
+    # keeps its XPU tile, its host memory and its share of the CCL world. The
+    # next rung then starts on a node that is not idle, which is state carried
+    # across an A/B boundary -- the one thing a bracketed sweep cannot tolerate.
+    #
+    # Unconditional, not gated on rc: the reason to sweep is that rc does not
+    # tell you whether all ranks exited, and a clean rc with a surviving orphan
+    # is precisely the case that silently poisons the NEXT rung rather than this
+    # one. Costs one mpiexec per rung when there is nothing to reap.
+    #
+    # Reported, so a leak is visible as a fact instead of inferred later from a
+    # rung that mysteriously would not start.
+    local _orph
+    _orph=$(mpiexec -n $R -ppn 1 --hostfile "$nf" --cpu-bind none --no-vni \
+        bash -c "pgrep -c -f 'app[.]main_dist_aurora' 2>/dev/null || true" 2>/dev/null \
+        | awk '{s+=$1} END{print s+0}')
+    if [ "${_orph:-0}" -gt 0 ]; then
+        echo "  rung $name: $_orph orphan rank process(es) survived mpiexec -- reaping"
+        reap_rung_everywhere
+        sleep 10
+    fi
+
     # Free the tmpfs immediately. /tmp is RAM here (504 GB of the node's DDR5),
     # so a staged window left behind is memory the NEXT rung does not have --
     # and the next rung may be the daos-capped control whose whole job is to

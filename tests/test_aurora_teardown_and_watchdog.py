@@ -161,7 +161,138 @@ def test_watchdog_waits_before_probing_for_the_trainer():
 
 
 # --------------------------------------------------------------------------
-# 3. SIGUSR1 must be survivable from process start, not just in the train loop
+# 3. Reaping must reach every node of the rung, not just the head
+# --------------------------------------------------------------------------
+
+
+def test_every_kill_of_the_trainer_is_cluster_wide():
+    """A bare `pkill -9` in the watchdog reaps the head node only.
+
+    The watchdog runs on the head node. Its SIGUSR1 already fans out via
+    mpiexec, so the plain `pkill -9` that followed reached 12 of a 2-node
+    rung's 24 ranks and left the other 12 holding XPU tiles and their half of
+    the CCL world -- state the NEXT rung inherits.
+
+    Assert on the shape rather than on behaviour, because the behaviour needs a
+    multi-node allocation to observe. Every -9 aimed at the trainer must either
+    carry a hostfile or go through reap_rung_everywhere (which supplies one).
+
+    The reaper's own body is exempted, but not waved through: it holds ONE
+    deliberate bare pkill, the local fallback for when the fanout mpiexec
+    cannot launch -- the failure that most often coincides with a hang. So the
+    exemption is checked rather than assumed: exactly one bare kill, and a
+    hostfile'd one ahead of it.
+    """
+    src = open(LADDER).read()
+    lines = src.splitlines()
+    r0 = src[:src.index("reap_rung_everywhere () {")].count("\n") + 1
+    r1 = src[:src.index("\n}", src.index("reap_rung_everywhere () {"))].count("\n") + 1
+
+    def logical_command(i):
+        """The kill's own command, joined across backslash continuations.
+
+        A fixed-size window of preceding lines is NOT good enough, and the
+        difference is the whole test. Both watchdog sites send SIGUSR1 through
+        an mpiexec fanout and then kill on the next line, so any window wide
+        enough to catch a wrapped `--hostfile` also catches the UNRELATED
+        hostfile of the SIGUSR1 above it -- and the head-node-only kill this
+        test exists to reject sails through. Verified by mutation: with the
+        window version, restoring the original bug left this test green and
+        only a neighbouring test failed, by luck.
+        """
+        j = i - 1  # 0-indexed index of the pkill line itself
+        while j > 0 and lines[j - 1].rstrip().endswith("\\"):
+            j -= 1
+        return "\n".join(lines[j:i])
+
+    bare_in_reaper = 0
+    for i, ln in enumerate(lines, 1):
+        s = ln.strip()
+        if s.startswith("#") or "pkill -9" not in s or "main_dist_aurora" not in s:
+            continue
+        cmd = logical_command(i)
+        if r0 <= i <= r1:
+            if "--hostfile" not in cmd:
+                bare_in_reaper += 1
+            continue
+        assert "--hostfile" in cmd or "reap_rung_everywhere" in cmd, (
+            f"line {i} kills the trainer without a cluster-wide fanout: {s}"
+        )
+
+    body = "\n".join(lines[r0 - 1:r1])
+    assert bare_in_reaper == 1, (
+        f"reaper should hold exactly one local-fallback kill, found {bare_in_reaper}"
+    )
+    assert body.index("--hostfile") < body.rindex("pkill -9"), (
+        "the local fallback must come AFTER the cluster-wide fanout, or it is "
+        "the primary path and the fanout is dead code"
+    )
+
+
+def test_reaper_scopes_to_the_rung_not_the_allocation():
+    """`-n` must come from the rung's nodefile, not from NNODES.
+
+    A `1:node1` sub-world rung occupies one node of a larger allocation.
+    Reaping with -n $NNODES against a 1-line hostfile oversubscribes, and in a
+    world with concurrent rungs it would kill a rung that is doing fine.
+    """
+    src = open(LADDER).read()
+    start = src.index("reap_rung_everywhere () {")
+    body = src[start:src.index("\n}", start)]
+    assert "$RUNG_NODEFILE" in body
+    assert "NNODES" not in body, "reaper must not scope to the whole allocation"
+
+
+def test_pkill_patterns_cannot_match_the_reaper_itself():
+    """`pkill -f app.main_dist_aurora` inside `bash -c "..."` is self-matching.
+
+    -f matches the whole command line, and the remote reaper's own argv
+    contains the pattern verbatim -- so the plain spelling races the reaper
+    against its targets. `app[.]main_dist_aurora` matches the same processes
+    and not the pattern text.
+    """
+    src = open(LADDER).read()
+    for i, ln in enumerate(src.splitlines(), 1):
+        s = ln.strip()
+        if s.startswith("#"):
+            continue
+        if ("pkill" in s or "pgrep -c" in s) and "main_dist_aurora" in s:
+            assert "app[.]main_dist_aurora" in s, (
+                f"line {i} uses a self-matching pkill/pgrep pattern: {s}"
+            )
+
+
+def test_rung_nodefile_is_published_before_the_watchdog_arms():
+    """Ordering bug that would silently restore head-node-only reaping.
+
+    The watchdog reads RUNG_NODEFILE when it fires, but it is armed early; if
+    the assignment came after start_rung_watchdog the variable would still hold
+    the PREVIOUS rung's nodefile -- correct-looking on rung 1, wrong after.
+    """
+    src = open(LADDER).read()
+    run = src.index("run_rung () {")
+    assign = src.index('RUNG_NODEFILE="$nf"', run)
+    arm = src.index("start_rung_watchdog ", assign - 4000 if assign > 4000 else run)
+    arm = src.index('start_rung_watchdog "$dir/log_r0.csv"', run)
+    assert assign < arm, "RUNG_NODEFILE must be set before the watchdog is armed"
+
+
+def test_orphan_sweep_runs_regardless_of_exit_code():
+    """rc=0 with a surviving orphan is the case that poisons the NEXT rung.
+
+    Gating the sweep on a nonzero rc would skip exactly that case, so assert
+    the sweep is not inside an `if [ $rc ... ]`.
+    """
+    src = open(LADDER).read()
+    i = src.index("ORPHAN SWEEP")
+    block = src[i:i + 1400]
+    assert "pgrep -c -f" in block
+    head = src[src.index("local rc=$?", src.index("run_rung () {")):i]
+    assert 'if [ "$rc"' not in head and "if [ $rc" not in head
+
+
+# --------------------------------------------------------------------------
+# 4. SIGUSR1 must be survivable from process start, not just in the train loop
 # --------------------------------------------------------------------------
 
 _USR1_SNIPPET = textwrap.dedent(
