@@ -1339,10 +1339,31 @@ gives the floor:
 | omp16 (default) | 751 s | 4.90 | 3.28 | 1.62 | 1.62 | 1.00 | 8.18 |
 | omp8  | 725 s | 4.95 | 3.16 | 1.79 | 1.78 | 1.01 | 8.92 |
 | **omp4** | **1368 s** | **11.17** | 3.37 | 7.81 | 3.09 | **2.52** | 22.70 |
+| omp16 **rep2** (closing anchor, 45 its) | truncated | **8.56** | 3.66 | 4.90 | 3.13 | 1.56 | 17.43 |
 
-**Halving each rank's CPU is free (+1.0% wall, inside the floor); quartering it
-costs 2.3×.** So the production setting sits with **at least 2× CPU headroom**,
-and CPU cannot be what the tail is competing for.
+⚠️ **The anchor did not reproduce, so `iter_mean` here has a 1.75× floor and
+`excess` a 4.45× one.** Identical config, same allocation, 30 minutes apart:
+4.90 → 8.56 s. `tail_arm_compare.py` refuses to rank the arms on that basis and
+it is right to. **Nothing in the `iter_mean` column supports any claim**,
+including the +1.0% omp8 null — that is a floor artifact, not a measurement.
+
+**The result survives anyway, on a floor-free statistic.** The anchor's drift is
+confined to dataload (1.62 → 3.13) and the barrier that absorbs its skew
+(1.69 → 5.44); its *compute* phases are untouched. `fwd-target` in particular is
+0.71 / 0.71 / **1.25** / 0.70 across the four arms — three of them, including the
+drifted anchor, within ±1%, and omp4 alone at 1.76×. So:
+
+- **omp4 starves: established at 1.76× against a ±1% spread.** Not on wall clock.
+- **omp8 does not starve: `fwd-target` is 0.71, bit-for-bit the default.** This is
+  the real evidence for CPU headroom; the wall-clock null was worthless.
+
+**So the production setting has at least 2× CPU headroom**, and CPU cannot be
+what the tail is competing for.
+
+The methodological point generalizes: **when the floor is in the tail, pick a
+statistic that is not.** `fwd-target` is pure XPU math on a fixed shape — it has
+no legitimate reason to vary, which is exactly what makes it a usable ruler when
+`iter_mean` is drifting 1.75× underneath you.
 
 Note what `:omp<N>` actually varies. It moves `--depth` with `OMP_NUM_THREADS`,
 because lowering threads alone leaves the binding unchanged and lowering `--depth`
@@ -1356,14 +1377,19 @@ not of CPU contention between ranks.
 Max-over-ranks across all 24 ranks, 93 fully-covered iterations, counter-wrap
 unwrapped (mean-of-max / med-of-max, seconds):
 
-| phase | omp16 | omp8 | omp4 | omp4 mean/med |
-|---|---|---|---|---|
-| dload | 1.62 / 0.00 | 1.78 / 0.00 | 3.09 / 0.00 | — |
-| fwd-target | 0.71 / 0.71 | 0.71 / 0.71 | **1.25 / 0.71** | **1.76** |
-| fwd-context | 1.17 / 1.09 | 1.09 / 1.05 | **3.01 / 1.20** | **2.51** |
-| backward | 1.53 / 1.46 | 1.44 / 1.40 | **4.80 / 1.45** | **3.31** |
-| barrier | 1.69 / 0.09 | 1.84 / 0.07 | 4.50 / 0.08 | 56 |
-| **iter** | 4.90 / 3.28 | 4.95 / 3.16 | **11.17 / 3.37** | **3.32** |
+| phase | omp16 | omp8 | omp4 | omp16 rep2 | omp4 mean/med |
+|---|---|---|---|---|---|
+| dload | 1.62 / 0.00 | 1.78 / 0.00 | 3.09 / 0.00 | *3.13 / 0.00* | — |
+| fwd-target | 0.71 / 0.71 | 0.71 / 0.71 | **1.25 / 0.71** | *0.70 / 0.70* | **1.76** |
+| fwd-context | 1.17 / 1.09 | 1.09 / 1.05 | **3.01 / 1.20** | *1.10 / 1.06* | **2.51** |
+| backward | 1.53 / 1.46 | 1.44 / 1.40 | **4.80 / 1.45** | *1.45 / 1.43* | **3.31** |
+| barrier | 1.69 / 0.09 | 1.84 / 0.07 | 4.50 / 0.08 | *5.44 / 0.08* | 56 |
+| **iter** | 4.90 / 3.28 | 4.95 / 3.16 | **11.17 / 3.37** | *8.56 / 3.66* | **3.32** |
+
+The italic column is the drifted closing anchor. Read it as a second control: it
+is the same config as column 1 and it moved a long way in `iter`, but **only
+through dataload and barrier**. Compute stayed put. Whatever the allocation was
+doing to itself between the first and last arm was not CPU starvation.
 
 **Every median is flat across all three arms; every mean inflates at omp4.** The
 clean step is not slower — the entire cost is tail. And the tail is in *every*
@@ -1375,9 +1401,10 @@ That is also why `gap/dl` broke its long-standing 0.96–1.02 identity for the
 first time (2.52): dataload stops being the only tail once starvation injects one
 everywhere.
 
-**That fingerprint is what rules CPU out at production scale**, and it is
-stronger evidence than the omp8 null. Same statistic on job 8741594 `n16_nw2`
-(192 ranks, 53 iterations, the real 16n workload):
+**That fingerprint is what rules CPU out at production scale** — and with the
+omp8 wall-clock null voided by the floor, it is now the *only* evidence, not
+merely the stronger one. Same statistic on job 8741594 `n16_nw2` (192 ranks, 53
+iterations, the real 16n workload):
 
 | mean-of-max ÷ med-of-max | omp16 (2n) | omp4 (2n, starved) | **production 16n** |
 |---|---|---|---|
