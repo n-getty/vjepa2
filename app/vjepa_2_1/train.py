@@ -384,6 +384,18 @@ def main(args, resume_preempt=False):
         f"tmpdir={os.environ.get('TMPDIR', '')!r}"
         f"({len(os.environ.get('TMPDIR', ''))}"
         f"{'>75 AF_UNIX RISK at nw>0' if len(os.environ.get('TMPDIR', '')) > 75 else ''}) "
+        # OMP_NUM_THREADS AS THE RANK SEES IT. Decode is CPU work and 12 ranks
+        # share 104 cores, so this is a throughput knob -- but the reason it is
+        # logged is that it is the one knob that was WRONG for months without
+        # anyone being able to tell. PBS exports OMP_NUM_THREADS into every job
+        # script set to the node's logical CPU count (208 on Aurora), so
+        # `${OMP_NUM_THREADS:-16}` never fired and six launchers silently ran
+        # 208 while two ran 16. It was invisible precisely because nothing
+        # printed it; a knob that is never echoed is a knob nobody is actually
+        # setting. Flags the PBS value specifically, since inheriting it is
+        # never deliberate.
+        f"omp_threads={os.environ.get('OMP_NUM_THREADS', 'unset')}"
+        f"{' (=PBS node CPU count -- INHERITED, not set)' if os.environ.get('OMP_NUM_THREADS') == '208' else ''} "
         f"-> effective global batch "
         f"{world_size * batch_size * true_accum} "
         f"({world_size} ranks x bs {batch_size} x accum {true_accum})"
