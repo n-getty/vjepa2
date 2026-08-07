@@ -38,6 +38,35 @@ the decile means, plus a floor estimate (the minimum decile mean) and a decay
 ratio (first decile / floor). A run that reaches a floor early has a large ratio
 and a flat tail of deciles; a run in steady state has a ratio near 1.
 
+⚠️ DECILES RESCALE EACH SEGMENT TO ITS OWN LENGTH, AND THAT MISLED ONCE
+-----------------------------------------------------------------------
+Segments here span 300-1407 iterations, so decile 9 of the shortest and decile 9
+of the longest are ~1100 iterations apart -- yet a median "across segments by
+decile" averages them as if they were the same point in a run. Reading the
+pooled decile profile as a time course produced a wrong shape:
+
+    reported (deciles):  warmup 1.99 -> 1.29, then a monotone rise to 2.17
+                         over "the remaining 90% of the run" (+68%)
+    actual (absolute iteration axis, fixed cohort of 39 segments >= 600 iters):
+       iters   0-25  25-50  50-100  100-200  200-300  300-400  400-500  500-600
+       dload   2.65   1.33    1.24     1.18     1.20     1.21     1.40     1.56
+
+i.e. fall -> FLAT from ~50 to ~400 -> late rise. The rise is real but starts
+near iteration 400, not after warmup. It is entirely length-gated: median
+d9/d1 is 0.92 for segments of 300-400 iterations (no rise at all), 1.68 for
+400-600, and 2.13 for 600+. Short segments simply end inside the flat region.
+
+So: use the decile view to compare WITHIN one segment, and an absolute
+iteration axis with a FIXED COHORT to describe a time course across segments.
+The fixed cohort matters separately -- late bins otherwise contain only the long
+segments, so the sample composition changes as the x-axis advances.
+
+What this did NOT break: the allocation-vs-epoch boundary dissociation in
+`dload_rise_boundaries.py` was re-tested on the absolute axis (long segments
+only, epoch pairs after iteration 400) and came back SHARPER -- allocation
+2.60 -> 1.27 s, ratio 0.41 (37/45 reset); epoch 1.37 -> 1.95 s, ratio 1.38
+(only 54/428 reset). Only the timing of the rise was wrong.
+
 Rank 0 only, and here that is a REAL limitation, not a defensible shortcut as it
 was in backward_drift_scan.py. Dataload is an order statistic -- rank 0's own
 dataload is not the max over ranks, and the max is what the synchronous step
