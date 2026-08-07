@@ -205,7 +205,12 @@ def main():
         s = stats(pr, a.thresh)
         if not s:
             continue
-        s.update(name=name, files=nf, iters=len(dmax),
+        # Run order, for the bracketing check below. Rungs are serial within an
+        # allocation, so the first rank CSV's mtime orders them; the directory's
+        # own mtime does not, since a later checkpoint write touches it.
+        csvs = glob.glob(os.path.join(d, "log_r*.csv"))
+        t0 = min((os.path.getmtime(c) for c in csvs), default=0.0)
+        s.update(name=name, files=nf, iters=len(dmax), t0=t0,
                  dl_max_mean=st.mean(dmax) if dmax else float("nan"),
                  iter_mean=st.mean(imax) if imax else float("nan"),
                  iter_med=st.median(imax) if imax else float("nan"))
@@ -246,6 +251,7 @@ def main():
     print("entirely would move iter_mean down to iter_med and no further.")
 
     # --- anchor check, before any ranking ---------------------------------
+    arms_by_time = sorted(arms, key=lambda x: x["t0"])
     groups = {}
     for s in arms:
         groups.setdefault(base_name(s["name"]), []).append(s)
@@ -257,16 +263,48 @@ def main():
         print("Bracket the sweep with its baseline (A B C A) and re-run.")
         return
 
+    # WHICH repeated group is the anchor. Under A/B/B/A -- the layout this
+    # study uses so the treatment's own repeat spread is measured too -- BOTH
+    # groups have two members, so "the most-repeated group" is a coin flip and
+    # a treatment pair could silently become the baseline. The anchor is the
+    # group that BRACKETS the allocation: it holds both the first and the last
+    # arm in run order. That is what makes it a drift measurement.
+    first, last = arms_by_time[0], arms_by_time[-1]
+    anchor = None
+    if base_name(first["name"]) == base_name(last["name"]):
+        anchor = reps.get(base_name(first["name"]))
+    if anchor is None:
+        anchor = max(reps.values(), key=len)
+        print("NOTE: no arm brackets the allocation (first and last rungs "
+              "differ),\n  so the anchor below is the most-repeated group and "
+              "measures repeat spread\n  rather than start-to-end drift. "
+              "Bracket the sweep A/B/../A to get both.")
+    a_nm = base_name(anchor[0]["name"])
+
+    # The anchor's spread is a VETO; every other repeated group's spread is
+    # information that widens the floor. Vetoing on a treatment pair (which the
+    # first version of this check did) throws away a study whose baseline
+    # reproduced perfectly: under A/B/B/A a noisy B says the *effect* is not
+    # resolvable, which is a floor statement, not a comparability statement.
     spread_ok = True
+    extra_ex, extra_it = [], []
     for k, v in reps.items():
         ex = [x["excess"] for x in v]
         it = [x["iter_mean"] for x in v]
         r_ex = max(ex) / min(ex) if min(ex) > 0 else float("inf")
         r_it = max(it) / min(it) if min(it) > 0 else float("inf")
-        print(f"ANCHOR {k}: {len(v)} repeats  excess {min(ex):.3f}-{max(ex):.3f} "
+        role = "ANCHOR" if k == a_nm else "repeat"
+        print(f"{role} {k}: {len(v)} repeats  excess {min(ex):.3f}-{max(ex):.3f} "
               f"({r_ex:.2f}x)  iter_mean {min(it):.2f}-{max(it):.2f} ({r_it:.2f}x)")
-        if r_ex > 1.5 or r_it > 1.15:
-            spread_ok = False
+        if k == a_nm:
+            if r_ex > 1.5 or r_it > 1.15:
+                spread_ok = False
+        else:
+            m_ex, m_it = st.mean(ex), st.mean(it)
+            if m_ex:
+                extra_ex.append((max(ex) - min(ex)) / m_ex * 100)
+            if m_it:
+                extra_it.append((max(it) - min(it)) / m_it * 100)
 
     print()
     if not spread_ok:
@@ -276,10 +314,8 @@ def main():
         return
 
     # --- ranking, only once the anchor has earned it ----------------------
-    anchor = min(reps.values(), key=lambda v: -len(v))
     a_ex = st.mean([x["excess"] for x in anchor])
     a_it = st.mean([x["iter_mean"] for x in anchor])
-    a_nm = base_name(anchor[0]["name"])
     # The anchor's own spread is this study's noise floor. A delta smaller than
     # it is not a small effect -- it is an unmeasured one, and the sign of such
     # a delta is not even reliable. Gating on the spread being "tight enough"
@@ -289,10 +325,25 @@ def main():
     it_all = [x["iter_mean"] for x in anchor]
     ex_floor = (max(ex_all) - min(ex_all)) / a_ex * 100 if a_ex else float("inf")
     it_floor = (max(it_all) - min(it_all)) / a_it * 100 if a_it else float("inf")
+    # A repeated TREATMENT arm is a second, independent estimate of the same
+    # noise, and taking the max is the conservative read: if the treatment pair
+    # disagrees by 20% while the anchor pair agrees to 4%, a 10% treatment-vs-
+    # anchor delta is not resolvable, and calling it MEASURED off the anchor's
+    # narrower floor would be exactly the overclaim this reader exists to stop.
+    a_ex_floor, a_it_floor = ex_floor, it_floor
+    if extra_ex:
+        ex_floor = max(ex_floor, max(extra_ex))
+    if extra_it:
+        it_floor = max(it_floor, max(extra_it))
     print(f"baseline = {a_nm} (mean of {len(anchor)}): "
           f"excess {a_ex:.3f} s/iter, iter_mean {a_it:.2f} s")
-    print(f"NOISE FLOOR from the anchor's own repeats: "
-          f"tail +/-{ex_floor:.1f}%, wall +/-{it_floor:.1f}%")
+    print(f"NOISE FLOOR: tail +/-{ex_floor:.1f}%, wall +/-{it_floor:.1f}%")
+    if extra_ex or extra_it:
+        print(f"  anchor's own repeats give tail +/-{a_ex_floor:.1f}%, "
+              f"wall +/-{a_it_floor:.1f}%; the floor above is WIDENED to the")
+        print("  worst repeated group, because a treatment that does not "
+              "reproduce bounds\n  what this study can resolve just as hard as "
+              "a baseline that does not.")
     print("  (with 2 repeats this is a range, not a std -- it UNDERSTATES the")
     print("   floor, so a delta near it is even weaker than it looks.)")
     print()
