@@ -2391,3 +2391,61 @@ uncoupled test it was written for: two concurrent 1n sub-worlds (`1:node0
 1:node1`) in one allocation, where neither rung's forward can wait on the
 other's and coincidence therefore means something. The archive can show
 concentration; it cannot show independence.
+
+### The no-first-iter hang is a module-import stall on `/lus/flare`, not a rendezvous failure
+
+The SIGUSR1 fix (`app/main_dist_aurora.py:run_training`, arming
+`faulthandler.register` before the trainer is imported) paid off on its first
+run. Job 8742027 rung `n2_nw2` hit the same no-first-iter watchdog that killed
+two arms of 8741955 — but this time the ranks **survived** the signal
+(rc=137, our own `-9`, not rc=138 = 128+10), and all 12 ranks of node 1 wrote a
+stack. Node 0's 12 ranks wrote none: rank 0 had progressed to
+`Running pre-training of app: vjepa_2_1` and the rest to 3 lines.
+
+Every one of the 12 node-1 stacks is the same frame:
+
+```
+File "<frozen importlib._bootstrap_external>", line 1191 in get_data     <-- reading module bytes
+File ".../site-packages/torchvision/datasets/__init__.py", line 27 in <module>
+File ".../app/vjepa_2_1/models/utils/masks_dist.py", line 3 in <module>  <-- import torchvision
+File ".../app/vjepa_2_1/train.py", line 27 in <module>
+File ".../app/scaffold.py", line 17 in main                              <-- importlib.import_module
+File ".../app/main_dist_aurora.py", line 491 in run_training
+```
+
+`get_data` is the loader reading a module's bytes off disk. The venv lives on
+`/lus/flare`, and `torchvision/datasets/__init__.py` alone imports ~50 sibling
+modules. So the stall is **filesystem read latency during Python import**, with
+24 ranks per node opening the same several-hundred small files at once — not
+`init_process_group`, not xccl, not the fabric. The rendezvous had already
+completed (`init_process_group backend=xccl world_size=24 rank=0` is in
+`rank.0.out`, timestamped 2 s after start; the hang is 900 s later).
+
+This also explains the shape of 8741955: rungs 1 and 2 clean, 3 and 4 dead
+regardless of treatment. Nothing about pf8 was involved.
+
+**`masks_dist.py:3` does not use torchvision.** `import torchvision` in that
+file is dead — the module references no `torchvision.*` symbol. It is not the
+only entry point (`webdataset.py:18`, `video_dataset.py:16`,
+`transforms.py:11` all import it, and those *are* used), so removing it does
+not remove the import from the run; it removes it from the *earliest* point in
+the startup path, which is the one the trainer import blocks on.
+
+**Not yet fixed, and the reason is that the fix should be measured.** Candidate
+remediations, in order of how much they would actually buy:
+
+1. Stage the venv (or at least `site-packages`) to node-local `/tmp`, the
+   Copper read-only cache, or a container. This is the real fix — it is the
+   *whole* import tree, not one module. Note `[[aurora-tmp-is-tmpfs]]`: /tmp is
+   RAM, and site-packages is not small.
+2. Drop the dead `import torchvision` from `masks_dist.py`. Cheap and correct
+   regardless, but it only reorders when the cost is paid.
+3. `PYTHONDONTWRITEBYTECODE` is *not* the issue — all 50 `.pyc` files are
+   already present in `__pycache__`, so ranks are reading cached bytecode, and
+   the stall is in reading it, not in compiling it.
+
+**What is settled:** the no-first-iter hangs in this ladder are an import-time
+storage stall, evidenced by 12 concordant stacks, and the watchdog's forensics
+now work. **What is not:** why node 1 stalled and node 0 did not, and whether
+the stall is contention among the node's own 12 ranks or an external
+`/lus/flare` transient. One occurrence cannot separate those.
