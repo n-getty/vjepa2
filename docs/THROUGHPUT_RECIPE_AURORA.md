@@ -1524,6 +1524,41 @@ the order statistic. Rank 0's dataload is not the max over ranks, and the max is
 what the synchronous step pays (0.087 s per-rank mean vs 5.91 s mean-of-max at
 16n). The *shape* is what transfers; the magnitude is not.
 
+#### Work-paced or time-paced? The archive cannot tell — and says so loudly
+
+The surviving candidates split cleanly on one axis, so it was worth one more
+zero-node-hour pass. A **work-paced** accumulator fills per unit of work done
+(bytes read, shards opened, allocations made → page cache, loader growth); a
+**time-paced** one fills per unit of elapsed time regardless of what the job did
+(DAOS agent aging, a daemon, another tenant). Within one segment the two clocks
+are collinear, but the archive spans 2.1× in s/iter, and a time-paced
+accumulator would make a *slow* segment reach half-rise in *fewer* iterations.
+
+`scripts/dload_rise_clock.py`, 57 rising segments:
+
+| rho(s/iter, half-rise crossing iteration) | value | 95% CI |
+|---|---|---|
+| raw | **−0.296** | [−0.502, −0.061] — excludes 0 |
+| controlling for segment length | **−0.063** | [−0.302, **+0.192**] — includes 0 |
+
+**No separation.** And the gap between those two rows is the point:
+
+- `rho(length, s/iter) = −0.634` — slow segments are *short* segments.
+- `rho(length, cross-iter) = +0.395` — and a short segment **cannot** cross at a
+  high iteration index; it ends first. Pure censoring.
+
+Length alone manufactures the raw −0.296 whether or not any clock effect exists.
+Read raw, it is a confident and wrong "time-paced". An earlier version of the
+script compared *coefficient of variation* between clocks instead — 0.64 vs
+0.69, sign-stable in 99% of 2000 bootstrap resamples — which looks decisive and
+is a 7% gap between two noisy statistics over 57 points. The script now measures
+the confound first, prints raw beside partial, and **refuses a verdict when the
+partial CI straddles zero**, so it can no longer report either wrong answer.
+
+Separating the clocks needs a **designed pair**: equal length, equal iteration
+count, ≥2× difference in s/iter on the same node. The OMP-thread arms cannot
+supply it — omp4/omp8/omp16 at 2n span 3.15–3.35 s/iter, a 6% spread.
+
 **Reader fix this forced.** `tail_arm_compare.py` was comparing arms of unequal
 length on a non-stationary series — the 8741663 anchor's "1.75× did not
 reproduce" was a 45-iteration mean against a 93-iteration one. It now truncates
