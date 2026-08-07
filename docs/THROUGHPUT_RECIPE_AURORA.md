@@ -2161,6 +2161,30 @@ is node-synchronous fwd-context episodes with `dload == 0`, 8741045's is
 dataload (and it carries profiling overhead besides). Two owners, one symptom —
 which is exactly why a single mean cannot serve as a denominator.
 
+### The mean fails to reproduce on the SAME node in the SAME allocation
+
+Job 8741810 ran two 1n rungs back-to-back on one node (`x4104c2s1b0n0`), same
+allocation, same config — the tightest control available:
+
+| rung | n | median | mean | barrier | dload | fwd-tgt | fwd-ctx | backward |
+|---|---|---|---|---|---|---|---|---|
+| `n1_nw2` | 250 | 2.97 | 3.37 | 0.03 | 0.00 | 0.71 | 1.05 | 1.23 |
+| `n1_nw2_rep2` | 100 | 2.99 | 4.05 | 0.03 | 0.00 | 0.71 | 1.06 | 1.23 |
+
+**Median agrees to 0.7% and every phase column to 1%; the mean differs 20%.**
+Node, allocation, hour, config and neighbours are all held fixed, so the only
+thing left is how per-rank tails co-occur across ranks — the order statistic.
+Run-to-run mean variation is therefore **intrinsic**, not an environment
+difference, and no amount of matching the environment will stabilise it.
+
+This also caps what the cross-run table can be read to mean: its 62% mean spread
+is not evidence about nodes, since 20% of it appears with the node held fixed.
+
+Rep2's own 20% gap is **entirely dataload** (8.30 s spikes on 12 of 106 iters,
+`fwdc` flat at ×1.05) with zero episodes. Two mechanisms, one symptom — so a
+mean gap is not a cheap proxy for episodes. Only the `fwdc` column separates
+them.
+
 **Rule:** if a 1n anchor must be quoted, quote **p10**, say that it is a floor,
 and label the resulting efficiency an **upper bound** — it prices the compute,
 not the run. Anything quoted from a mean needs the anchor re-measured *in the
