@@ -289,6 +289,62 @@ timeout 60 ls "$DAOS_MNT"   >/dev/null 2>&1 || { echo "FATAL: $DAOS_MNT unrespon
 timeout 60 ls "$MODELS_MNT" >/dev/null 2>&1 || { echo "FATAL: $MODELS_MNT unresponsive"; exit 1; }
 echo "DAOS mounted (corpus + models)"
 
+# Stage the imported packages to node-local /tmp, once per allocation, before
+# any rung. Job 8742027 lost a rung to Python import blocking on /lus/flare
+# (12 concordant stacks in importlib get_data), and the HEALTHY import is
+# 39-53 s of every rung on top of that. Measured on a login node, warm cache:
+# 9.5 s -> 4.4 s, with all 2777 modules resolving from /tmp and none falling
+# back. Cold compute nodes should show more, not less.
+#
+# VJEPA_LADDER_STAGE_VENV=0 disables it -- and staging must be A/B-able, because
+# /tmp is RAM ([[aurora-tmp-is-tmpfs]]) and 4.5 GB/node of it competes with page
+# cache, which the dataload-tail work has shown is not a free resource. If a
+# ladder result ever moves when this flag does, that is a finding, not noise.
+if [ "${VJEPA_LADDER_STAGE_VENV:-1}" = "1" ]; then
+    export VJEPA_VENV_LOCAL=${VJEPA_VENV_LOCAL:-/tmp/vjepa_venv}
+    export VJEPA_REPO_ROOT=$ROOT
+    # Regenerate the package list from THIS venv rather than shipping a stale
+    # one: it takes ~10 s and a manifest that has drifted from the environment
+    # is exactly how a partial stage happens.
+    #
+    # `python`, NOT $PY. $PY is the frameworks interpreter and resolves a
+    # DIFFERENT site-packages than the activated venv the ranks import from;
+    # a manifest generated against the wrong tree names packages that do not
+    # exist under $SITE, and rsync would then stage a subset without saying so.
+    # The closure must be captured by the interpreter that will run the trainer.
+    if python $ROOT/scripts/gen_import_closure.py --out "$JOBTMP/pkgs.txt" 2>/dev/null \
+       && [ -s "$JOBTMP/pkgs.txt" ]; then
+        export VJEPA_VENV_MANIFEST=$JOBTMP/pkgs.txt
+    else
+        echo "  closure generation failed -- stager will use its built-in package list"
+    fi
+    t_venv=$(date +%s)
+    # -ppn 1: one stager per node. NOT fatal on failure -- the stager itself
+    # exits 0 without publishing if anything goes wrong, and the ranks fall back
+    # to the Lustre venv, so the worst case is the status quo.
+    #
+    # HARD DEADLINE, and it is not belt-and-braces. This pass reads 4.6 GB over
+    # 22933 files off the SAME filesystem whose stalls it exists to avoid; a
+    # stager wedged in the Lustre read path would burn the allocation exactly as
+    # the import did. The timeout kills the mpiexec, not a D-state child -- but
+    # the child holds only its own node's temp dir, which is never published
+    # without the .complete marker, so an abandoned stage is inert.
+    #
+    # 900 s is deliberately generous against a MEASURED 392 s on a busy login
+    # node. That measurement is also why staging can be a net LOSS at few rungs:
+    # 392 s once against ~45 s of import per rung. It pays for itself past ~9
+    # rungs on the mean, and immediately against the 900 s+ pathological import.
+    # Report the real number every job rather than assume the login-node one.
+    timeout 900 mpiexec -n "$NNODES" -ppn 1 --hostfile "$PBS_NODEFILE" \
+        --cpu-bind none --no-vni \
+        bash $ROOT/scripts/stage_venv_local.sh 2>&1 | tail -20
+    _stage_rc=${PIPESTATUS[0]}
+    [ "$_stage_rc" = "124" ] && echo "  venv staging TIMED OUT at 900s -- ranks will use Lustre"
+    echo "venv staging pass done in $(( $(date +%s) - t_venv ))s (rc=$_stage_rc)"
+else
+    echo "venv staging DISABLED (VJEPA_LADDER_STAGE_VENV=0) -- imports read /lus/flare"
+fi
+
 # --weak-scale keeps per-rank batch FIXED as nodes grow, which is the only
 # meaningful setting for a per-tile scaling curve: every rung must do identical
 # per-rank work or the throughput comparison is between different workloads.
@@ -767,6 +823,20 @@ PY
         echo "  WARNING: watchdog for $name did NOT arm -- rung runs unwatched" >&2
     fi
     local t0=$(date +%s)
+    # Prepend the node-local staged packages, ONLY if this node published a
+    # complete stage. Two properties make this safe rather than a new failure
+    # mode, and both are load-bearing:
+    #   - the Lustre venv stays BEHIND it, so a package that was not staged
+    #     resolves to Lustre -- correct, just slow;
+    #   - a PYTHONPATH entry naming a directory that does not exist is silently
+    #     ignored by Python, so a node whose stager failed while the head node's
+    #     succeeded falls back on its own, with no per-node bookkeeping here.
+    # The head node's marker is therefore a sufficient test even though staging
+    # is per-node.
+    local rung_pypath=$PYTHONPATH
+    if [ -f "${VJEPA_VENV_LOCAL:-/nonexistent}/.complete" ]; then
+        rung_pypath="$VJEPA_VENV_LOCAL:$PYTHONPATH"
+    fi
     # --no-vni: DAOS RPCs fail NA_HOSTUNREACH without it.
     # -o/-e per rank: never funnel 3072 ranks' stdout through the head node,
     #   which also serves the rendezvous store and DAOS keepalives (job 8730678).
@@ -784,6 +854,7 @@ PY
     VJEPA_SHARD_CAP=$cap \
     WDS_LOCAL_SLICING=$slicing \
     OMP_NUM_THREADS=$omp \
+    PYTHONPATH=$rung_pypath \
     mpiexec -n $W -ppn $PPN --hostfile "$nf" --cpu-bind depth --depth $omp --no-vni \
         -o "$dir/rank.%r.out" -e "$dir/rank.%r.err" \
         python -m app.main_dist_aurora --train_mode \

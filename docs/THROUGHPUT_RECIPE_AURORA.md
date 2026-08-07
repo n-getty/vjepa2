@@ -2437,7 +2437,101 @@ remediations, in order of how much they would actually buy:
 1. Stage the venv (or at least `site-packages`) to node-local `/tmp`, the
    Copper read-only cache, or a container. This is the real fix — it is the
    *whole* import tree, not one module. Note `[[aurora-tmp-is-tmpfs]]`: /tmp is
-   RAM, and site-packages is not small.
+   RAM. But the import closure is far smaller than the venv, so the RAM cost is
+   not the objection it looks like — see the sizing below.
+
+**Sizing the import closure (measured, and it corrects an earlier estimate).**
+Importing `app.vjepa_2_1.train` under the venv python and summing
+`sys.modules[*].__file__`, **deduplicated by path**:
+
+| package | unique files | MB |
+|---|---|---|
+| triton | 51 | **1212.2** |
+| torch | 1033 | 21.7 |
+| numpy | 102 | 16.2 |
+| sympy | 419 | 9.4 |
+| everything else | ~1085 | ~28.9 |
+| **total** | **2690** | **1288.4** |
+
+Two corrections fall out of this, and both matter for what to stage:
+
+- **It is 1.29 GB, not the 5.2 GB written below.** 5.2 GB is `du` over all of
+  `site-packages`; most of it is never imported. Staging the whole tree would
+  copy 4× what the run reads.
+- **94% of those bytes are a single file**: `triton/_C/libtriton.so`, 1.21 GB,
+  shared as `__file__` by 32 distinct `triton.*` submodules (deduplicating that
+  is what took an intermediate estimate from a nonsensical 38 GB down to this).
+  So the closure is really *one big shared object* plus **2668 `.pyc` files
+  totalling 58 MB** — a metadata-and-small-reads workload, not a bandwidth one.
+
+That shape is consistent with the stack: the wedged read was in
+`importlib._bootstrap_external.get_data`, reading one small module's bytes. It
+also means a staging fix is cheap — 58 MB of `.pyc` per node is seconds, and
+`libtriton.so` is one large sequential read that Lustre is good at. **It does
+not tell us the stall would go away**, only that the cost of trying is low.
+
+**But 1.29 GB is not what gets staged, and the difference is 3.6×.** The table
+above is the set of files the import *reads*. What `scripts/stage_venv_local.sh`
+copies is the set of **whole top-level packages** containing them, which is
+**4.6 GB over 22,933 files** (`gen_import_closure.py --stats`, same venv):
+
+| package | files | MB |
+|---|---|---|
+| triton | 493 | 2694.7 |
+| torch | 14034 | 1486.9 |
+| wandb | 1201 | 85.1 |
+| opencv_python_headless.libs + cv2 | 109 | 164.0 |
+| everything else (152 pkgs) | ~7096 | ~194 |
+| **total (156 packages)** | **22933** | **4624.5** |
+
+The inflation is not waste to be optimized away — it is the design, and it was
+forced by two failures of the per-file approach:
+
+1. numpy imported, then died on `libscipy_openblas64_-…so: cannot open shared
+   object file`. `sys.modules` names an extension module, never the libraries it
+   `dlopen`s through an RPATH. Reading `/proc/self/maps` after the import closed
+   that particular gap (+49 files).
+2. torch then died on `Unable to find torch_shm_manager at …/torch/bin/`. A plain
+   **binary** — not a module, not a mapped library. No introspection of a running
+   import can see it.
+
+(2) is not a patchable gap; a package may reference arbitrary data files at
+runtime. What makes package granularity *safe* is the sys.path fallback: the
+staged tree is prepended with the Lustre venv still behind it, so a package
+**absent** from the stage resolves to Lustre — correct, just slow — while a
+package **present but internally incomplete** is found first and then fails.
+**Partial-at-package-granularity is safe; partial-at-file-granularity is not.**
+That asymmetry is also the escape hatch if tmpfs pressure ever bites: dropping
+`triton` alone removes 2.7 GB of the 4.6 with no other change (and
+`torch.compile` is not viable on XPU anyway).
+
+**Measured, login node, page-cache warm, two repeats each:**
+
+| arm | import | modules from /tmp | modules from Lustre |
+|---|---|---|---|
+| STAGED | 4.2 s, 4.5 s | 2777 | **0** |
+| LUSTRE | 9.8 s, 9.4 s | 0 | 2777 |
+
+**2.2× faster with zero fallback** — the whole closure resolves locally, so the
+prepend is doing what it claims. Two caveats that keep this honest:
+
+- Both arms were warm. A cold compute node should show more, not less, but this
+  measurement does not establish that.
+- **It does not show the stall is gone.** It shows the healthy path is faster and
+  that the run no longer *reads* module bytes off Lustre during import. The
+  stall is a rare transient; the claim available is "the known mechanism is
+  removed by construction", not "demonstrated fixed".
+
+**Staging is not free and can be a net loss.** The pass measured **49 s** for
+4463 MB on a login node (an earlier attempt on a busier one took 392 s). Against
+~45 s of import per rung it pays for itself after roughly the first rung at the
+49 s rate — but at the 392 s rate it needs ~9 rungs, and it is immediately worth
+it only against the 900 s pathological case. The ladder therefore reports the
+real elapsed time every job rather than assuming either number, bounds the pass
+at `timeout 900`, and keeps it switchable with `VJEPA_LADDER_STAGE_VENV=0` —
+`/tmp` is RAM (`[[aurora-tmp-is-tmpfs]]`) and 4.5 GB/node of it competes with
+page cache, which the dataload-tail work has already shown is not a free
+resource. If a ladder result ever moves when that flag does, that is a finding.
 2. Drop the dead `import torchvision` from `masks_dist.py`. Cheap and correct
    regardless, but it only reorders when the cost is paid.
 3. `PYTHONDONTWRITEBYTECODE` is *not* the issue — all 50 `.pyc` files are
@@ -2524,9 +2618,11 @@ Two consequences worth acting on, in order:
 
 1. **The launcher should not be able to lose an allocation to one file.**
    *Implemented* — see below.
-2. **Stage `site-packages` (5.2 GB of the 8.7 GB venv) off Lustre.** At the
-   0.43 GB/s/node staging rate that is ~20 s/node, against a measured ~45 s
-   healthy import and an observed 900 s+ pathological one. **Not implemented.**
+2. **Stage the import closure off Lustre.** *Implemented* — see below. Sized
+   above: the files the import reads are 1.29 GB, but what is staged is the
+   **whole packages** containing them, 4.6 GB / 22,933 files, for reasons the
+   sizing section gives. Measured 49 s to stage, 9.6 s → 4.4 s import, **zero**
+   modules resolving from Lustre afterwards.
 
 #### What was changed (#1), and what it is not
 
@@ -2554,10 +2650,65 @@ Locked in by two tests in `tests/test_aurora_teardown_and_watchdog.py`, both
 mutation-verified: restoring the `cp`-onto-Lustre two-step fails them, as does
 dropping the stdio redirect, as does removing the deadline.
 
-**This is not a Lustre fix and does not make the ladder immune.** The venv, the
-rank CSVs and the job log are still on `/lus/flare`; remediation 2 is untouched,
-and the import stall that killed rung 1 of this same job is unaddressed. What
-changed is that *the launcher's own config write* can no longer take the
-allocation down with it. Whether it works is not yet demonstrated — the failure
-is a rare transient, so absence in the next run is weak evidence. It should be
-claimed only as "the known mechanism is removed by construction".
+**This is not a Lustre fix and does not make the ladder immune.** The rank CSVs
+and the job log are still on `/lus/flare`. What changed is that *the launcher's
+own config write* can no longer take the allocation down with it. Whether it
+works is not yet demonstrated — the failure is a rare transient, so absence in
+the next run is weak evidence. It should be claimed only as "the known mechanism
+is removed by construction".
+
+#### What was changed (#2), and what it is not
+
+`scripts/stage_venv_local.sh` runs once per allocation, one process per node
+under `mpiexec -ppn 1`, before any rung. It rsyncs the packages named by
+`scripts/gen_import_closure.py` from the venv's `site-packages` into
+`/tmp/vjepa_venv`, and `run_rung` prepends that to `PYTHONPATH` for each rung's
+`mpiexec`. Sizing, the package-vs-file argument, and the A/B are in the sizing
+section above.
+
+**Failing safe is the contract, not a nicety** — an optimization that can break
+a run is worse than the 45 s it saves. So:
+
+- the tree is built in a private `$DEST.building.$$` and published by `mv -T`, so
+  12 ranks starting at an arbitrary moment see a complete tree or none;
+- it is **verified by actually importing through it** (`torch, numpy,
+  torchvision, PIL, yaml, timm`) before publish, using the *venv's* interpreter.
+  Not a file count: both real staging failures were invisible to any check
+  comparing copied-against-requested;
+- on **any** failure it prints why and `exit 0` **without publishing**, and the
+  ladder's prepend is gated on the `.complete` marker. A node whose stage failed
+  simply keeps reading Lustre. A `PYTHONPATH` entry naming a directory that does
+  not exist is ignored by Python, so a per-node failure needs no bookkeeping in
+  the launcher;
+- the pass is bounded by `timeout 900` — it reads 4.6 GB off the same filesystem
+  whose stalls it exists to avoid, and an unbounded stager could lose the
+  allocation exactly as the import did.
+
+Two mechanical traps here are worth recording because both produce **rc=0 with a
+useless tree**, and one of them was hit:
+
+- `rsync -a --files-from=<dirs>` copies **nothing**. `--files-from` cancels the
+  `-r` that `-a` implies, so it creates the directory entries and stops
+  (measured: 0 files without an explicit `-r`, 2 with). The `-r` in the script is
+  written out for this reason.
+- `--files-from` implies `-R`, so **absolute** paths in the manifest reproduce
+  the whole `/lus/flare/...` hierarchy under the destination and the staged tree
+  is not importable — at the right byte count.
+
+Also: the manifest must be generated by the **venv** interpreter, not the
+frameworks `$PY`. They resolve different `site-packages`, and a manifest built
+against the wrong one names packages absent from the venv. The stager filters
+entries against `$SITE` and reports the drop count rather than letting rsync
+exit 23 or stage a silent subset.
+
+Ten tests in `tests/test_venv_staging.py`, five mutants killed: dropping the
+explicit `-r`, absolutising the manifest paths, publishing without verifying,
+prepending unconditionally, and removing the staging deadline.
+
+**What this does not do.** It does not make the ladder Lustre-independent — the
+per-rank CSVs, the job log and the checkpoint path all still live there. It does
+not demonstrate the import stall is fixed; it removes the mechanism. And it is
+not unambiguously a win at every scale: 49 s (or 392 s on a busy filesystem) of
+staging against ~45 s/rung of import means a short two-rung job can come out
+behind. `VJEPA_LADDER_STAGE_VENV=0` exists so that is measurable rather than
+assumed.
