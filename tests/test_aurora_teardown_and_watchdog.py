@@ -1,19 +1,29 @@
-"""Two silent-failure guards, both learned from job 8739712.
+"""Three silent-failure guards in the harness, each learned from a real job.
 
-Neither of these is a correctness property of training. Both are properties of
-the *harness*, and both failed in a way that produced no error message -- which
-is exactly why they need tests rather than a comment.
+None of these is a correctness property of training. All are properties of the
+*harness*, and all failed in a way that produced no error message -- which is
+exactly why they need tests rather than a comment.
 
 1. `app/main_dist_aurora.py` hard-exits with `os._exit()` to escape a C++
    destructor throw at interpreter shutdown that hung a completed run. Because
    that call sits in a `finally`, it also runs while an exception is propagating,
    and a hardcoded `os._exit(0)` there would report every crash as success.
+   (Job 8739712.)
 
 2. `scripts/scaling_ladder.sh` arms a per-rung stall watchdog. It used to capture
    the pid with `pid=$(start_rung_watchdog ...)`, which blocks until the
    backgrounded subshell exits and therefore silently disarmed it. Job 8739712
    ran both rungs unwatched and lost ~25 min of a 60 min slot to a hang nothing
    reaped.
+
+3. The SIGUSR1 stack-dump handler was registered inside the training loop's
+   setup, so every rank ran the whole startup -- import, XPU pin, rendezvous,
+   model build, dataset open -- with SIGUSR1 at its DEFAULT disposition, which
+   terminates. The shell watchdog's no-first-iter path exists to photograph a
+   rank stuck in exactly that window; instead it killed all 24 ranks of job
+   8741955 arm `n2_nw2_pf8_rep2` (rc=138 = 128+10) and wrote no stacks. The
+   forensics were disarmed over precisely the window they were built for, and
+   the only visible trace was a nonzero code with empty stderr.
 """
 
 import os
@@ -148,6 +158,94 @@ def test_watchdog_waits_before_probing_for_the_trainer():
         "grace period must precede the first pgrep liveness check"
     )
     assert grace < loop or "sleep $WD_START_GRACE" in src.split("while true")[0]
+
+
+# --------------------------------------------------------------------------
+# 3. SIGUSR1 must be survivable from process start, not just in the train loop
+# --------------------------------------------------------------------------
+
+_USR1_SNIPPET = textwrap.dedent(
+    """
+    import os, signal, sys, time
+    if sys.argv[1] == "armed":
+        import faulthandler, signal as _s
+        faulthandler.enable(all_threads=True)
+        faulthandler.register(_s.SIGUSR1, all_threads=True, chain=False)
+    os.kill(os.getpid(), signal.SIGUSR1)
+    time.sleep(0.2)          # let the handler run before we claim survival
+    print("SURVIVED")
+    """
+)
+
+
+def _run_usr1(mode):
+    return subprocess.run(
+        [sys.executable, "-c", _USR1_SNIPPET, mode], capture_output=True, text=True, timeout=60
+    )
+
+
+def test_unhandled_sigusr1_kills_the_process():
+    """The premise. Without this the fix below looks like defensive noise.
+
+    Python installs no default SIGUSR1 handler, so the kernel's disposition
+    applies and the process dies with signal 10 -- which mpiexec reports as
+    rc=138, and which is what job 8741955 arm 3 actually was. Nothing is written
+    to stderr, so from the artifacts alone it is indistinguishable from a crash.
+    """
+    r = _run_usr1("bare")
+    assert r.returncode == -signal_num(), r
+    assert "SURVIVED" not in r.stdout
+
+
+def signal_num():
+    import signal as _s
+
+    return int(_s.SIGUSR1)
+
+
+def test_registered_sigusr1_dumps_and_continues():
+    """chain=False + register (not enable-only) must DUMP and RESUME.
+
+    Both halves matter: a dump that then aborts still loses the rung, and a
+    handler that resumes without dumping loses the forensics. The watchdog's
+    contract is `pkill -USR1` to photograph, then `pkill -9` to reap.
+    """
+    r = _run_usr1("armed")
+    assert r.returncode == 0, r
+    assert "SURVIVED" in r.stdout
+    # faulthandler writes the stack to stderr when no file is given.
+    assert "Current thread" in r.stderr or "Thread" in r.stderr, r.stderr
+
+
+def test_handler_is_armed_before_the_trainer_is_imported():
+    """Registration must sit in run_training(), ahead of the scaffold hand-off.
+
+    train.py's own register() is behind `importlib.import_module`, model build
+    and dataset open -- minutes of wall time at 2n, and the entire window the
+    no-first-iter watchdog covers. Position is the whole property here, so
+    assert on ORDER in the source, not merely on presence.
+    """
+    src = open(os.path.join(REPO, "app", "main_dist_aurora.py")).read()
+    reg = src.index("_fh0.register(_sig0.SIGUSR1")
+    fn = src.index("def run_training(args):")
+    assert fn < reg, "SIGUSR1 must be armed inside run_training()"
+    # Everything the startup does after this point must come later in the file.
+    for later in ("init_distributed(", "app_main(", "eval_main("):
+        assert reg < src.index(later, fn), f"SIGUSR1 armed after {later}"
+
+
+def test_early_registration_is_not_env_gated():
+    """An unhandled SIGUSR1 is lethal whether or not diagnostics are enabled.
+
+    Gating this on VJEPA_ITER_WATCHDOG_S (as the trainer's copy is) would leave
+    the lethal default in place for every run that did not opt in -- including
+    every production run the shell watchdog is watching.
+    """
+    src = open(os.path.join(REPO, "app", "main_dist_aurora.py")).read()
+    reg = src.index("_fh0.register(_sig0.SIGUSR1")
+    block = src[src.index("def run_training(args):"):reg]
+    assert "VJEPA_ITER_WATCHDOG_S" not in block
+    assert "VJEPA_SCALE_PROBE" not in block
 
 
 def test_ladder_script_is_valid_bash():

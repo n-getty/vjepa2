@@ -344,6 +344,38 @@ def run_training(args):
     from src.utils.distributed import _get_pmi_env, init_distributed
     import torch
 
+    # -- SIGUSR1 -> stack dump, armed HERE rather than in the trainer.
+    #
+    # train.py:1088 registers the same handler, but only once it reaches the
+    # training loop's setup. Everything before that -- import, XPU pin,
+    # init_process_group, model build, dataset open -- runs with SIGUSR1
+    # UNHANDLED, and the default disposition for SIGUSR1 is to terminate. So the
+    # shell watchdog's no-first-iter path (scaling_ladder.sh:387), which exists
+    # precisely to photograph a rank that never reached iteration 0, instead
+    # killed all 24 of them with rc=138 (128+10) and produced no stacks at all:
+    # job 8741955 arm n2_nw2_pf8_rep2, where every rank's last line is
+    # scaffold.py's "Running pre-training of app: vjepa_2_1" -- i.e. stalled
+    # inside importlib, an import the trainer's own registration sits behind.
+    # The forensics were disarmed over exactly the window they were built for.
+    #
+    # chain=False and no file: dumps to this rank's stderr, which under the
+    # ladder's `mpiexec -e rank.%r.err` is already per-rank, so attribution
+    # comes free without knowing `folder` yet (we don't at this point). The
+    # trainer's later register() simply supersedes this one and redirects to
+    # its per-rank file -- registering twice is not an error, last wins.
+    #
+    # Unconditional, not env-gated: an unhandled SIGUSR1 is lethal whether or
+    # not diagnostics are enabled, so making the handler opt-in would leave the
+    # lethal default in place for every run that did not opt in.
+    try:
+        import faulthandler as _fh0
+        import signal as _sig0
+
+        _fh0.enable(all_threads=True)
+        _fh0.register(_sig0.SIGUSR1, all_threads=True, chain=False)
+    except Exception as _e0:  # never let diag setup block a run
+        logger.warning(f"early faulthandler.register(SIGUSR1) failed: {_e0}")
+
     # IPEX provides the XPU primitives + the oneccl_bindings_for_pytorch
     # import side effect required when init_distributed() falls back to ccl.
     try:
