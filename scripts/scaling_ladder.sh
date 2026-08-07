@@ -100,10 +100,18 @@
 # not two, plus a closing anchor:
 #
 #   L6: qsub -q debug -l select=2 -v \
-#         VJEPA_LADDER_RUNGS="2:nw2 2:nw2:store staged:cap50 2:nw2:cap50 2:nw2" \
+#         VJEPA_LADDER_RUNGS="2:nw2 2:nw2:store staged:cap24 2:nw2:cap24 2:nw2" \
 #         scripts/scaling_ladder.sh
 #         (write the store field WITHOUT the space -- `store staged` above is a
-#          line-wrap artifact of this comment; the real spec is `2:nw2:storestaged:cap50`)
+#          line-wrap artifact of this comment; the real spec is `2:nw2:storestaged:cap24`)
+#
+# cap24 is sized, not guessed. Measured against vitG384_lbA's mean shard size:
+# cap=0 puts 2317 GiB/node at N=2 (~90 min at 0.43 GB/s/node, longer than the
+# slot); cap=50 puts 254 GiB on a tmpfs that is RAM and already loses ~690 GiB
+# to unattributed host memory over a run; cap=24 puts 122 GiB and stages in
+# ~4.7 min at EVERY node count (the 24 floor binds from 2n up). 24 is also
+# exactly 12 local ranks x 2 DataLoader workers -- the worker-independence
+# floor, below which a worker would have to share a shard.
 #
 #   arm 1  daos-full      the production path, and the OPENING anchor
 #   arm 2  staged-capped  local tmpfs, so the DAOS agent and the NIC are bypassed
