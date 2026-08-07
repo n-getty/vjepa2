@@ -182,14 +182,25 @@ def main():
     print(f"window: iterations [{a.lo}, {a.hi}), full rank coverage only")
     print(f"fixed threshold for rate: {a.thresh:.1f} s\n")
     print(f"{'arm':<34} {'rks':>4} {'its':>4} | {'iter_mean':>9} {'iter_med':>8} "
-          f"| {'dl_max':>7} | {'BODY':>6} {'excess':>7} {'p99':>6} {'rate':>6}")
-    print("-" * 118)
+          f"{'gap':>6} | {'dl_max':>7} {'gap/dl':>7} | {'BODY':>6} {'excess':>7} "
+          f"{'p99':>6} {'rate':>6}")
+    print("-" * 132)
     for s in arms:
+        gap = s["iter_mean"] - s["iter_med"]
+        gd = gap / s["dl_max_mean"] if s["dl_max_mean"] else float("nan")
         print(f"{s['name']:<34} {s['n_ranks']:>4} {s['iters']:>4} | "
-              f"{s['iter_mean']:>9.2f} {s['iter_med']:>8.2f} | "
-              f"{s['dl_max_mean']:>7.2f} | "
+              f"{s['iter_mean']:>9.2f} {s['iter_med']:>8.2f} {gap:>6.2f} | "
+              f"{s['dl_max_mean']:>7.2f} {gd:>7.2f} | "
               f"{s['med']:>6.2f} {s['excess']:>7.3f} {s['p99']:>6.2f} "
               f"{s['rate']:>6.3f}")
+    print()
+    print("gap = iter_mean - iter_med, the part of wall-clock the median hides.")
+    print("gap/dl near 1.0 means the dataload order statistic accounts for ALL")
+    print("of it -- no other phase contributes a tail. Note this is close to an")
+    print("identity when dataload is zero-inflated (median iter ~ a clean step,")
+    print("mean iter ~ clean step + mean dl_max), so it is not a discovery. It")
+    print("is a BOUND, and that is why it is here: removing the dataload tail")
+    print("entirely would move iter_mean down to iter_med and no further.")
 
     # --- anchor check, before any ranking ---------------------------------
     groups = {}
