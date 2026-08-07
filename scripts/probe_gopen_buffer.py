@@ -161,7 +161,14 @@ def main():
     ap.add_argument("--source", default="cholec80_g16")
     ap.add_argument("--members", type=int, default=24,
                     help="members to read per trial; caps runtime on big shards")
-    ap.add_argument("--bufsizes", default="4096,65536,1048576,4194304")
+    # -1 MUST be in this list and MUST come first. It is the value training
+    # actually runs at (GOPEN_BUFFER unset -> gopen passes buffering=-1 ->
+    # CPython uses the mount's st_blksize), and the first run of this probe
+    # omitted it -- sweeping 4096..4 MB and reporting a 42x DAOS speedup that
+    # was really the gap between a setting nobody uses and the one already in
+    # force. Without the -1 row the sweep cannot distinguish "big lever" from
+    # "already at the top of the curve", which are opposite conclusions.
+    ap.add_argument("--bufsizes", default="-1,4096,65536,1048576,4194304")
     ap.add_argument("--repeats", type=int, default=3,
                     help="trials per bufsize, each on its own cold shard")
     ap.add_argument("--require-daos", action="store_true",
@@ -205,11 +212,16 @@ def main():
     # --- Part 1: what does buffering=-1 actually pick? ---------------------
     print("--- st_blksize (what Python's default buffering=-1 resolves to) ---")
     print(f"{'path':>8} {'st_blksize':>12} {'size MB':>10}   verdict")
+    # No verdict column here. The first run of this probe printed
+    # "LARGE -> mechanism REFUTED here" for DAOS (st_blksize 2 MB) on the same
+    # run whose intervention arm measured 36-44x, i.e. the heuristic contradicted
+    # the measurement sitting twenty lines below it. st_blksize says where the
+    # DEFAULT sits on the curve; it says nothing about the curve's shape. Only
+    # Part 3 decides, and the -1 row there is what locates the default on it.
     for label, paths in targets:
         st = os.stat(paths[0])
-        v = ("SMALL -> many syscalls, mechanism is LIVE"
-             if st.st_blksize <= 65536 else "LARGE -> mechanism REFUTED here")
-        print(f"{label:>8} {st.st_blksize:>12} {st.st_size/1e6:>10.1f}   {v}")
+        print(f"{label:>8} {st.st_blksize:>12} {st.st_size/1e6:>10.1f}   "
+              f"(= what the -1 row in Part 3 runs at)")
     print()
 
     # --- Part 2: does the read count actually track buffer size here? ------
