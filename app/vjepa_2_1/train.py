@@ -363,6 +363,15 @@ def main(args, resume_preempt=False):
         # dataload-time purely because decode runs inline instead of prefetched.
         f"num_workers={num_workers} pin_mem={pin_mem} "
         f"persistent_workers={persistent_workers} "
+        # GOPEN_BUFFER sets the read() size webdataset uses to stream shards:
+        # gopen falls through to open(url, "rb", buffering=int($GOPEN_BUFFER or
+        # -1)) for scheme-less paths, and at -1 CPython uses the mount's
+        # st_blksize. Unset is therefore NOT "no buffering" -- it is "whatever
+        # this filesystem reports", which differs between Lustre and DAOS and is
+        # invisible in the config. Logged for the same reason as num_workers: an
+        # env-only knob that changes I/O cost and leaves no trace in
+        # params-pretrain.yaml is unrecoverable from a finished run's artifacts.
+        f"gopen_buffer={os.environ.get('GOPEN_BUFFER', 'unset(-1=st_blksize)')} "
         # TMPDIR AS THE RANK SEES IT, which is not what the launcher exported:
         # PALS appends a per-mpiexec-launch /<uuid>/tmp, adding ~41 chars. At
         # num_workers>0 that is load-bearing -- python multiprocessing builds an
