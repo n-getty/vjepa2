@@ -197,6 +197,13 @@ def summarize(per, ranks, clips, epoch=1, lo=1, hi=4):
     s = dict(
         n=len(vals),
         med=med,
+        # The MEAN of the per-iteration max, not just its median. Dataload is
+        # bimodal -- exactly 0.00 s on most iters and multi-second on the rest --
+        # so the median prices the stall at ZERO and flatters the run: at 64n it
+        # read 68% efficiency against an honest 63%. Wall-clock is the mean, and
+        # a schedule is built from wall-clock. Report both; when they disagree
+        # the gap IS the stall tax, and the mean is the one that pays it.
+        mean=st.mean(vals),
         lo=vals[len(vals) // 4],
         hi=vals[3 * len(vals) // 4],
         thru=ranks * clips / med,
@@ -229,6 +236,31 @@ def summarize(per, ranks, clips, epoch=1, lo=1, hi=4):
         ph[name] = st.median(vv) if vv else 0.0
     s["phases"] = ph
     s["bad"] = bad
+    # SECOND reduction: median-OVER-RANKS per iteration, then median over the
+    # window. This is not a redundant view of the table above -- the two answer
+    # different questions and have already disagreed on a headline claim.
+    #
+    #   max-over-ranks    = what the synchronous step WAITS for (wall-clock cost)
+    #   median-over-ranks = what a TYPICAL rank actually pays (per-rank cost)
+    #
+    # A phase can rise in the first and be flat in the second, which means no
+    # rank got slower and the growth is skew ARRIVING in that phase. That is
+    # exactly what the long-standing "64n forward blowup" turned out to be:
+    # max-over-ranks fwd-context 1.07 -> 1.83 s, but median-over-ranks flat
+    # 1.03 -> 1.01. target_encoder is HSDP-wrapped, so forward's first
+    # all-gather absorbs all upstream dataload skew and bills it to forward.
+    # Conversely a phase that grows in BOTH is a real per-rank cost: backward
+    # 1.23 -> 2.38 s median-over-ranks is the HSDP replicate-dim collective, and
+    # every rank pays it. Only that second pattern justifies a comms conclusion.
+    phm = {}
+    for name, col in PHASES:
+        vv = []
+        for k in keys:
+            vals_c = [x for x in per[k].get(col, []) if x >= 0]
+            if vals_c:
+                vv.append(st.median(vals_c) / 1000.0)
+        phm[name] = st.median(vv) if vv else 0.0
+    s["phases_med"] = phm
     # Unaccounted = iter time minus the sum of phases. Large values mean the
     # instrumentation is not covering the step (or that phase maxima come from
     # different ranks, which inflates the sum instead) -- either way it is the
@@ -295,7 +327,7 @@ def main():
         print(f"ladder: {a.ladder}   clips/rank/step={a.clips_per_rank}")
     print()
     hdr = (f"{'run':26s} {'ranks':>5s} {'csv':>5s} {'n':>3s} {'med s':>7s} "
-           f"{'IQR s':>13s} {'clips/s':>8s} {'/tile':>7s} {'trend':>6s}")
+           f"{'mean s':>7s} {'IQR s':>13s} {'clips/s':>8s} {'/tile':>7s} {'trend':>6s}")
     print(hdr)
     print("-" * len(hdr))
     out = []
@@ -318,9 +350,16 @@ def main():
             continue
         print(
             f"{label:26s} {ranks:5d} {nfiles:5d} {s['n']:3d} {s['med']:7.2f} "
-            f"{s['lo']:6.1f}-{s['hi']:6.1f} {s['thru']:8.1f} {s['per_tile']:7.4f} "
-            f"{s['trend']:6.2f}"
+            f"{s['mean']:7.2f} {s['lo']:6.1f}-{s['hi']:6.1f} {s['thru']:8.1f} "
+            f"{s['per_tile']:7.4f} {s['trend']:6.2f}"
         )
+        # A mean well above the median means a few iterations carry the cost --
+        # the bimodal dataload stall. Efficiency computed from med is then an
+        # OVERSTATEMENT of what the run will actually deliver in wall-clock.
+        if s["mean"] > 1.10 * s["med"]:
+            print(f"{'':26s}   ** mean {s['mean']:.2f} s exceeds median {s['med']:.2f} s by "
+                  f"{100 * (s['mean'] / s['med'] - 1):.0f}% -- stall-dominated; quote the "
+                  f"MEAN for wall-clock/efficiency **")
         if s["n"] < MIN_ITERS:
             print(f"{'':26s}   ** only {s['n']} fully-covered iter(s) in the window "
                   f"(< {MIN_ITERS}); this is not a median. Widen --lo/--hi or accept "
@@ -355,16 +394,36 @@ def main():
     print("  unacct = iter - sum(phases); phase maxima can come from different ranks, so a")
     print("           negative residual is possible and means exactly that.")
 
+    # ---- the same phases reduced by MEDIAN over ranks
+    print()
+    print("phase breakdown (s, median over window of the per-iteration MEDIAN over ranks)")
+    print(f"{'run':26s} " + " ".join(f"{n:>9s}" for n in names))
+    for label, ranks, s in out:
+        cells = " ".join(f"{s['phases_med'][n]:9.2f}" for n in names)
+        print(f"{label:26s} {cells}")
+    print("  THIS is the table to read for a per-rank cost claim. Growth here means every")
+    print("  rank got slower (real work: e.g. the HSDP replicate-dim all-reduce in backward).")
+    print("  Growth ONLY in the max table above means no rank slowed and skew merely ARRIVED")
+    print("  in that phase -- forward's first FSDP all-gather absorbs upstream dataload skew,")
+    print("  which is how the '64n forward blowup' read as real for months. Check both before")
+    print("  naming a cause.")
+
     # ---- efficiency ladder, always against the SMALLEST rung actually measured
     if a.ladder:
         print()
         base = min(out, key=lambda o: o[1])
         print(f"per-tile efficiency vs {base[0]} ({base[1]} ranks = 100%)")
-        print(f"{'run':26s} {'ranks':>5s} {'x ranks':>8s} {'per-tile':>9s} {'eff':>6s} {'aggregate':>10s}")
+        print(f"{'run':26s} {'ranks':>5s} {'x ranks':>8s} {'per-tile':>9s} {'eff':>6s} "
+              f"{'eff(mean)':>9s} {'aggregate':>10s}")
         for label, ranks, s in out:
             eff = s["per_tile"] / base[2]["per_tile"]
+            # Efficiency from the MEAN as well. Same reason as the mean column
+            # above: with a bimodal stall the median-based figure is the one that
+            # looks good and the mean-based one is the one that comes true. When
+            # they differ, judge the >80% bar on eff(mean).
+            eff_mean = base[2]["mean"] / s["mean"]
             print(f"{label:26s} {ranks:5d} {ranks / base[1]:8.0f}x {s['per_tile']:9.4f} "
-                  f"{eff * 100:5.0f}% {s['thru'] / base[2]['thru']:9.2f}x")
+                  f"{eff * 100:5.0f}% {eff_mean * 100:8.0f}% {s['thru'] / base[2]['thru']:9.2f}x")
         print("  A rung flagged above (partial coverage / still warming) is NOT a valid")
         print("  reference; re-run it rather than quoting an efficiency against it.")
         return
