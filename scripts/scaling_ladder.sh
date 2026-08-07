@@ -311,8 +311,22 @@ run_rung () {
     local cfg="$CFG_NAME"
     local rest="${spec#*:}" fld
     if [ "$rest" != "$spec" ]; then
-        local IFS=:
-        for fld in $rest; do
+        # Split on ':' by SUBSTITUTION, not by setting IFS.
+        #
+        # `local IFS=:` here is scoped to the whole FUNCTION, not to this if-block
+        # -- and it silently corrupted the ipe-override loop 60 lines below, which
+        # iterates `for ov in $LADDER_IPE_OVERRIDES` over entries like "1:nw2=40".
+        # With IFS still ':' that entry splits into "1" and "nw2=40", so its key
+        # never matches the spec and the override is DROPPED. Job 8741170's 1n
+        # re-anchor rung was budgeted at ipe=40 and silently ran at 30. It fails
+        # only for specs containing a colon, i.e. exactly the rungs that carry a
+        # per-rung field, and it fails quietly -- the banner prints the wrong ipe
+        # as though it were intended.
+        local _saved_ifs=$IFS
+        IFS=:
+        set -- $rest
+        IFS=$_saved_ifs
+        for fld in "$@"; do
             case "$fld" in
                 nw*)    nw="${fld#nw}" ;;
                 probe*) probe="${fld#probe}" ;;
