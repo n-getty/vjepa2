@@ -1733,7 +1733,8 @@ transferred. `n64_nw2` completed rc=0, 30 rows, **768/768 rank CSVs, no
 Measures per-tile efficiency across node counts in **one allocation**, so every
 rung shares a fabric hour, and separates straggler wait from compute.
 
-- Rungs are `<nodes>[:nw<N>][:probe<0|1>][:prof<0|1>][:cfg<NAME>][:omp<N>]`, fields in any
+- Rungs are `<nodes>[:nw<N>][:pf<N>][:node<K>][:probe<0|1>][:prof<0|1>][:cfg<NAME>][:omp<N>][:store<S>][:cap<N>]`,
+  fields in any
   order, run serially, each in its own sub-world: private nodefile + explicit
   `WORLD_SIZE` + offset `MASTER_PORT`. `WORLD_SIZE` takes precedence over PMI
   `SIZE` (`src/utils/distributed.py:146-158`) and `hsdp.py` derives
@@ -1773,6 +1774,39 @@ rung shares a fabric hour, and separates straggler wait from compute.
   Bracketed A/B/B/A so the anchor's own repeat spread is measured in the same
   allocation — read with `scripts/tail_arm_compare.py`, which refuses to rank
   arms whose delta is inside that spread.
+- **`:pf<N>` sets `VJEPA_PREFETCH_FACTOR`, the DataLoader prefetch queue depth**
+  (default 2, `src/datasets/webdataset.py:993`). It exists because the tail
+  analysis below concludes that "a stall deeper than the prefetch queue stalls
+  the step no matter who is reading" — and queue depth had never been varied, so
+  that sentence was an assumption, not a measurement. `:pf<N>` at `nw0` is
+  **rejected, not dropped**: `DataLoader` takes no `prefetch_factor` without
+  workers, so a `1:nw0:pf4` rung would run unprefetched inside a dir named
+  `_pf4` and read later as a null for the lever. The ladder's default is
+  exported once after the env source and pinned by
+  `tests/test_ladder_rung_spec.py` against the loader's own literal, so the two
+  cannot drift and mis-tag every rung. **Cost to watch:** queue depth is memory
+  (`nw × pf × bs` decoded clips resident per node) on a node whose `/tmp` is
+  RAM — check `host-avail-mib` (col 17) on any `pf` arm, and if it floors, the
+  arm is confounded with the staged-path degradation in job 8741855.
+  ```
+  qsub -q debug -l select=2 \
+    -v VJEPA_LADDER_RUNGS="2:nw2 2:nw2:pf8 2:nw2:pf8 2:nw2",VJEPA_LADDER_IPE=80 \
+    scripts/scaling_ladder.sh
+  ```
+  Judge it on **total wall and on p99 / rate>T, not on the median** — the median
+  prices the tail at zero by construction.
+- **`:node<K>` starts the rung at node index `K` of the allocation** instead of
+  always at the head. Without it every rung sliced `sed -n "1,${R}p"`, so two 1n
+  rungs in one allocation were *necessarily the same node* and "is this effect
+  node-local?" was a question the launcher could not express — the only
+  cross-node evidence came from separate allocations, where node is confounded
+  with fabric-hour and run length. `1:node0 1:node1` in one job holds both
+  fixed and varies only the node. A window running off the end of the allocation
+  **SKIPs rather than clamping**: falling back to the head would rerun node 0
+  under a name promising node 1, which reads as a clean refutation of
+  node-locality while having measured nothing of the kind. The banner echoes the
+  rung's physical hostnames, because which node an index maps to is PBS's choice
+  and a cross-node claim that cannot name its two hosts is not checkable later.
 - **Rung ordering is a budget decision, not cosmetic.** Put the cheap
   irreplaceable rung first, the hazard arm next, its control after, and anything
   optional last. A hang burns `FIRST_ITER_DEADLINE` (900 s) of a 60 min cap, so
