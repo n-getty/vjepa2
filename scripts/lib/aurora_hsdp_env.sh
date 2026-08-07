@@ -119,7 +119,19 @@ export WDS_LOCAL_SLICING=${WDS_LOCAL_SLICING:-0}
 #      107-byte cap; the default PBS TMPDIR is 141 chars and overflows it.
 #   2. The loader-destructor exit fix (281b3fe) + persistent_workers.
 # The xccl-fork deadlock is O(ranks) and was the last open risk; n64_nw2 cleared
-# it at 768 ranks with no `terminate called`.
+# it at 768 ranks -- every rank ran to completion and wrote a full CSV.
+#
+# It does NOT exit silently, and an earlier version of this comment wrongly said
+# it did. Job 8741170's n64_nw2 threw `terminate called ... std::system_error /
+# No such file or directory` on 756 of 768 ranks (1/12 at 1n). That is the same
+# AF_UNIX-path-length signature TMPDIR=/tmp was meant to close: the fix closed
+# the *listener* socket path (the HANG, which delivered zero batches and
+# destroyed runs), but some over-length path survives at teardown.
+# It is benign -- all 768 ranks wrote their full 30 rows and the rung exited
+# rc=0, so it happens after the checkpoint save. Do not let it mask a real
+# failure: judge a rung by rc + row count + rank-CSV coverage, never by the
+# presence of this string. (And grep ALL rank.*.err, not rank 0 -- rank 0 was
+# one of the 12 clean ranks, which is how the wrong claim got recorded.)
 export VJEPA_NUM_WORKERS=${VJEPA_NUM_WORKERS:-2}
 # Declared rather than inherited: it is a -3 GB memory lever (not a speed lever)
 # and the code default is already 1, so an outer env setting 0 would silently
