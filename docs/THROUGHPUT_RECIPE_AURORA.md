@@ -203,9 +203,46 @@ cache would otherwise be free to use. Three consequences:
   changes the working set *and* the memory available to cache it, in opposite
   directions. Read such an arm as "does read locality remove the tail", not as
   "is the tail page-cache pressure".
-- It also means host memory is a plausible home for the accumulating state
-  behind the within-run dataload rise, and it is the one resource not in the
-  per-iteration CSV.
+- It also made host memory a plausible home for the accumulating state behind
+  the within-run dataload rise — the one resource not in the per-iteration CSV.
+  **That has now been measured and refuted; see below.**
+
+### Host memory is not the dataload accumulator (job 8741769)
+
+Columns 17/18 (`host-avail-mib`, `rss-mib`) were added to close this. One node,
+12 tiles, nw=2, `vitG384_lbA`, **350 iterations, 12/12 rank CSVs**:
+
+| itr | MemAvail | max-over-ranks dataload | iter mean |
+|---|---|---|---|
+| 0-41 | 678 GiB | 5.35 s | 8.59 s |
+| 42-83 | 356 GiB | 1.40 s | 4.40 s |
+| 84-125 | 277 GiB | **0.00 s** | 3.14 s |
+| 168-209 | 223 GiB | 0.00 s | 3.54 s |
+| 334-349 | 173 GiB | 0.00 s | 3.52 s |
+
+Memory fills as the tail **disappears**, which is a cache reaching its working
+set rather than pressure. It also decelerates to a plateau (14051 → 9382 → 4103
+→ 794 MiB/iter, then 100-960) instead of leaking to zero — a linear projection
+from the early slope ("exhausted by iteration 101") was void. The 12 ranks' total
+RSS is 57 → 52 GiB and *falling*, so 690 GiB of the drop is unattributed;
+`l0-free-mib` is flat at 11101, so it is not device memory. Direct
+`/proc/meminfo` Shmem attribution was never obtained.
+
+⚠️ **Read this at 80% of the run and it says the opposite.** At iteration 283 the
+episode rate vs MemAvail gave rho = **-0.762** — the memory-pressure result the
+job was sent to find. Over the full run it is **-0.160**. The episode rate is
+non-monotone (0.00 → 0.36 → 0.00) and MemAvail is monotone *by construction*, so
+any mid-run bulge fits it over a truncated prefix. Never correlate against a
+monotone counter on a partial run. `scripts/fwdc_episode_scan.py` prints the
+whole-run and prefix rho side by side and warns when they disagree.
+
+**The floor is not the problem — the episodes are.** p10 of max-over-ranks iter
+is **2.98 s in every 25-iteration bin from 84 to 349**; it never degrades. The
+mean is 3.74 s, and the whole 0.76 s gap is 38 episodic iterations = **20.3% of
+post-warmup wall**. Those episodes are a *different* cost from the dataload tail:
+dataload is 0.00 s on every one, `fwd-context` goes x2.79, and the across-rank
+spread *narrows* (1.026 vs 1.057), so nothing is waiting on a laggard. One run
+only — see `scripts/fwdc_episode_scan.py` for the caveats and the 16n contrast.
 
 ## Tested and found NOT to matter (do not re-run)
 
