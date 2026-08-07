@@ -41,6 +41,24 @@ already issuing big reads and there is nothing here -- the mechanism is dead and
 the tail's owner is still open. That is a real possible outcome and this probe
 is written to report it plainly rather than to confirm the hypothesis.
 
+RESULT (2026-08-07): REFUTED as a lever, though the curve is real.
+  * Job 8741245 measured 36-44x on DAOS between a 4 KB and a 1 MB buffer, and a
+    FLAT curve on Lustre. Read granularity genuinely is a first-order cost on
+    the DAOS client and not on Lustre.
+  * But `buffering=-1` resolves to st_blksize EXACTLY -- verified directly on
+    Lustre by reading one byte through gopen and checking f.raw.tell(): unset
+    gives 4194304 against an st_blksize of 4194304, and GOPEN_BUFFER=1048576
+    gives 1048576. DAOS reports st_blksize = 2 MB.
+  * So training already runs at 2 MB, on the flat fast end of the curve (1 MB
+    and 4 MB were within 5% of each other). The 42x was the gap between a
+    setting nothing uses and the one already in force. GOPEN_BUFFER can only
+    make this WORSE; there is no win here to collect.
+  * The tail's owner remains unidentified. What this does establish is a
+    fragility worth knowing: anything that shrinks the effective buffer -- a
+    different mount reporting a small st_blksize, an explicit GOPEN_BUFFER, a
+    library re-opening the shard itself -- would cost ~40x on DAOS silently.
+    That is why train.py logs the resolved value.
+
 READ THE OUTPUT AS:
   * st_blksize on the DAOS mount is the whole ballgame. Large => refuted.
   * The GOPEN_BUFFER sweep is the intervention. A flat curve means buffer size
@@ -128,7 +146,13 @@ def _time_tar(path, bufsize, count_reads=False, limit=None):
     raw = _CountingRaw(path) if count_reads else None
     t0 = time.time()
     if raw is not None:
-        fobj = io.BufferedReader(raw, buffer_size=bufsize)
+        # BufferedReader rejects -1, and a hand-rolled RawIOBase has no
+        # st_blksize for it to fall back on, so resolve -1 the same way
+        # open(buffering=-1) does: to the file's st_blksize. Without this the
+        # read-count column would either crash on the -1 row or silently report
+        # DEFAULT_BUFFER_SIZE (8192) as though it were the default.
+        rb = os.stat(path).st_blksize if bufsize < 0 else bufsize
+        fobj = io.BufferedReader(raw, buffer_size=rb)
     else:
         # The real path: gopen's open(url, "rb", buffering=bufsize).
         fobj = open(path, "rb", buffering=bufsize)
@@ -168,6 +192,8 @@ def main():
     # was really the gap between a setting nobody uses and the one already in
     # force. Without the -1 row the sweep cannot distinguish "big lever" from
     # "already at the top of the curve", which are opposite conclusions.
+    # NOTE: pass this as --bufsizes=-1,4096,... with an '=' if the list starts
+    # with -1; argparse reads a bare leading "-1" as an option, not a value.
     ap.add_argument("--bufsizes", default="-1,4096,65536,1048576,4194304")
     ap.add_argument("--repeats", type=int, default=3,
                     help="trials per bufsize, each on its own cold shard")
@@ -209,6 +235,40 @@ def main():
         print("       column alone cannot answer this question; not reporting.")
         return 2
 
+    # --- Part 0: what does the REAL loader get? ----------------------------
+    # Every other part of this probe calls open() itself, which only proves what
+    # open() does. This part calls webdataset's own gopen on a real shard and
+    # asks the returned object its buffer size -- the only reading here that is
+    # evidence about the live training path rather than about a reconstruction
+    # of it. If this disagrees with Part 1's st_blksize, then something between
+    # gopen and the filesystem is re-buffering and the whole sweep is being read
+    # against the wrong baseline.
+    print("--- what webdataset's gopen actually returns on a real shard ---")
+    try:
+        # `import webdataset.gopen as wg` binds the FUNCTION gopen, not the
+        # module -- the package re-exports it over its own name. importlib is
+        # the way to reach the module.
+        import importlib
+        wg = importlib.import_module("webdataset.gopen")
+        for label, paths in targets:
+            f = wg.gopen(paths[0], "rb")
+            # BufferedReader does not expose its buffer size as an attribute.
+            # Read one byte to force exactly one refill, then ask the underlying
+            # fd how far it advanced: that IS the buffer size, measured rather
+            # than inferred. (Wrapping a custom RawIOBase to observe readinto
+            # sizes does NOT work -- a hand-rolled raw object has no st_blksize,
+            # so BufferedReader falls back to DEFAULT_BUFFER_SIZE=8192 and the
+            # probe reports 8 KiB no matter what the real open() would do.)
+            f.read(1)
+            n = f.raw.tell()
+            print(f"{label:>8} gopen -> {type(f).__name__}  effective buffer = "
+                  f"{n} B ({n/1024:.0f} KiB)")
+            f.close()
+    except Exception as e:  # never let introspection kill the measurement
+        print(f"  (introspection failed: {type(e).__name__}: {e})")
+    print(f"  GOPEN_BUFFER in env = {os.environ.get('GOPEN_BUFFER', '<unset>')}")
+    print()
+
     # --- Part 1: what does buffering=-1 actually pick? ---------------------
     print("--- st_blksize (what Python's default buffering=-1 resolves to) ---")
     print(f"{'path':>8} {'st_blksize':>12} {'size MB':>10}   verdict")
@@ -240,8 +300,13 @@ def main():
     # --- Part 3: the intervention, on the real gopen path ------------------
     print("--- wall time through the REAL gopen path: open(buffering=N) ---")
     print("(this is what GOPEN_BUFFER=N would do in training; COLD, distinct shards)")
+    # Ratio is against the FIRST row, which is -1 = the default = what training
+    # runs. That is the only baseline that answers "is there a win here"; an
+    # earlier version labelled this "vs 4096" and so reported every row relative
+    # to a synthetic worst case nothing uses, which is how a 42x that was really
+    # "the default is already fast" got read as a lever.
     print(f"{'path':>8} {'bufsize':>10} {'median s':>10} {'trials':>7} "
-          f"{'members':>8} {'vs 4096':>9}")
+          f"{'members':>8} {'vs dflt':>9}")
     for label, paths in targets:
         nxt = 0
         base = None
@@ -263,12 +328,16 @@ def main():
     print("spread across repeats rivals the effect, the effect is not there.")
     print()
     print("=" * 74)
-    print("HOW TO JUDGE")
-    print("  Speedup >=1.5x at 1 MB vs 4 KB on DAOS  -> GOPEN_BUFFER is a real")
-    print("     lever; next step is a paired live ladder rung, not a rollout.")
-    print("  Flat curve on DAOS                      -> REFUTED. dfuse is doing")
-    print("     its own readahead; the tail's owner remains unidentified and")
-    print("     this mechanism should be written off explicitly.")
+    print("HOW TO JUDGE  -- read the 'vs dflt' column, NOT the spread of the sweep.")
+    print("  The sweep's spread only says whether read granularity matters on")
+    print("  this filesystem at all. Whether there is a WIN depends entirely on")
+    print("  where the -1 row sits, because -1 is what training runs.")
+    print("  Some row beats -1 by >=1.5x  -> GOPEN_BUFFER is a real lever; next")
+    print("     step is a paired live ladder rung, not a rollout.")
+    print("  -1 is already the fastest   -> REFUTED as a lever (measured on DAOS")
+    print("     2026-08-07: st_blksize is 2 MB, and 1 MB/4 MB are within 5%, so")
+    print("     the default already sits on the flat fast end). The 4 KB arm is")
+    print("     a synthetic worst case. The tail's owner remains unidentified.")
     print("  Effect on Lustre but not DAOS (or both) -> it is the Python read")
     print("     path, not the DAOS client. Note it, but it does not explain a")
     print("     tail that only appears when reading through DAOS.")
