@@ -237,18 +237,37 @@ def main():
     a_ex = st.mean([x["excess"] for x in anchor])
     a_it = st.mean([x["iter_mean"] for x in anchor])
     a_nm = base_name(anchor[0]["name"])
+    # The anchor's own spread is this study's noise floor. A delta smaller than
+    # it is not a small effect -- it is an unmeasured one, and the sign of such
+    # a delta is not even reliable. Gating on the spread being "tight enough"
+    # is NOT sufficient: a 1.09x anchor passes any reasonable gate and still
+    # swamps a 5% effect. The comparison that decides is delta vs spread.
+    ex_all = [x["excess"] for x in anchor]
+    it_all = [x["iter_mean"] for x in anchor]
+    ex_floor = (max(ex_all) - min(ex_all)) / a_ex * 100 if a_ex else float("inf")
+    it_floor = (max(it_all) - min(it_all)) / a_it * 100 if a_it else float("inf")
     print(f"baseline = {a_nm} (mean of {len(anchor)}): "
           f"excess {a_ex:.3f} s/iter, iter_mean {a_it:.2f} s")
+    print(f"NOISE FLOOR from the anchor's own repeats: "
+          f"tail +/-{ex_floor:.1f}%, wall +/-{it_floor:.1f}%")
+    print("  (with 2 repeats this is a range, not a std -- it UNDERSTATES the")
+    print("   floor, so a delta near it is even weaker than it looks.)")
+    print()
     for s in arms:
         if base_name(s["name"]) == a_nm:
             continue
         de = (s["excess"] - a_ex) / a_ex * 100 if a_ex else float("nan")
         di = (s["iter_mean"] - a_it) / a_it * 100 if a_it else float("nan")
-        print(f"  {s['name']:<32} tail {de:+6.1f}%   wall {di:+6.1f}%")
+        vt = "MEASURED" if abs(de) > ex_floor else "below floor"
+        vw = "MEASURED" if abs(di) > it_floor else "below floor"
+        print(f"  {s['name']:<32} tail {de:+6.1f}% ({vt:11s}) "
+              f"wall {di:+6.1f}% ({vw})")
     print()
     print("Read tail and wall together. A knob that cuts the tail without")
     print("cutting wall time moved a column, not the cost -- and one that cuts")
-    print("wall time without the tail did it some other way.")
+    print("wall time without the tail did it some other way. And a delta marked")
+    print("'below floor' supports NO claim, in either direction: report it as a")
+    print("null with the floor attached, never as a small win.")
 
 
 if __name__ == "__main__":
