@@ -1627,12 +1627,34 @@ sits underneath. Quote both; "min stays at the floor" is true per-iteration and
 false per-quarter.
 
 **Onset is not a fixed iteration:** itr 26 at 16n (357 s in-loop), itr 17 at 64n
-(271 s). And the ordering is suggestive — the 16n rung *ended* degraded at 7.43 s
-and the 64n rung, more nodes on the same allocation minutes later, *started* clean
-at 1.93 s. A persistent machine- or fabric-wide slowdown cannot do that; something
-cleared by process restart / CCL-context re-creation can. **Not yet controlled** —
-node count and restart changed together. Job 8741490 (`16:nw2 16:nw2`, ipe=60)
-runs two identical 16n rungs back to back to separate them.
+(271 s).
+
+### It does not reproduce — the drift is allocation-specific (job 8741490)
+
+The follow-up ran `16:nw2` twice at ipe=60, same config, same node count, *longer*
+than the rung that degraded. Backward held **1.65–1.95 s across all 60
+iterations** — no degradation whatever, where 8741386's 16n rung was at 7.43 s by
+itr 40-49. The two jobs drew **disjoint node sets** (8741386 on x4201/x4202,
+8741490 on x4116).
+
+So the numbers above are **one allocation's behaviour, not a law of the run.**
+Consequences for how to read all of this:
+
+- **The "after a few minutes" onset timing does not generalize.** It described
+  two rungs in one job.
+- **"Restart clears it" is withdrawn.** The 64n rung starting clean after the 16n
+  rung ended degraded is equally consistent with the degradation having simply
+  stopped on its own. Both readings survive; neither is established.
+- **Not one sick node.** Inside the degraded rung, all 16 nodes slowed together —
+  per-node median backward at itr>=40 spans 4.61–7.96 s with no outlier. A single
+  straggler dragging the collective would show one node far out.
+- **What this means practically:** a run can hit a regime where the inter-node
+  all-reduce costs 4-6x its clean-phase value, lasting at least tens of
+  iterations, and another allocation running the identical job never sees it. Any
+  A/B that puts its two arms in different jobs can be swamped by this
+  (`ccl_knob_sweep.sh` already runs arms in one allocation for exactly this class
+  of reason). Treat a single-allocation throughput number as a draw from a
+  distribution, not a measurement of the config.
 
 **What survives of the original framing:** clean-phase cost is 1.24 / ~1.7 /
 ~1.9 s at 1 / 16 / 64 nodes. The 16→64 increment is *small*, which is what a
@@ -1641,9 +1663,11 @@ saturating bandwidth term predicts. The large numbers are drift, not node count.
 **Consequences.** Short shakeout rungs spend most of their iterations in the clean
 phase, so they *understate* what a long production run pays — the opposite of the
 usual warmup bias, and a reason not to extrapolate a 30-50 iteration rung to a
-multi-hour epoch. Cause is UNKNOWN; reset-on-restart narrows it to something with
-process/CCL-context lifetime (oneCCL or Level-Zero resource accumulation across
-collectives is the natural family), but no column here identifies which, so do not
-label it. `[[vitG-2b-allreduce-spikes]]`'s 9 s → 150 s 16n spike may be the same
+multi-hour epoch. Cause is UNKNOWN and nothing here narrows it: process/CCL-context
+lifetime (oneCCL or Level-Zero resource accumulation across successive collectives)
+was the natural family *while* reset-on-restart looked real, but with that
+withdrawn, an allocation-level or fabric-neighbour explanation fits the evidence
+equally well. No column identifies which, so do not label it
+([[no-lazy-cause-labels]]). `[[vitG-2b-allreduce-spikes]]`'s 9 s → 150 s 16n spike may be the same
 phenomenon at larger amplitude and makes `CCL_ZE_CACHE_OPEN_IPC_*` worth a paired
 arm — but that was a hypothesis, and the two have not been shown to be the same.
