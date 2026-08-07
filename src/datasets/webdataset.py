@@ -19,6 +19,8 @@ import torchvision
 import webdataset as wds
 from decord import VideoReader, cpu
 
+from src.datasets.shard_window import shards_for_node
+
 _GLOBAL_SEED = 0
 logger = getLogger()
 
@@ -107,6 +109,26 @@ _DECODE_PROFILE = os.environ.get("VJEPA_DECODE_PROFILE", "0") == "1"
 _DECODE_EVERY = int(os.environ.get("VJEPA_DECODE_PROFILE_EVERY", "200"))
 _DECODE_RANKS = int(os.environ.get("VJEPA_DECODE_PROFILE_RANKS", "12"))
 _decode_prof = {"n": 0, "last_exit": None, "by_src": {}}
+
+# VJEPA_SHARD_CAP: restrict each NODE to a capped window of every source's
+# shard list, computed by the same function the stager uses
+# (src/datasets/shard_window.py). 0 = off, and off is the only correct setting
+# for a training run -- a cap means the run sees a fixed subset of each source.
+#
+# It exists for exactly one experiment: the staged-vs-DAOS arm of the dataload
+# tail study. Staging the S/N window at small node counts is ~90 min of copying
+# (half the corpus per node at N=2), so the staged arm has to be capped; and a
+# capped staged arm vs an uncapped DAOS arm moves the storage path AND the
+# working-set size together. This knob supplies the missing control -- a DAOS
+# arm reading the IDENTICAL capped window -- so the three-arm comparison
+# daos-full / staged-capped / daos-capped separates the storage path from
+# page-cache reuse.
+#
+# Node identity comes from PALS_*; with WDS_LOCAL_SLICING the node's local
+# ranks then slice this window among themselves, exactly as they slice a staged
+# dir.
+_SHARD_CAP = int(os.environ.get("VJEPA_SHARD_CAP", "0"))
+_SHARD_CAP_MIN = int(os.environ.get("VJEPA_SHARD_CAP_MIN", "24"))
 
 
 def _is_profiling_worker():
@@ -198,6 +220,33 @@ def _is_rank0():
     rank = os.environ.get("RANK", os.environ.get("PMI_RANK",
            os.environ.get("PALS_RANKID", "0")))
     return str(rank) == "0"
+
+
+def _node_identity(rank, world_size):
+    """(node_rank, num_nodes) for the VJEPA_SHARD_CAP window.
+
+    Derived from the TORCH world (rank, world_size) and the local world size,
+    NOT from PALS_RANKID/PALS_LOCAL_SIZE directly. The distinction matters
+    inside scripts/scaling_ladder.sh: a rung runs a sub-world of the
+    allocation, so PALS reports the rung's own MPI world -- correct -- but the
+    trainer's rank is the authoritative one either way, and deriving from it
+    keeps this consistent with app/vjepa_2_1/hsdp.py, which computes
+    num_nodes = world_size // local_world_size for the mesh.
+
+    Falls back to (0, 1) -- one node holding the whole window -- whenever the
+    local world size is unknown or nonsensical. The cap then still applies, so
+    a misdetected topology gives a smaller-than-intended read set rather than
+    an exception mid-loader-construction.
+    """
+    try:
+        lws = int(os.environ.get(
+            "LOCAL_WORLD_SIZE", os.environ.get("PALS_LOCAL_SIZE",
+            os.environ.get("PMI_LOCAL_SIZE", "0"))))
+    except (TypeError, ValueError):
+        lws = 0
+    if rank is None or world_size is None or lws <= 0 or world_size < lws:
+        return 0, 1
+    return int(rank) // lws, max(1, int(world_size) // lws)
 
 
 def _record_kept_clip(source_name, clip_std):
@@ -707,7 +756,17 @@ def _make_stream(meta, dataset_dir, decoder, fpc, shuffle_buffer=1000,
     else:
         slice_rank, slice_ws = rank, world_size
 
-    urls = [os.path.join(dataset_dir, u) for u in meta["shard_urls"]]
+    shard_names = meta["shard_urls"]
+    _n_source = len(shard_names)
+    _capped_to = 0
+    if _SHARD_CAP > 0:
+        node_rank, num_nodes = _node_identity(rank, world_size)
+        idx = shards_for_node(_n_source, node_rank, num_nodes,
+                              min_shards=_SHARD_CAP_MIN, max_shards=_SHARD_CAP)
+        if idx:
+            shard_names = [shard_names[i] for i in idx]
+            _capped_to = len(shard_names)
+    urls = [os.path.join(dataset_dir, u) for u in shard_names]
     _n_total = len(urls)
     _sliced = False
     if slice_rank is not None and slice_ws is not None and slice_ws > 1:
@@ -724,8 +783,12 @@ def _make_stream(meta, dataset_dir, decoder, fpc, shuffle_buffer=1000,
     # all 16 sources fall below the threshold. Rank-0-gated (see _is_rank0) --
     # one line per source, not one per rank per source.
     if _is_rank0():
+        cap_note = (
+            f" cap={_SHARD_CAP}({_n_source}->{_capped_to} on this node)"
+            if _capped_to else ""
+        )
         logger.info(
-            f"[wds-slice] source={meta.get('name')} shards={_n_total} "
+            f"[wds-slice] source={meta.get('name')} shards={_n_total}{cap_note} "
             f"slice_rank={slice_rank} slice_ws={slice_ws} "
             f"sliced={_sliced} per_rank_urls={len(urls)}"
             + ("" if _sliced else "  <-- UNSLICED: every rank sees all shards")

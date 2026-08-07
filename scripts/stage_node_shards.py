@@ -32,6 +32,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import yaml
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from src.datasets.shard_window import shards_for_node  # noqa: E402
+
 
 def _node_rank():
     """Identify this node's index (0..num_nodes-1) when launched -ppn 1."""
@@ -78,48 +81,26 @@ def _shards_for_node_bynode(num_shards, node_rank, num_nodes,
                             min_shards=SHARDS_PER_NODE_MIN, max_shards=0):
     """Indices of shards this node holds, partitioned by NODE COUNT.
 
-    Each node takes a contiguous wraparound window of
-    ``max(ceil(S/N), min_shards)`` shards starting at ``floor(n*S/N)``.
+    Thin wrapper over ``src.datasets.shard_window.shards_for_node`` -- see that
+    module for the window definition and for why the same code has to serve
+    both the stager and the DAOS-side ``VJEPA_SHARD_CAP`` reader (a capped
+    staged arm and a capped DAOS arm are only comparable if they draw the
+    identical shard set).
 
-    Why this is correct, and why the global-world_size math was never needed:
-    every production launcher sets ``WDS_LOCAL_SLICING=1``, so
-    ``src/datasets/webdataset.py:_make_stream`` slices the URL list by LOCAL
-    rank/world (12) -- never by the 3072-rank global world. And
-    ``_load_or_build_metadata`` re-lists the node's local dir and overwrites
-    ``shard_urls`` with whatever is actually present, keeping ``sample_count``
-    from the copied metadata.json (so the ipe math is unaffected). The loader
-    therefore consumes whatever subset a node holds: the staging partition is a
-    free parameter, and the "source needs >= nodes*12 shards" threshold was an
-    artifact of this function rather than a property of the data path.
-
-    Windows are sized >= the S/N stride, so their union covers every shard.
-    Windows OVERLAP between nodes once ``min_shards`` binds (small sources) --
-    that is intended and harmless: distinct nodes holding the same shard still
-    draw different clips from it (``resampled=True`` + per-rank shuffle), and
-    cross-node sample overlap is already the norm for any source the mixer
-    revisits within an epoch.
-
-    ``max_shards`` (0 = unlimited) caps the window from ABOVE, and unlike the
-    floor it BREAKS full-corpus coverage on purpose. It exists for short
-    throughput arms, where the corpus is not the point: a 100-iteration arm at
-    24 ranks x bs=2 consumes 4800 clips total, but the S/N stride at small N is
-    enormous (at N=2 each node's window is HALF the corpus, ~2317 GiB, ~90 min
-    to stage at the measured 0.43 GB/s/node -- longer than the queue slot).
-    Capping makes a staged-vs-DAOS arm affordable at small N. Never use it for
-    a training run: the run would see only a fixed prefix of each source.
-
-    The cap keeps each node's window START, so different nodes still hold
-    different shards. Truncating to a common prefix instead would put every
-    node on the same shards and quietly change what a page-cache arm measures.
+    Why a node-count partition is correct here, and why the global-world_size
+    math was never needed: every production launcher sets
+    ``WDS_LOCAL_SLICING=1``, so ``src/datasets/webdataset.py:_make_stream``
+    slices the URL list by LOCAL rank/world (12) -- never by the 3072-rank
+    global world. And ``_load_or_build_metadata`` re-lists the node's local dir
+    and overwrites ``shard_urls`` with whatever is actually present, keeping
+    ``sample_count`` from the copied metadata.json (so the ipe math is
+    unaffected). The loader therefore consumes whatever subset a node holds:
+    the staging partition is a free parameter, and the "source needs >=
+    nodes*12 shards" threshold was an artifact of this function rather than a
+    property of the data path.
     """
-    if num_shards <= 0:
-        return []
-    stride = -(-num_shards // num_nodes)  # ceil(S/N)
-    take = min(max(stride, min_shards), num_shards)
-    if max_shards > 0:
-        take = min(take, max_shards)
-    start = (node_rank * num_shards) // num_nodes
-    return sorted({(start + k) % num_shards for k in range(take)})
+    return shards_for_node(num_shards, node_rank, num_nodes,
+                           min_shards=min_shards, max_shards=max_shards)
 
 
 def _copy_one(src, dst):
@@ -201,6 +182,12 @@ def main():
                    help="Floor on shards/node under --partition-mode nodes. "
                         "Should be >= local_world_size * dataloader workers so "
                         "every worker gets a distinct shard.")
+    p.add_argument("--src-root", default=None,
+                   help="Read sources from <src-root>/<basename> instead of "
+                        "the absolute paths in --params. Mirrors what "
+                        "app/main_dist_aurora.py --local_data_root does on the "
+                        "trainer side, so a DAOS-resident corpus can be staged "
+                        "without editing the config.")
     p.add_argument("--max-shards-per-node", type=int, default=0,
                    help="Cap on shards/node/source under --partition-mode "
                         "nodes (0 = unlimited). THROUGHPUT ARMS ONLY -- this "
@@ -222,6 +209,9 @@ def main():
     if not sources:
         print(f"[node {node_rank}] no datasets in params; nothing to do", flush=True)
         return
+    if args.src_root:
+        sources = [os.path.join(args.src_root, os.path.basename(s.rstrip("/")))
+                   for s in sources]
 
     os.makedirs(args.local_root, exist_ok=True)
 

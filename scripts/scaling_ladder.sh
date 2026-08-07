@@ -96,10 +96,47 @@
 # do not have overlapping IQRs, the ladder is measuring its own barrier and the
 # design needs revising before the L1-L3 debug-scaling slots are spent.
 #
-# A rung is <nodes>[:nw<N>][:probe<0|1>][:prof<0|1>][:cfg<NAME>][:omp<N>], fields
-# in any order. Unknown fields are rejected, not ignored -- a typo'd arm that
-# silently ran the default config would be indistinguishable from a real null
-# result.
+# L6 is the STAGED-vs-DAOS arm for the dataload tail, and it needs THREE arms,
+# not two, plus a closing anchor:
+#
+#   L6: qsub -q debug -l select=2 -v \
+#         VJEPA_LADDER_RUNGS="2:nw2 2:nw2:store staged:cap50 2:nw2:cap50 2:nw2" \
+#         scripts/scaling_ladder.sh
+#         (write the store field WITHOUT the space -- `store staged` above is a
+#          line-wrap artifact of this comment; the real spec is `2:nw2:storestaged:cap50`)
+#
+#   arm 1  daos-full      the production path, and the OPENING anchor
+#   arm 2  staged-capped  local tmpfs, so the DAOS agent and the NIC are bypassed
+#   arm 3  daos-capped    THE CONTROL. Same shard window as arm 2, over DAOS.
+#   arm 4  daos-full      the CLOSING anchor -- the noise floor
+#                         ([[wallclock-kill-deletes-the-closing-anchor]])
+#
+# Arm 3 is not optional. The staged arm must be capped (see the staging block in
+# run_rung for why the uncapped window is ~90 min of copying at N=2), so arms 1
+# and 2 differ in BOTH the storage path and the working-set size. A staged win
+# over arm 1 alone cannot separate "DAOS is slow" from "the working set now fits
+# in page cache". Arms 2-vs-3 isolate the path; arms 3-vs-1 isolate the window.
+#
+# CONFOUND TO REPORT EITHER WAY: a capped arm reads a fixed subset of every
+# source, so its sampling diversity is not the production one. Harmless for
+# s/iter (loss from this ladder is meaningless anyway) but it must be stated.
+#
+# A rung is
+# <nodes>[:nw<N>][:probe<0|1>][:prof<0|1>][:cfg<NAME>][:omp<N>][:store<daos|staged>][:cap<N>],
+# fields in any order. Unknown fields are rejected, not ignored -- a typo'd arm
+# that silently ran the default config would be indistinguishable from a real
+# null result.
+#
+# `:store<daos|staged>` picks the storage path. `staged` copies this rung's
+# shard window from DAOS to each node's /tmp before the rung and removes it
+# after (tmpfs is RAM; a leftover window is memory the next rung loses).
+#
+# `:cap<N>` caps the shards/source/node that a rung reads, via
+# src/datasets/shard_window.py -- the same function the stager uses, so a capped
+# DAOS rung and a staged rung of the same cap read an IDENTICAL shard set
+# (tests/datasets/test_shard_cap.py pins that agreement). Either field forces
+# WDS_LOCAL_SLICING=1, because both give each node a different subset.
+# NEVER use cap on a training run: it sees a fixed prefix of every source.
 #
 # `:omp<N>` sets OMP_NUM_THREADS and the mpiexec --depth together (see run_rung).
 # It exists for the CPU-oversubscription arm: the default 16 threads x 12 ranks
@@ -325,7 +362,7 @@ run_rung () {
     # forward's first FSDP all-gather), but if it is not, the ladder is measuring
     # the probe. Run `16 16:probe0` in one allocation and require overlapping IQRs.
     local R="${spec%%:*}" nw="$VJEPA_NUM_WORKERS" probe="$VJEPA_SCALE_PROBE" prof=0
-    local cfg="$CFG_NAME" omp="$LADDER_OMP_DEFAULT"
+    local cfg="$CFG_NAME" omp="$LADDER_OMP_DEFAULT" store=daos cap=0
     local rest="${spec#*:}" fld
     if [ "$rest" != "$spec" ]; then
         # Split on ':' by SUBSTITUTION, not by setting IFS.
@@ -350,6 +387,8 @@ run_rung () {
                 prof*)  prof="${fld#prof}" ;;
                 cfg*)   cfg="${fld#cfg}" ;;
                 omp*)   omp="${fld#omp}" ;;
+                store*) store="${fld#store}" ;;
+                cap*)   cap="${fld#cap}" ;;
                 *) echo "  rung $spec: unknown field '$fld'"; return 1 ;;
             esac
         done
@@ -366,6 +405,13 @@ run_rung () {
     # narrower span even harder. Tagged only when it departs from the default so
     # existing rung-dir names are unchanged.
     [ "$omp" = "$LADDER_OMP_DEFAULT" ] || name="${name}_omp${omp}"
+    # store/cap: the two fields of the staged-vs-DAOS arm. Both tag the dir so
+    # a capped arm can never be mistaken for a full-corpus one at analysis time
+    # -- a capped run reads a fixed subset of every source, so its loss and its
+    # sampling diversity are not comparable to an uncapped run's even though its
+    # s/iter is the number being compared.
+    [ "$store" = "daos" ] || name="${name}_${store}"
+    [ "$cap" = "0" ] || name="${name}_cap${cap}"
     # prof<0|1>: per-source decode/gap profiling (src/datasets/webdataset.py).
     # This exists because the tail has outgrown the explanation we had for it.
     # The sparse-keyframe finding reproduces the BODY of the per-rank dataload
@@ -448,7 +494,48 @@ yaml.safe_dump(c, open(p, "w"), sort_keys=False)
 PY
     [ $? -eq 0 ] || { echo "  rung $spec: config rewrite FAILED"; return 1; }
 
-    echo "===== RUNG $name : ${R}n x ${PPN} = ${W} ranks, ipe=$ipe, num_workers=$nw, scale_probe=$probe, cfg=$cfg, omp=$omp ====="
+    # store=staged: copy this rung's capped shard window from DAOS to each
+    # node's /tmp first, and point the trainer at /tmp. The window is computed
+    # by src/datasets/shard_window.py -- the SAME function the `cap` field feeds
+    # to the loader on a DAOS rung, which is what makes staged-capped and
+    # daos-capped read an identical shard set (tests/datasets/test_shard_cap.py).
+    #
+    # WITHOUT A CAP THIS IS UNAFFORDABLE at small node counts and the failure is
+    # counterintuitive: each node takes ceil(S/N) shards per source, so staging
+    # gets CHEAPER as N grows. Measured against vitG384_lbA, at N=2 node 0's
+    # take is 2317 GB of the 4634 GB corpus -- ~90 min at the observed
+    # 0.43 GB/s/node, longer than the whole debug slot. A short arm does not
+    # need the corpus (24 ranks x bs2 x 100 iters = 4800 clips), so cap it.
+    # Local slicing follows the WINDOW, not the storage path. Both a staged rung
+    # and a capped DAOS rung give each node a DIFFERENT subset of each source,
+    # so the URL list must be split among that node's 12 local ranks -- a global
+    # urls[rank::world_size] slice would hand rank 13 an index into node 1's
+    # window as though it were node 0's. Keeping this keyed on the window is
+    # also what makes staged-capped and daos-capped read identically: same
+    # shards, same per-rank split, only the path differs.
+    local slicing=$WDS_LOCAL_SLICING
+    { [ "$store" = "staged" ] || [ "$cap" != "0" ]; } && slicing=1
+
+    local data_root=$DAOS_MNT
+    if [ "$store" = "staged" ]; then
+        data_root=/tmp/ladder_stage/${TAG}_${name}
+        local t_stage=$(date +%s)
+        echo "  staging to $data_root (cap=$cap shards/source/node) ..."
+        # -ppn 1: one stager per node, each copying its own window in parallel.
+        # Failure is NOT fatal -- a partial stage would silently measure a
+        # different working set than intended, so bail on this rung only.
+        PBS_NODEFILE="$nf" mpiexec -n $R -ppn 1 --hostfile "$nf" \
+            --cpu-bind none --no-vni \
+            python $ROOT/scripts/stage_node_shards.py \
+                --params "$params" --local-root "$data_root" \
+                --src-root "$DAOS_MNT" \
+                --num-nodes $R --local-world-size $PPN --workers 16 \
+                --partition-mode nodes --max-shards-per-node "$cap" \
+            || { echo "  rung $name: STAGING FAILED, skipping rung"; return 0; }
+        echo "  staging done in $(( $(date +%s) - t_stage ))s"
+    fi
+
+    echo "===== RUNG $name : ${R}n x ${PPN} = ${W} ranks, ipe=$ipe, num_workers=$nw, scale_probe=$probe, cfg=$cfg, omp=$omp, store=$store, cap=$cap, local_slicing=$slicing ====="
     # Sets RUNG_WD_PID -- see the note on start_rung_watchdog for why this must
     # not be a command substitution. Verify it armed: a silently-dead watchdog is
     # exactly the failure that cost job 8739712 half its slot, and it is
@@ -474,14 +561,25 @@ PY
     VJEPA_DECODE_PROFILE=$prof \
     VJEPA_DECODE_PROFILE_EVERY=${VJEPA_DECODE_PROFILE_EVERY:-40} \
     VJEPA_DECODE_PROFILE_RANKS=${VJEPA_DECODE_PROFILE_RANKS:-12} \
+    VJEPA_SHARD_CAP=$cap \
+    WDS_LOCAL_SLICING=$slicing \
     OMP_NUM_THREADS=$omp \
     mpiexec -n $W -ppn $PPN --hostfile "$nf" --cpu-bind depth --depth $omp --no-vni \
         -o "$dir/rank.%r.out" -e "$dir/rank.%r.err" \
         python -m app.main_dist_aurora --train_mode \
             --fname "$params" --params_path "$params" \
-            --local_data_root "$DAOS_MNT"
+            --local_data_root "$data_root"
     local rc=$?
     kill "$wd_pid" 2>/dev/null
+    # Free the tmpfs immediately. /tmp is RAM here (504 GB of the node's DDR5),
+    # so a staged window left behind is memory the NEXT rung does not have --
+    # and the next rung may be the daos-capped control whose whole job is to
+    # read the same shards under comparable conditions.
+    if [ "$store" = "staged" ]; then
+        PBS_NODEFILE="$nf" mpiexec -n $R -ppn 1 --hostfile "$nf" \
+            --cpu-bind none --no-vni \
+            bash -c "rm -rf '$data_root'" >/dev/null 2>&1 || true
+    fi
     local rows=0
     [ -f "$dir/log_r0.csv" ] && rows=$(awk -F, '$2 ~ /^[0-9]+$/ {n++} END{print n+0}' "$dir/log_r0.csv")
     local csvs; csvs=$(ls "$dir"/log_r*.csv 2>/dev/null | wc -l)
