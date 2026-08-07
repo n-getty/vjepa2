@@ -1302,6 +1302,16 @@ Two further facts recorded as open, not explained:
    → 0.009 at 64n, with both the stall rate (0.0291 → 0.0178 → 0.0066) and the
    magnitude (8.51 → 3.17 → 1.34 s) falling. No order-statistic account predicts
    this.
+
+   ⚠️ **CONFOUNDED — do not cite as a clean node-count effect.** The runs in
+   this series straddle both thread-count families from the
+   `OMP_NUM_THREADS=208` trap above (8741594's 16n arms inherited 208;
+   8741663's 2n arm ran 16), and decode is CPU work, so threads is a live
+   alternative explanation for a dataload difference. Worse, neither run's
+   artifacts record the value — `THROUGHPUT KNOBS` only began echoing it in
+   `71e9f64`, added *because* this check could not be done after the fact.
+   Re-measure the node-count series within one thread setting before treating
+   the decline as real.
 2. **Prefetch masking does not explain (1), and is refuted.** Marginal
    r(compute, stall rate) = −0.683 across 15 nw2 runs reads like "a slower step
    hides more prefetch" — but r(ranks, compute) = +0.545, so it is confounded by
