@@ -36,7 +36,15 @@ EXPECTED_COLUMNS = [
     "l0-free-mib",
     "l0-ext-mib",
     "barrier-ms",
+    "host-avail-mib",
+    "rss-mib",
 ]
+
+# Columns 0..15 predate the scale probe and are read positionally by four
+# scripts. Everything from 16 on was APPENDED, so any CSV ever written parses
+# correctly as a prefix of this contract. Pin the frozen prefix separately from
+# the full list: the full list grows, this must not.
+FROZEN_PREFIX = EXPECTED_COLUMNS[:16]
 
 
 def _csv_logger_columns():
@@ -63,15 +71,34 @@ def test_csv_column_order_matches_contract():
     assert _csv_logger_columns() == EXPECTED_COLUMNS
 
 
-def test_barrier_ms_is_last():
-    """barrier-ms must stay APPENDED, never inserted.
+def test_new_columns_are_appended_never_inserted():
+    """Columns 0..15 are frozen; new columns go on the END.
 
-    Readers index into 0..15 positionally, so a 17th column at the end is
-    backward-compatible with every CSV written before 2026-08-06 while an
-    inserted one would corrupt them all.
+    Readers index into 0..15 positionally, so appending is backward-compatible
+    with every CSV ever written while an inserted column would corrupt them all
+    silently -- no exception, just a wrong number that looks plausible.
+
+    barrier-ms specifically must stay at 16: `scaling_efficiency.EVENT_COLS`
+    excludes it by index as a wall-clock column, and a shift would send it
+    through the 343-second unwrap.
     """
-    assert _csv_logger_columns()[-1] == "barrier-ms"
-    assert _csv_logger_columns()[:16] == EXPECTED_COLUMNS[:16]
+    cols = _csv_logger_columns()
+    assert cols[:16] == FROZEN_PREFIX
+    assert cols[16] == "barrier-ms"
+
+
+def test_host_memory_columns_present():
+    """host-avail-mib / rss-mib are the only view of HOST memory.
+
+    Aurora's /tmp is tmpfs, so staged shards, page cache and process RSS all
+    draw on one ~960 GiB pool -- and the within-run dataload rise resets at an
+    allocation boundary but not at an epoch boundary, i.e. it tracks
+    accumulating per-node state. l0-free-mib is DEVICE memory and is flat
+    across the same segments, so it cannot answer this.
+    """
+    cols = _csv_logger_columns()
+    assert cols.index("host-avail-mib") == 17
+    assert cols.index("rss-mib") == 18
 
 
 def test_scaling_efficiency_phase_indices_agree():
@@ -174,3 +201,7 @@ def test_only_event_columns_are_unwrapped():
     assert se.EVENT_COLS == {4, 6, 7, 8, 9, 10}
     for wall_col in (3, 5, 16):
         assert wall_col not in se.EVENT_COLS
+    # 17/18 are memory gauges in MiB, not durations at all. Unwrapping one
+    # would add 343,597 to a memory reading.
+    for mem_col in (17, 18):
+        assert mem_col not in se.EVENT_COLS

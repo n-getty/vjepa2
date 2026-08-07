@@ -87,6 +87,40 @@ torch.backends.cudnn.benchmark = True
 logger = get_logger(__name__, force=True)
 
 
+def _host_mem_mib():
+    """(MemAvailable, this process's RSS) in MiB, or (-1, -1) if unreadable.
+
+    Called once per iteration from log_stats. Two small /proc reads, both
+    served from kernel memory with no I/O, so the hot-path cost is a few
+    microseconds -- but it must never raise, hence the blanket excepts.
+
+    Why this is worth a column on Aurora specifically: /tmp is tmpfs, so
+    staged shards, the page cache and process RSS all draw on the same
+    ~960 GiB. MemAvailable is a NODE-wide number (every rank on a node logs
+    the same value), while RSS is per rank -- together they separate "this
+    loader is growing" from "the node is filling up".
+    """
+    avail = rss = -1.0
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    avail = float(line.split()[1]) / 1024.0  # kB -> MiB
+                    break
+    except Exception:
+        pass
+    try:
+        with open("/proc/self/statm") as f:
+            # field 1 is resident set size in pages
+            rss = float(f.read().split()[1]) * _PAGE_SIZE / 1024.0**2
+    except Exception:
+        pass
+    return avail, rss
+
+
+_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+
+
 def main(args, resume_preempt=False):
     _main_start_s = time.time()
     # ----------------------------------------------------------------------- #
@@ -561,6 +595,19 @@ def main(args, resume_preempt=False):
         # parts[3]/parts[5]), so a 17th column is backward-compatible and an
         # inserted one would silently corrupt them.
         ("%.1f", "barrier-ms"),
+        # Host-memory probe. The device probe above cannot see this, and on
+        # Aurora it is the resource most likely to be scarce: /tmp is TMPFS
+        # (504 GiB of the node's ~960 GiB), so staged shards, the page cache
+        # and process RSS all draw on one pool. The within-run dataload rise
+        # resets at an allocation boundary and not at an epoch boundary --
+        # i.e. it tracks accumulating per-node state -- and host memory was
+        # the one candidate with no column. Columns 17/18, appended.
+        #   host-avail-mib: MemAvailable, node-wide (all 12 ranks see the same
+        #     number; it is a NODE statistic that happens to be logged per rank)
+        #   rss-mib: this rank's own RSS, to separate "the loader is growing"
+        #     from "something else on the node is eating memory"
+        ("%.1f", "host-avail-mib"),
+        ("%.1f", "rss-mib"),
     )
 
     # -- init model
@@ -1580,6 +1627,8 @@ def main(args, resume_preempt=False):
                     except Exception:
                         pass  # NotImplementedError under pluggable allocator, etc.
 
+                host_avail_mib, rss_mib = _host_mem_mib()
+
                 csv_logger.log(
                     epoch + 1,
                     itr,
@@ -1598,6 +1647,8 @@ def main(args, resume_preempt=False):
                     l0_free_mib,
                     l0_ext_mib,
                     barrier_ms,
+                    host_avail_mib,
+                    rss_mib,
                 )
                 if (
                     (itr % log_freq == 0)

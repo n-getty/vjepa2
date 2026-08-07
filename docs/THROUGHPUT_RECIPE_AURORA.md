@@ -190,6 +190,23 @@ would run gb=6144 against gb=3072 constants — the assertion rejects it.
 Lustre's 2.71 GB/s at 192 ranks is *below* the ~3 GB/s a 256n run streams, so
 DAOS is not merely faster — Lustre could not have sustained the read load.
 
+**`/tmp` on Aurora is tmpfs — RAM, not disk.** `df -T` from a staging job:
+`tmpfs  tmpfs  504G  /tmp`, against a node's ~960 GB user-accessible DDR5+HBM.
+Aurora compute nodes have no local drive, so "staging to /tmp" is not a
+disk-vs-network comparison — it *buys* read locality with RAM that the page
+cache would otherwise be free to use. Three consequences:
+
+- The 66 TB a full-corpus staged job moves is 66 TB of **RAM**, and the
+  503 GB/node ceiling is why the `world` partition mode breaks past ~32 nodes.
+- Staged bytes and page-cached bytes compete for one resource. A staged-vs-DAOS
+  arm therefore does **not** cleanly isolate "page cache" as a tail owner — it
+  changes the working set *and* the memory available to cache it, in opposite
+  directions. Read such an arm as "does read locality remove the tail", not as
+  "is the tail page-cache pressure".
+- It also means host memory is a plausible home for the accumulating state
+  behind the within-run dataload rise, and it is the one resource not in the
+  per-iteration CSV.
+
 ## Tested and found NOT to matter (do not re-run)
 
 | knob | result | where |

@@ -75,7 +75,7 @@ def _shards_for_node(num_shards, node_rank, num_nodes, local_world_size):
 
 
 def _shards_for_node_bynode(num_shards, node_rank, num_nodes,
-                            min_shards=SHARDS_PER_NODE_MIN):
+                            min_shards=SHARDS_PER_NODE_MIN, max_shards=0):
     """Indices of shards this node holds, partitioned by NODE COUNT.
 
     Each node takes a contiguous wraparound window of
@@ -98,11 +98,26 @@ def _shards_for_node_bynode(num_shards, node_rank, num_nodes,
     draw different clips from it (``resampled=True`` + per-rank shuffle), and
     cross-node sample overlap is already the norm for any source the mixer
     revisits within an epoch.
+
+    ``max_shards`` (0 = unlimited) caps the window from ABOVE, and unlike the
+    floor it BREAKS full-corpus coverage on purpose. It exists for short
+    throughput arms, where the corpus is not the point: a 100-iteration arm at
+    24 ranks x bs=2 consumes 4800 clips total, but the S/N stride at small N is
+    enormous (at N=2 each node's window is HALF the corpus, ~2317 GiB, ~90 min
+    to stage at the measured 0.43 GB/s/node -- longer than the queue slot).
+    Capping makes a staged-vs-DAOS arm affordable at small N. Never use it for
+    a training run: the run would see only a fixed prefix of each source.
+
+    The cap keeps each node's window START, so different nodes still hold
+    different shards. Truncating to a common prefix instead would put every
+    node on the same shards and quietly change what a page-cache arm measures.
     """
     if num_shards <= 0:
         return []
     stride = -(-num_shards // num_nodes)  # ceil(S/N)
     take = min(max(stride, min_shards), num_shards)
+    if max_shards > 0:
+        take = min(take, max_shards)
     start = (node_rank * num_shards) // num_nodes
     return sorted({(start + k) % num_shards for k in range(take)})
 
@@ -117,22 +132,30 @@ def _copy_one(src, dst):
 
 
 def _choose_shards(num_shards, node_rank, num_nodes, local_world_size,
-                   partition_mode="world", min_shards=SHARDS_PER_NODE_MIN):
-    """Dispatch to the legacy or by-node partition."""
+                   partition_mode="world", min_shards=SHARDS_PER_NODE_MIN,
+                   max_shards=0):
+    """Dispatch to the legacy or by-node partition.
+
+    ``max_shards`` applies only to the by-node partition. The legacy mode is
+    left untouched by design: in-flight chains depend on it staging
+    byte-identical shard sets across resumes.
+    """
     if partition_mode == "nodes":
         return _shards_for_node_bynode(num_shards, node_rank, num_nodes,
-                                       min_shards=min_shards)
+                                       min_shards=min_shards,
+                                       max_shards=max_shards)
     return _shards_for_node(num_shards, node_rank, num_nodes, local_world_size)
 
 
 def stage_dataset(src_dir, dst_dir, node_rank, num_nodes, local_world_size,
                   num_workers=8, partition_mode="world",
-                  min_shards=SHARDS_PER_NODE_MIN):
+                  min_shards=SHARDS_PER_NODE_MIN, max_shards=0):
     """Stage this node's slice of src_dir into dst_dir. Returns counts."""
     os.makedirs(dst_dir, exist_ok=True)
     shards = sorted(f for f in os.listdir(src_dir) if f.endswith(".tar"))
     chosen_idx = _choose_shards(len(shards), node_rank, num_nodes,
-                                local_world_size, partition_mode, min_shards)
+                                local_world_size, partition_mode, min_shards,
+                                max_shards)
     chosen = [shards[i] for i in chosen_idx]
     if not chosen:
         return 0, 0
@@ -178,6 +201,13 @@ def main():
                    help="Floor on shards/node under --partition-mode nodes. "
                         "Should be >= local_world_size * dataloader workers so "
                         "every worker gets a distinct shard.")
+    p.add_argument("--max-shards-per-node", type=int, default=0,
+                   help="Cap on shards/node/source under --partition-mode "
+                        "nodes (0 = unlimited). THROUGHPUT ARMS ONLY -- this "
+                        "deliberately breaks full-corpus coverage so a short "
+                        "arm at small node count can be staged in minutes "
+                        "instead of the ~90 min the S/N stride would need. "
+                        "Never use it for a training run.")
     args = p.parse_args()
 
     node_rank = _node_rank()
@@ -208,7 +238,8 @@ def main():
             continue
         idx = _choose_shards(len(shards), node_rank, args.num_nodes,
                              args.local_world_size, args.partition_mode,
-                             args.min_shards_per_node)
+                             args.min_shards_per_node,
+                             args.max_shards_per_node)
         for i in idx:
             try:
                 need_bytes += os.path.getsize(os.path.join(src, shards[i]))
@@ -236,9 +267,12 @@ def main():
             hint = (
                 f"Under --partition-mode nodes each node takes "
                 f"max(ceil(S/{args.num_nodes}), {args.min_shards_per_node}) "
-                f"shards per source, so the floor dominates for small sources. "
-                f"Lower --min-shards-per-node (>= local_world_size * dataloader "
-                f"workers) or drop the largest sources."
+                f"shards per source, so at small node counts the ceil(S/N) "
+                f"STRIDE dominates (at N=2 that is half the corpus per node) "
+                f"and at large N the floor does. Lower --min-shards-per-node "
+                f"(>= local_world_size * dataloader workers), drop the largest "
+                f"sources, or -- for a short throughput arm only, never a "
+                f"training run -- cap coverage with --max-shards-per-node."
             )
         raise SystemExit(
             f"[node {node_rank}] ABORT: staging needs ~{need_gb:.1f} GiB but "
@@ -257,6 +291,7 @@ def main():
                 num_workers=args.workers,
                 partition_mode=args.partition_mode,
                 min_shards=args.min_shards_per_node,
+                max_shards=args.max_shards_per_node,
             )
         except FileNotFoundError as e:
             print(f"[node {node_rank}] SKIP {name}: {e}", flush=True)
