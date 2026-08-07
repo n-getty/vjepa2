@@ -130,7 +130,7 @@
 # s/iter (loss from this ladder is meaningless anyway) but it must be stated.
 #
 # A rung is
-# <nodes>[:nw<N>][:pf<N>][:probe<0|1>][:prof<0|1>][:cfg<NAME>][:omp<N>][:store<daos|staged>][:cap<N>],
+# <nodes>[:nw<N>][:pf<N>][:node<K>][:probe<0|1>][:prof<0|1>][:cfg<NAME>][:omp<N>][:store<daos|staged>][:cap<N>],
 # fields in any order. Unknown fields are rejected, not ignored -- a typo'd arm
 # that silently ran the default config would be indistinguishable from a real
 # null result.
@@ -158,6 +158,16 @@
 # workers) -- pf without nw>0 is rejected rather than silently dropped.
 # COST: queue depth is memory. Each worker holds pf batches of decoded clips, so
 # node RAM scales nw x pf x bs, on a node whose /tmp is already RAM.
+#
+# `:node<K>` starts the rung's private nodefile at allocation node K instead of
+# the head (default 0). Without it every rung takes the FIRST R nodes, so two 1n
+# rungs in one allocation always land on the same node and "is this effect
+# node-local?" is a question the launcher cannot ask. The only cross-node
+# evidence today comes from separate allocations, where node is confounded with
+# fabric-hour and run length. `1:node0 1:node1` in one job varies node alone.
+# A rung whose window runs off the end of the allocation is SKIPPED, never
+# clamped back to the head -- a node1 rung silently rerun on node 0 would be a
+# same-node repeat wearing a cross-node name.
 #
 # `:omp<N>` sets OMP_NUM_THREADS and the mpiexec --depth together (see run_rung).
 # It exists for the CPU-oversubscription arm: the default 16 threads x 12 ranks
@@ -393,7 +403,7 @@ run_rung () {
     # the probe. Run `16 16:probe0` in one allocation and require overlapping IQRs.
     local R="${spec%%:*}" nw="$VJEPA_NUM_WORKERS" probe="$VJEPA_SCALE_PROBE" prof=0
     local cfg="$CFG_NAME" omp="$LADDER_OMP_DEFAULT" store=daos cap=0
-    local pf="$LADDER_PF_DEFAULT"
+    local pf="$LADDER_PF_DEFAULT" node=0
     local rest="${spec#*:}" fld
     if [ "$rest" != "$spec" ]; then
         # Split on ':' by SUBSTITUTION, not by setting IFS.
@@ -415,6 +425,10 @@ run_rung () {
             case "$fld" in
                 nw*)    nw="${fld#nw}" ;;
                 pf*)    pf="${fld#pf}" ;;
+                # Must be matched before nothing in particular -- `node1` cannot
+                # collide with `nw*`, which needs a literal 'w' -- but keep it
+                # adjacent to pf so the two placement fields read together.
+                node*)  node="${fld#node}" ;;
                 probe*) probe="${fld#probe}" ;;
                 prof*)  prof="${fld#prof}" ;;
                 cfg*)   cfg="${fld#cfg}" ;;
@@ -451,6 +465,11 @@ run_rung () {
         fi
         name="${name}_pf${pf}"
     fi
+    # node<K>: which node of the allocation the rung starts on. Tagged whenever
+    # it is not the head, so `1:node0 1:node1` produces two distinct dirs rather
+    # than the _rep2 auto-suffix -- a cross-node pair must be legible as one at
+    # analysis time, not inferred from submission order after the fact.
+    [ "$node" = "0" ] || name="${name}_node${node}"
     # store/cap: the two fields of the staged-vs-DAOS arm. Both tag the dir so
     # a capped arm can never be mistaken for a full-corpus one at analysis time
     # -- a capped run reads a fixed subset of every source, so its loss and its
@@ -493,8 +512,17 @@ run_rung () {
         while [ -e "$OUTROOT/${_base}_rep${_rep}" ]; do _rep=$(( _rep + 1 )); done
         name="${_base}_rep${_rep}"
     fi
-    if [ "$R" -gt "$NNODES" ]; then
-        echo "SKIP rung $spec: needs $R nodes, allocation has $NNODES"; return 0
+    # --- END RUNG SPEC PARSING ---
+    # tests/test_ladder_rung_spec.py extracts everything above this marker and
+    # runs it against synthetic specs. Keep field parsing and dir naming above
+    # it; anything needing a real allocation goes below.
+
+    # Offset included: a `1:node5` rung in a 2-node allocation needs 6 nodes,
+    # not 1, and saying so here beats failing at the nodefile line with a
+    # message about line counts.
+    if [ $(( node + R )) -gt "$NNODES" ]; then
+        echo "SKIP rung $spec: needs $(( node + R )) nodes (offset $node + $R),"
+        echo "         allocation has $NNODES"; return 0
     fi
     local W=$(( R * PPN ))
     local dir="$OUTROOT/$name"
@@ -502,15 +530,31 @@ run_rung () {
     local params="$dir/params.yaml"
     mkdir -p "$dir"
 
-    # Private nodefile: the first R nodes of the allocation. Same pattern as
+    # Private nodefile: R nodes of the allocation starting at node index $node
+    # (default 0 = the head, the historical behaviour). Same pattern as
     # scaling/fanout_pbs.py:63-86. Paired with an explicit WORLD_SIZE, which
     # src/utils/distributed.py:146-158 gives PRECEDENCE over PMI's SIZE -- that
     # is what lets a sub-world of the allocation bootstrap correctly, and
     # app/vjepa_2_1/hsdp.py:52-93 then derives num_nodes = world_size /
     # local_world_size, so the (replicate, shard) mesh is right for the rung.
-    sort -u "$PBS_NODEFILE" | sed -n "1,${R}p" > "$nf"
+    #
+    # The offset exists because without it two 1n rungs in one allocation ALWAYS
+    # land on the same node, which makes "is this effect node-local?" a question
+    # the launcher cannot express. The only cross-node evidence available today
+    # comes from separate allocations, where node is confounded with fabric-hour
+    # and run length (the 16.5% 1n gap). `1:node0 1:node1` in one job holds both
+    # of those fixed and varies only the node.
+    local _lo=$(( node + 1 )) _hi=$(( node + R ))
+    sort -u "$PBS_NODEFILE" | sed -n "${_lo},${_hi}p" > "$nf"
     local got=$(wc -l < "$nf")
-    [ "$got" -eq "$R" ] || { echo "SKIP rung $spec: nodefile has $got of $R"; return 0; }
+    if [ "$got" -ne "$R" ]; then
+        # Do NOT silently fall back to the head of the allocation: a node1 rung
+        # that quietly ran on node 0 would be a same-node repeat wearing a
+        # cross-node name, i.e. a guaranteed null misread as a refutation.
+        echo "SKIP rung $spec: nodes ${node}..$(( node + R - 1 )) needs $(( node + R ))"
+        echo "         in the allocation, nodefile yielded $got of $R"
+        return 0
+    fi
 
     local ipe=$LADDER_IPE
     for ov in $LADDER_IPE_OVERRIDES; do
@@ -582,6 +626,10 @@ PY
     fi
 
     echo "===== RUNG $name : ${R}n x ${PPN} = ${W} ranks, ipe=$ipe, num_workers=$nw, prefetch=$pf, scale_probe=$probe, cfg=$cfg, omp=$omp, store=$store, cap=$cap, local_slicing=$slicing ====="
+    # Which physical nodes, by name. A cross-node pair is only interpretable if
+    # the pairing is on the record -- inferring it from the offset assumes the
+    # allocation's node order, which is PBS's to choose.
+    echo "  nodes: $(tr '\n' ' ' < "$nf")"
     # Sets RUNG_WD_PID -- see the note on start_rung_watchdog for why this must
     # not be a command substitution. Verify it armed: a silently-dead watchdog is
     # exactly the failure that cost job 8739712 half its slot, and it is

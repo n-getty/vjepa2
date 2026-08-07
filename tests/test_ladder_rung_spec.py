@@ -39,9 +39,13 @@ def _parse_fields(spec, nw_default="2", pf_default="2", omp_default="16"):
     """
     src = open(LADDER).read()
     start = src.index('local R="${spec%%:*}"')
-    # End at the nodefile setup, which is the first thing after naming that
-    # needs a real allocation.
-    end = src.index('if [ "$R" -gt "$NNODES" ]')
+    # End at the allocation-size guard, the first thing after naming that needs
+    # a real allocation. Anchored on the marker comment rather than the guard's
+    # own text: the guard's condition changed once already (it grew the node
+    # offset), and an anchor that moves with the code under test turns every
+    # test in this file into a ValueError instead of a failure that says what
+    # broke.
+    end = src.index("# --- END RUNG SPEC PARSING ---")
     block = src[start:end]
     # `local` is only legal inside a function.
     block = "parse () {\n local spec=$1\n" + block + '\n echo "NAME=$name PF=$pf NW=$nw"\n}\n'
@@ -102,6 +106,76 @@ def test_unknown_field_still_rejected():
     """The pf branch must not have widened the `pf*` glob into a catch-all."""
     rc, out = _parse_fields("2:nw2:pfx4:bogus9")
     assert rc != 0, out
+
+
+# --------------------------------------------------------------------------
+# :node<K> -- which node of the allocation the rung starts on
+# --------------------------------------------------------------------------
+#
+# Without it every rung takes the FIRST R nodes, so two 1n rungs in one
+# allocation are always the same node and the launcher cannot express "is this
+# node-local?" at all. The cross-node evidence available before this field came
+# from separate allocations, where node is confounded with fabric-hour and run
+# length.
+
+
+def test_node_absent_is_the_head_and_does_not_tag():
+    rc, out = _parse_fields("1:nw2")
+    assert rc == 0, out
+    assert _field(out, "NAME") == "n1_nw2", out
+
+
+def test_node0_explicit_does_not_tag():
+    """node0 IS the historical behaviour, so it is not a different arm."""
+    rc, out = _parse_fields("1:nw2:node0")
+    assert rc == 0, out
+    assert _field(out, "NAME") == "n1_nw2", out
+
+
+def test_nonzero_node_tags_the_dir():
+    """`1:node0 1:node1` must give two dirs, not a dir and a _rep2 suffix.
+
+    The auto-rep suffix means "same arm, run again"; a cross-node pair is a
+    different arm and has to be legible as one without consulting submission
+    order after the fact.
+    """
+    rc, out = _parse_fields("1:nw2:node1")
+    assert rc == 0, out
+    assert _field(out, "NAME") == "n1_nw2_node1", out
+
+
+def test_node_does_not_collide_with_nw():
+    """`node*` and `nw*` both start 'n'; the case arms must stay disjoint."""
+    rc, out = _parse_fields("1:node1:nw4")
+    assert rc == 0, out
+    assert _field(out, "NW") == "4", out
+    assert _field(out, "NAME") == "n1_nw4_node1", out
+
+
+def test_offset_window_is_skipped_not_clamped():
+    """A window running off the end of the allocation must not fall back.
+
+    Clamping would rerun node 0 under a name promising node 1 -- a same-node
+    repeat wearing a cross-node name, which reads as a clean refutation of
+    node-locality when it measured nothing of the kind.
+    """
+    src = open(LADDER).read()
+    assert re.search(r'sed -n "\$\{_lo\},\$\{_hi\}p"', src), (
+        "nodefile must be sliced from the offset, not from line 1")
+    # The guard must count offset+R, not R alone.
+    assert re.search(r'if \[ \$\(\( node \+ R \)\) -gt "\$NNODES" \]', src), (
+        "allocation-size guard must include the node offset")
+
+
+def test_rung_banner_records_the_physical_nodes():
+    """The pairing has to be on the record, not inferred from the offset.
+
+    Which physical node an index maps to is PBS's choice, so a cross-node claim
+    that cannot name its two hosts is not checkable later.
+    """
+    src = open(LADDER).read()
+    assert re.search(r"echo \"  nodes: \$\(tr '\\n' ' ' < \"\$nf\"\)\"", src), (
+        "run_rung must echo the rung's node list")
 
 
 def test_fields_are_order_independent():
