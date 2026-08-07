@@ -25,6 +25,7 @@ Each MPI rank == one node; PALS_RANKID identifies which node-id we are.
 import argparse
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -198,7 +199,12 @@ def main():
     args = p.parse_args()
 
     node_rank = _node_rank()
-    host = os.environ.get("HOSTNAME", "?")
+    # socket.gethostname(), NOT $HOSTNAME: mpiexec propagates the launching
+    # shell's environment, so every -ppn 1 stager inherits the HEAD node's
+    # HOSTNAME and the log reads as though all N stagers ran on one node --
+    # which looks exactly like a broken partition. node_rank is the real
+    # identity (PALS_RANKID); this line just has to agree with it.
+    host = socket.gethostname()
     t0 = time.time()
     print(f"[node {node_rank}/{args.num_nodes} {host}] staging start {time.strftime('%F %T')}",
           flush=True)
