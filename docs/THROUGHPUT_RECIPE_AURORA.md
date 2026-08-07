@@ -1656,6 +1656,46 @@ Consequences for how to read all of this:
   of reason). Treat a single-allocation throughput number as a draw from a
   distribution, not a measurement of the config.
 
+The restart test itself came back **inconclusive by construction**: both `16:nw2`
+rungs of 8741490 were clean (backward 1.76 / 1.68 s, drift 1.08 / 1.05 over 53
+fully-covered iterations each). You cannot test whether a restart clears a state
+that never accumulated.
+
+### How much does this cost production? Mostly it isn't this at all
+
+Rather than buy more slots hoping to catch an episode, scan the `backward-ms`
+every production run has already written — `scripts/backward_drift_scan.py`,
+46 runs, 195k rank-0 iterations, zero node-hours. Degraded blocks come to ~7% of
+wall clock, but split by loader era:
+
+| loader | runs | rank-0 iters | weighted wall% | runs with episodes |
+|---|---|---|---|---|
+| LIVE (DAOS) | 26 | 77,348 | **17.2** | 22/26 |
+| staged (/tmp) | 20 | 117,349 | **0.3** | 1/20 |
+
+Every clean-era run reports `dataload` **identically 0.00 at max-over-ranks
+across 11-14k iterations**; every degraded-era run has a live tail. Config is not
+the split — `abl_laponly` (0.0%) and `abl_full` (27.6%) match on model, bs,
+activation checkpointing and workers, three days apart.
+
+**So most "backward degradation" in production is the dataload tail wearing the
+comms column's clothes.** One late rank blocks every other rank inside the
+gradient all-reduce, and that wait is charged to `backward`. Practical rule:
+never read a `backward` blowup as a comms result without checking `dataload`
+**max**-over-ranks in the same block — the median stays ~1 s while the max goes
+to 12 s, so the median will not warn you.
+
+It also revises the "two halves" split: the halves are not independent, because
+part of the backward half *is* the tail half. At 17.2% of wall clock on the
+current DAOS path the tail outranks any remaining CCL knob.
+
+Conditioning `surg_2_1_vitG384_fixedshape` on a quiet loader still leaves 11
+degraded blocks (vs 4 with a tail) at 10.5 s against a 4.31 s floor, min-over-ranks
+up 2.00 → 3.87 — a small residual, and the only production evidence bearing on
+the 8741386 drift. Segmenting that run by allocation (on the repeated CSV
+**header**, not on `itr`, which cycles every `ipe`=30) gives 14 segments spanning
+**4.78-14.34 s** in backward median: the allocation spread, visible in production.
+
 **What survives of the original framing:** clean-phase cost is 1.24 / ~1.7 /
 ~1.9 s at 1 / 16 / 64 nodes. The 16→64 increment is *small*, which is what a
 saturating bandwidth term predicts. The large numbers are drift, not node count.
