@@ -1051,23 +1051,84 @@ distribution (1.55–2.31× on p50, measured paired) — but the asymptote is se
 the tail, the tail is upstream of decode, and **a per-node DAOS client stall
 remains the leading hypothesis and is still untraced on the DAOS side.**
 
+#### The re-encode is shipped, and what it is still owed
+
+All four twins are ingested into DAOS `AuroraGPT/vjepa_surg_wds` and verified
+**byte-exact** against Lustre: job 8741105, 8 nodes, **7,484 tars / 1.744 TiB in
+69 s at 27.8 GiB/s**, source and destination both 1,917,412,353,556 bytes, diff
+**0**.
+
+⚠️ The verifier prints **"99% bytes" and that is expected, not a shortfall.**
+`du -sbL` counts directory entries, which Lustre and DAOS size differently. Only
+a file-bytes-only comparison closes it exactly:
+
+```
+find -L <src> -type f -printf '%s\n' | awk '{t+=$1} END{print t}'
+```
+
+Keep the 99% gate — it catches real truncation, and it exists because a previous
+ingest passed on *tar counts* with 413 bytes of dangling symlinks behind it — but
+do not chase the last percent without running the line above first.
+
+Batch-mode ingest also retires the "cost tracks file count, not bytes" rule from
+the per-source-mpiexec era: one `dsync --dereference` over a symlink farm moved
+1.74 TiB in 69 s, where the old per-source loop budgeted ~0.17 s/tar (≈21 min for
+the same 7,484 tars). The old rule described the launch loop, not DAOS.
+
+Point a run at the twins with
+`configs/vitg16_surg_vid_webdataset_single4/vitG384_lbA_g16.yaml` — `lbA` with
+exactly four dataset basenames changed, proven equal by parsing both configs,
+substituting the datasets list, and comparing the remainder. `lbA` itself is
+untouched: `scripts/vitG384_256n_daos.sh` defaults to it and the swap has no live
+measurement yet.
+
+**Two things it is still owed, and neither should be skipped:**
+
+1. **A live s/iter measurement.** Everything above is offline per-clip decode. The
+   tail is upstream of decode, so the *body* win is not entitled to become an
+   iteration-time win — that is a prediction, not a result. A corpus A/B must run
+   serially **inside one allocation**; across two jobs it measures the fabric
+   hour, not the corpus. The ladder now takes a per-rung `:cfg<NAME>` field for
+   exactly this.
+2. **Reading sitl_2026's arm correctly.** Its twin is GOP *and* a short-side-512
+   downscale, so `vitG384_lbA_g16` genuinely feeds lower-resolution sitl_2026
+   frames than `lbA` does. `crop_size` is 384 so 512 still exceeds the crop, but
+   it is a real input change and the only one in the file. Any quality delta
+   attributed to "the re-encode" has to account for it.
+
 ## Scaling ladder (`scripts/scaling_ladder.sh`)
 
 Measures per-tile efficiency across node counts in **one allocation**, so every
 rung shares a fabric hour, and separates straggler wait from compute.
 
-- Rungs are `<nodes>[:nw<N>]`, run serially, each in its own sub-world: private
-  nodefile + explicit `WORLD_SIZE` + offset `MASTER_PORT`. `WORLD_SIZE` takes
-  precedence over PMI `SIZE` (`src/utils/distributed.py:146-158`) and
-  `hsdp.py` derives `num_nodes = world_size // local_world_size`, so each rung
-  builds a correctly sized mesh from its own world.
+- Rungs are `<nodes>[:nw<N>][:probe<0|1>][:prof<0|1>][:cfg<NAME>]`, fields in any
+  order, run serially, each in its own sub-world: private nodefile + explicit
+  `WORLD_SIZE` + offset `MASTER_PORT`. `WORLD_SIZE` takes precedence over PMI
+  `SIZE` (`src/utils/distributed.py:146-158`) and `hsdp.py` derives
+  `num_nodes = world_size // local_world_size`, so each rung builds a correctly
+  sized mesh from its own world.
   ```
   L1: qsub -l select=16 -v VJEPA_LADDER_RUNGS="1 2 4 8 16"   scripts/scaling_ladder.sh
   L2: qsub -l select=32 -v VJEPA_LADDER_RUNGS="16 32"        scripts/scaling_ladder.sh
   L3: qsub -l select=64 -v VJEPA_LADDER_RUNGS="16 64 16:nw2" scripts/scaling_ladder.sh
+  L5: qsub -l select=64 -v VJEPA_LADDER_RUNGS="1:nw2 64:nw2 64" scripts/scaling_ladder.sh
   ```
   16n repeats in every job as a **cross-job anchor**. If it moves by more than
   its IQR between jobs, cross-job comparisons are void.
+- **`:cfg<NAME>` exists for CORPUS arms** (the g16 re-encode), which cannot be
+  expressed as an env knob the way `nw`/`probe`/`prof` can. A corpus A/B across
+  two jobs measures the fabric hour, not the corpus, so it has to sit serially in
+  one allocation like every other arm. The rung dir is tagged only when the
+  config differs from the job's, so existing rung names and
+  `scaling_efficiency.py --ladder` discovery are unchanged. Unknown fields
+  hard-reject: a typo'd `:cfg` that silently ran the default config would be
+  indistinguishable from a real null result.
+- **Rung ordering is a budget decision, not cosmetic.** Put the cheap
+  irreplaceable rung first, the hazard arm next, its control after, and anything
+  optional last. A hang burns `FIRST_ITER_DEADLINE` (900 s) of a 60 min cap, so
+  whatever follows a hazard arm is what you are willing to lose. Budget from
+  *measured* rung walls, which include 350–500 s of per-rung startup — not from
+  `ipe × s/iter`.
 - `VJEPA_SCALE_PROBE=1` adds an explicit pre-step `torch.distributed.barrier()`
   (after a device sync) and logs it as **`barrier-ms`, CSV column 16**, appended
   so pre-existing readers that index 0-15 are unaffected. Per rank it is how
