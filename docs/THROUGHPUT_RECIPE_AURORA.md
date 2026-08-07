@@ -1463,9 +1463,44 @@ Two consequences:
 - **A new question, and it is probably not new.** Something makes dataload
   degrade ~68% over a run. That is plausibly the same phenomenon as the
   within-run backward degradation recorded below — seen directly in the dataload
-  column instead of laundered through the backward all-reduce. Candidates
-  (hypotheses, none tested): page-cache pressure accumulating, DAOS container or
-  agent state, shard-list position effects, the epoch boundary.
+  column instead of laundered through the backward all-reduce.
+
+#### The rise resets at an allocation boundary but not at an epoch boundary
+
+Two of the four candidates above are testable against the same archive, again at
+zero node-hours, because production artifacts already contain both boundaries.
+`scripts/dload_rise_boundaries.py`, 84 live segments:
+
+| boundary | what resets there | end of k → start of k+1 | ratio | verdict |
+|---|---|---|---|---|
+| allocation (new PBS job) | processes, host page cache, DAOS agent, open shards | 2.32 → 1.28 s | **0.53** | **RESETS** (48/62) |
+| epoch (within one job) | shard iteration order — the loader restarts its list | 1.26 → 1.59 s | **1.26** | **CARRIES** (962/1110) |
+
+That is a clean dissociation, and it kills one candidate outright:
+
+- **Shard-list position is REFUTED.** An epoch restarts the shard list. If the
+  rise tracked position within that list it would have to fall back at every
+  epoch boundary. It does the opposite — 962 of 1110 epoch pairs *carry* the
+  elevated level across, and the median epoch starts 26% *above* where the
+  previous one ended. The rise is indifferent to which shard is being read.
+- **The epoch boundary itself is REFUTED** as the driver, by the same table.
+- What survives is **accumulating per-process or per-node state**, which a fresh
+  allocation clears and an epoch does not: host page-cache pressure, DAOS agent
+  or client-connection state, loader-process growth. These are not separated by
+  this data — all three reset at exactly the same boundary and at no other.
+
+One control worth stating because it is *not* the explanation: XPU free memory
+(`l0-free-mib`) is flat across the same segments, last-decile ÷ first-decile
+median **0.992**. Whatever accumulates is not device memory. That says nothing
+about *host* memory, which is where page-cache pressure would live and which is
+not in the CSV.
+
+⚠️ **This does not localize the tail owner, and it is a different measurement
+from the max-over-ranks tail.** It is rank 0's own cost. It narrows the *rise*,
+not the order statistic. But it does re-rank task #25's candidates: the two
+survivors of that list (page cache, DAOS agent) are exactly the two that reset
+at an allocation boundary, while the NIC — which is neither per-process nor
+cleared by a new job on the same node — fits this pattern worst.
 
 ⚠️ Measured **rank 0 only**, so this is the shape of one rank's own cost, not of
 the order statistic. Rank 0's dataload is not the max over ranks, and the max is
