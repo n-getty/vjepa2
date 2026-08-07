@@ -2414,8 +2414,8 @@ File ".../app/main_dist_aurora.py", line 491 in run_training
 ```
 
 `get_data` is the loader reading a module's bytes off disk. The venv lives on
-`/lus/flare`, and `torchvision/datasets/__init__.py` alone imports ~50 sibling
-modules. So the stall is **filesystem read latency during Python import**, with
+`/lus/flare` — which is **Lustre** (`172.22.12.130@o2ib21:/grand`), not DAOS —
+and `torchvision/datasets/__init__.py` alone imports ~50 sibling modules. So the stall is **filesystem read latency during Python import**, with
 24 ranks per node opening the same several-hundred small files at once — not
 `init_process_group`, not xccl, not the fabric. The rendezvous had already
 completed (`init_process_group backend=xccl world_size=24 rank=0` is in
@@ -2444,8 +2444,81 @@ remediations, in order of how much they would actually buy:
    already present in `__pycache__`, so ranks are reading cached bytecode, and
    the stall is in reading it, not in compiling it.
 
+**How far out of normal is it?** From `rank.0.out` timestamps, the interval
+between `Running pre-training of app: vjepa_2_1` (scaffold, immediately before
+`importlib.import_module`) and the trainer's first log line — i.e. the import
+itself — on four healthy arms:
+
+| arm | import |
+|---|---|
+| 8741955 `n2_nw2` | 45 s |
+| 8741386 `n16_nw2` | 39 s |
+| 8741594 `n16_nw2` | 51 s |
+| 8741490 `n16_nw2` | 53 s |
+
+So the healthy import already costs **~45 s of every rung**, which is itself
+worth reclaiming, and the stalled rung exceeded 900 s — a **20x outlier**, not
+a slow normal. Whatever happens on a bad node is a different regime, not the
+tail of this distribution.
+
 **What is settled:** the no-first-iter hangs in this ladder are an import-time
 storage stall, evidenced by 12 concordant stacks, and the watchdog's forensics
 now work. **What is not:** why node 1 stalled and node 0 did not, and whether
 the stall is contention among the node's own 12 ranks or an external
 `/lus/flare` transient. One occurrence cannot separate those.
+
+
+### The same job then stalled its own LAUNCHER on the same filesystem
+
+Job 8742027 did not go on to run the pf8 arm. After the reaper cleared rung 1's
+orphans and `run_rung` started rung 2, the ladder's own config-rewrite step
+blocked, and the job burned the rest of its slot with nothing running.
+
+Caught live on the head node:
+
+```
+186278  09:55  D  .../frameworks/.../python - .../8742027/n2_nw2_pf8/params.yaml
+        wchan   = osc_io_setattr_end          <- Lustre OSC truncate
+        syscall = 257 (openat) flags 0x80241  <- O_WRONLY|O_CREAT|O_TRUNC
+```
+
+That is `scaling_ladder.sh:610`'s `$PY - "$params" ...` heredoc opening the
+just-copied `params.yaml` with `O_TRUNC` to rewrite it. The truncate RPC to the
+OST never returned. **D state is uninterruptible** — the process cannot be
+signalled, so neither the rung watchdog nor the ladder's job-wall guard can do
+anything about it.
+
+The blast radius is one inode, verified from a login node while it was stuck:
+
+| operation on that directory | result |
+|---|---|
+| `stat n2_nw2_pf8/params.yaml` | instant (0 bytes, mtime 10:59:10) |
+| create + write a *new* file there | instant |
+| `dd` 1 MB to `/lus/flare/...` (login **and** compute) | 441 / 479 MB/s |
+| `head -c 10` that one `params.yaml` | **blocked** |
+| open that one `params.yaml` `O_TRUNC` | **blocked** |
+
+So Lustre was healthy, the directory was healthy, and a single object's
+truncate was wedged. Nothing about this is a bandwidth or a fabric story.
+
+**Both of this job's failures are `/lus/flare` I/O stalls, on different nodes,
+20 minutes apart** — the rank import stall on node 1, the launcher truncate on
+node 0. Whether that is one underlying Lustre condition or two independent
+transients is not decidable from one job, and the write-up should not merge
+them. What it does establish is that the ladder has a **single-filesystem
+dependency it does not survive**: the venv, the run configs, the rank CSVs and
+the job log are all on Lustre, and any one of them wedging costs the whole
+allocation.
+
+Two consequences worth acting on, in order:
+
+1. **The launcher should not be able to lose an allocation to one file.** Write
+   `params.yaml` to node-local `/tmp` and pass that path, or write-new-then-
+   `rename()` instead of `O_TRUNC` in place — a fresh inode cannot inherit a
+   wedged object. Neither is a Lustre fix; both remove the single point.
+2. **Stage `site-packages` (5.2 GB of the 8.7 GB venv) off Lustre.** At the
+   0.43 GB/s/node staging rate that is ~20 s/node, against a measured ~45 s
+   healthy import and an observed 900 s+ pathological one.
+
+Neither is implemented yet, and neither should be claimed as a fix until a
+run shows the stall gone.
