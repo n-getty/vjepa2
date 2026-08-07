@@ -16,6 +16,20 @@ Two contrasts, and neither is arm-2-vs-arm-1:
 Arm 2 against arm 1 moves both at once and cannot separate "DAOS is slow" from
 "the working set now fits in cache". That is why arm 3 exists.
 
+THE STATISTIC TO READ FIRST: WARMUP EXCESS
+
+Not the plateau mean. Every rung descends 11 -> 6.7 -> 5 -> 4.3 -> 3.0 s over
+its first ~50-100 iterations, and that descent is ~90% dataload -- it is the
+cache filling, which is precisely what changing the storage path is supposed to
+affect. Integrated against each rung's own floor it comes to 289.7 / 313.0 /
+296.4 / 316.9 s across four archived rungs: a 9.4% spread, far tighter than the
+plateau mean and measurable in 100 iterations.
+
+The plateau mean, by contrast, converges to the SAME value on every path once
+the cache is warm -- so a sweep that only reads the plateau is asking whether
+storage matters after storage has stopped mattering. Read both: warmup excess
+for the cost of getting warm, plateau for the cost once warm.
+
 WHY THIS SCRIPT AND NOT scaling_efficiency.py
 
 Same phase columns, but the question is different: this compares ARMS AT ONE
@@ -110,6 +124,12 @@ WARMUP_FRAC_MIN = 0.30      # ... but never keep more than 70% of a long run
 # phenomenon in 8741769 and remains genuinely unexplained.
 PRIOR_FLOOR_SAME_NODE = 0.008
 PRIOR_FLOOR_CROSS_NODE = 0.165
+
+# Rung-to-rung spread of the warmup-excess integral, from the four archived
+# rungs that are not 8741769 (which carries the unexplained fwd-context
+# episodes): 289.7 / 313.0 / 296.4 / 316.9 s -- a 9.4% range. Better behaved
+# than the plateau mean, and it is ~90% dataload, i.e. the storage cost itself.
+WARM_SPREAD = 0.094
 
 ARMS = [
     ("n2_nw2", "daos-full", "opening anchor"),
@@ -227,6 +247,25 @@ def summarize(per, label):
     q = max(1, len(ordered) // 4)
     out["q3"], out["q4"] = st.mean(ordered[-2 * q:-q]), st.mean(ordered[-q:])
     out["converged"] = out["q4"] >= 0.95 * out["q3"]
+
+    # ---- WARMUP EXCESS: the statistic this sweep can actually resolve.
+    #
+    # Warmup is not noise to be discarded here -- it is the cache filling, which
+    # is exactly what a storage path is supposed to change. And unlike the
+    # plateau mean it is well behaved: across five archived rungs it comes in at
+    # 289.7 / 313.0 / 296.4 / 316.9 / 500.0 s (the last is 8741769, the run with
+    # the unexplained fwd-context episodes), and 87-92% of it is dataload.
+    #
+    # Measured over the WHOLE run against the run's own floor, so a 100-iteration
+    # arm reports it in full while a 280-iteration arm adds only its plateau.
+    allk = sorted(per.keys())
+    it_all = [max(r["iter"] for r in per[k].values()) for k in allk]
+    dl_all = [max(r["dload"] for r in per[k].values()) for k in allk]
+    floor_s = st.median(sorted(it_all)[:max(10, len(it_all) // 10)])
+    out["plateau"] = floor_s
+    out["warm_excess"] = sum(max(0.0, v - floor_s) for v in it_all)
+    out["warm_dload"] = sum(dl_all[:WARMUP_ITERS])
+    out["warm_frac_dl"] = out["warm_dload"] / max(out["warm_excess"], 1e-9)
     return out
 
 
@@ -246,7 +285,7 @@ def main():
     print(f"\n{a.root}")
     print(f"{'arm':22s}{'kind':14s}{'rk':>4s}{'n':>5s}"
           f"{'p10':>7s}{'med':>7s}{'mean':>7s}{'mean 95% CI':>16s}"
-          f"{'dload':>8s}{'tail%':>7s}")
+          f"{'dload':>8s}{'tail%':>7s}{'warm-s':>9s}{'%dl':>6s}")
     for d, kind, _ in ARMS:
         r = res.get(d)
         if r is None:
@@ -259,7 +298,8 @@ def main():
         print(f"{d:22s}{kind:14s}{r['ranks']:4d}{r['n']:5d}"
               f"{r['p10']:7.2f}{r['med']:7.2f}{r['mean']:7.2f}"
               f"{'[%.2f,%.2f]' % ci:>16s}"
-              f"{r['dload']:8.2f}{100*r['dl_hit']:7.1f}")
+              f"{r['dload']:8.2f}{100*r['dl_hit']:7.1f}"
+              f"{r['warm_excess']:9.0f}{100*r['warm_frac_dl']:6.0f}")
 
     ok = {d: r for d, r in res.items() if r and not r.get("partial")}
 
@@ -329,6 +369,16 @@ def main():
               f" -> {100*y['dl_hit']:.1f}% "
               f"[{100*y['dl_hit_ci'][0]:.0f}-{100*y['dl_hit_ci'][1]:.0f}]"
               f"   (dload > {TAIL_S:.0f}s)")
+        # Reported even when the plateau contrast is UNREADABLE: warmup excess
+        # does not need convergence (it is measured against each arm's own
+        # floor), it reproduces to ~9% across archived rungs, and it is ~90%
+        # dataload -- so it is the contrast a 100-iteration arm can actually
+        # carry. A storage path that helps should shrink it.
+        wd = (y["warm_excess"] - x["warm_excess"]) / max(x["warm_excess"], 1e-9)
+        wtag = "beyond the ~9% rung-to-rung spread" if abs(wd) > WARM_SPREAD \
+            else "within the ~9% rung-to-rung spread -> null"
+        print(f"      WARMUP   {x['warm_excess']:.0f} -> {y['warm_excess']:.0f} s "
+              f"({100*wd:+.0f}%)  {wtag}")
 
     verdict(a3, a2, "arm3 daos-capped", "arm2 staged-capped",
             "the storage path: DAOS agent / NIC")
