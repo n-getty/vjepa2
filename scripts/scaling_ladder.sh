@@ -364,6 +364,19 @@ run_rung () {
     # default period of 200 would emit NOTHING and be indistinguishable from a
     # clean result. Hence the explicit value below.
     [ "$prof" = "1" ] && name="${name}_prof"
+    # Repeat suffix -- LAST, after every other suffix, so it dedups the final
+    # name. Two rungs with identical specs are now a necessary experiment: job
+    # 8741386 found backward degrades WITHIN a rung (16n: 1.68 -> 7.43 s over 50
+    # iters) and the NEXT rung starts clean, so "restart clears it" has to be
+    # tested with two IDENTICAL rungs back to back -- otherwise node count and
+    # restart change together and the observation is confounded. Without this
+    # they would share one output dir and the second would resume into the
+    # first's CSVs, the collision class of [[train-mode-ignores-folder-flag]].
+    if [ -e "$OUTROOT/$name" ]; then
+        local _base="$name" _rep=2
+        while [ -e "$OUTROOT/${_base}_rep${_rep}" ]; do _rep=$(( _rep + 1 )); done
+        name="${_base}_rep${_rep}"
+    fi
     if [ "$R" -gt "$NNODES" ]; then
         echo "SKIP rung $spec: needs $R nodes, allocation has $NNODES"; return 0
     fi

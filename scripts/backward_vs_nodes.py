@@ -142,7 +142,10 @@ def main():
 
     rows = []
     for name in sorted(os.listdir(a.ladder)):
-        m = re.match(r"^n(\d+)_nw(\d+)$", name)
+        # Accept the _rep<N> suffix the ladder appends to a repeated rung spec --
+        # repeats are the restart experiment, so skipping them would drop exactly
+        # the arms this script exists to compare.
+        m = re.match(r"^n(\d+)_nw(\d+)(?:_rep\d+)?$", name)
         if not m:
             continue
         nodes = int(m.group(1))
@@ -185,7 +188,13 @@ def main():
         print("  first (does onset track iteration index or elapsed seconds?).")
         return
 
-    by_n = {nodes: s for _, nodes, s in rows}
+    # Keep the FIRST rung at each node count. A repeat is deliberately a
+    # different run (that is the restart experiment), so averaging them together
+    # would blend a clean arm with a degraded one and hide the very effect the
+    # repeat was added to expose.
+    by_n = {}
+    for _, nodes, s in rows:
+        by_n.setdefault(nodes, s)
     if not {1, 16, 64} <= by_n.keys():
         print("\nneed rungs at 1, 16 and 64 nodes to run the verdict")
         return
