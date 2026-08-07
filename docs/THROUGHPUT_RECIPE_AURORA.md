@@ -2488,6 +2488,16 @@ OST never returned. **D state is uninterruptible** — the process cannot be
 signalled, so neither the rung watchdog nor the ladder's job-wall guard can do
 anything about it.
 
+**The inode was fresh, and that matters for what the fix has to be.** The
+directory listing taken afterwards shows `n2_nw2_pf8/params.yaml` at **0 bytes,
+mtime 10:59:10** — created by `cp` moments earlier, not left over from a prior
+job. So this was not a stale-object problem: `cp` created the file and wrote
+3480 bytes to an OST, and python's `open(p, "w")` then truncated *that* object
+seconds later. `stat` reporting 0 bytes while the process hung means the size
+change had already reached the MDS with the OST RPC still outstanding. A
+fresh-inode-per-rung policy alone would therefore **not** have prevented this;
+what prevents it is never issuing an `O_TRUNC` against Lustre at all.
+
 The blast radius is one inode, verified from a login node while it was stuck:
 
 | operation on that directory | result |
@@ -2512,13 +2522,42 @@ allocation.
 
 Two consequences worth acting on, in order:
 
-1. **The launcher should not be able to lose an allocation to one file.** Write
-   `params.yaml` to node-local `/tmp` and pass that path, or write-new-then-
-   `rename()` instead of `O_TRUNC` in place — a fresh inode cannot inherit a
-   wedged object. Neither is a Lustre fix; both remove the single point.
+1. **The launcher should not be able to lose an allocation to one file.**
+   *Implemented* — see below.
 2. **Stage `site-packages` (5.2 GB of the 8.7 GB venv) off Lustre.** At the
    0.43 GB/s/node staging rate that is ~20 s/node, against a measured ~45 s
-   healthy import and an observed 900 s+ pathological one.
+   healthy import and an observed 900 s+ pathological one. **Not implemented.**
 
-Neither is implemented yet, and neither should be claimed as a fix until a
-run shows the stall gone.
+#### What was changed (#1), and what it is not
+
+`run_rung` now builds `params.yaml` on `JOBTMP` (tmpfs) — `cp` from the runtime
+config, then the rewrite heredoc — so the truncating write happens in RAM. The
+result is published by `publish_atomic`, which copies to a name that has never
+existed and `mv -f`s it into place. **Lustre sees one create-and-write and one
+rename; it never sees an `O_TRUNC`.** `rename()` within a directory is an MDS
+metadata operation and does not resize the object it replaces.
+
+The second half is a deadline, and it is there because the first half is not
+general. Write-once removes the failure that was *observed*; Lustre can also
+stall a plain write, and D state would be just as unrecoverable. So the copy is
+backgrounded and polled, with `VJEPA_LADDER_PUBLISH_TIMEOUT_S` (default 120 s).
+On timeout the rung is **skipped** — `return 0`, the ladder continues to the next
+rung — and the stuck writer is deliberately **not** killed: D state ignores
+signals, and logging a `kill -9` would record a reap that did not happen
+([[no-lazy-cause-labels]]). Its stdio is redirected to `/dev/null` and a temp
+file rather than inherited, because a backgrounded child holds the launcher's
+stdout for as long as it lives — the same fd-lifetime trap as
+[[watchdog-disarmed-by-command-substitution]], from the other side. That one was
+caught by the test, not by inspection.
+
+Locked in by two tests in `tests/test_aurora_teardown_and_watchdog.py`, both
+mutation-verified: restoring the `cp`-onto-Lustre two-step fails them, as does
+dropping the stdio redirect, as does removing the deadline.
+
+**This is not a Lustre fix and does not make the ladder immune.** The venv, the
+rank CSVs and the job log are still on `/lus/flare`; remediation 2 is untouched,
+and the import stall that killed rung 1 of this same job is unaddressed. What
+changed is that *the launcher's own config write* can no longer take the
+allocation down with it. Whether it works is not yet demonstrated — the failure
+is a rare transient, so absence in the next run is weak evidence. It should be
+claimed only as "the known mechanism is removed by construction".

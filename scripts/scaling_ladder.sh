@@ -337,6 +337,61 @@ runtime_cfg_for () {
     printf '%s' "${_RTCFG_CACHE[$n]}"
 }
 
+# Publish a locally-built file to Lustre without ever truncating a Lustre
+# object, and without letting a wedged one cost the allocation.
+#
+# Two defences, because they cover different failures:
+#
+#  1. WRITE-ONCE + rename(). The destination is written exactly once, at a name
+#     that has never existed, so no O_TRUNC is ever issued against Lustre --
+#     and O_TRUNC is the syscall that hung job 8742027's launcher in
+#     uninterruptible D state on `osc_io_setattr_end` for the remainder of its
+#     slot. rename() within a directory is an MDS metadata operation; it does
+#     not resize the object it replaces.
+#
+#  2. A DEADLINE. Write-once removes the known failure, not all failures --
+#     Lustre can stall a plain write too. So the copy runs in the
+#     background and is polled. If it outlives the deadline the caller is told
+#     and the rung is skipped, so the job loses one rung instead of every
+#     remaining one. The stuck child is deliberately NOT killed: D state does
+#     not take signals, `kill -9` would only mislead the log into claiming a
+#     reap that did not happen ([[no-lazy-cause-labels]]). It exits with the job.
+#
+# Unique-per-attempt, not per-rung: a retry after a stalled attempt must not
+# reuse the name the stalled writer still holds open.
+_PUBLISH_SEQ=0
+PUBLISH_TIMEOUT_S=${VJEPA_LADDER_PUBLISH_TIMEOUT_S:-120}
+publish_atomic () {
+    local src=$1 dst=$2
+    _PUBLISH_SEQ=$(( _PUBLISH_SEQ + 1 ))
+    local stage="${dst}.new.$$.${_PUBLISH_SEQ}"
+    local errf="$JOBTMP/publish_${_PUBLISH_SEQ}.err"
+    # O_CREAT|O_EXCL semantics come free: the name has never existed.
+    #
+    # The child's stdio is redirected AWAY from the launcher's, and that is not
+    # tidiness. A backgrounded child inherits the parent's stdout, and a child
+    # stuck in D state holds it for the life of the job -- so anything reading
+    # this script's output through a pipe would block on a writer that already
+    # timed out, turning a skipped rung back into a hung ladder. Same fd-lifetime
+    # trap as [[watchdog-disarmed-by-command-substitution]], the other direction.
+    ( cp "$src" "$stage" && mv -f "$stage" "$dst" ) > /dev/null 2>"$errf" &
+    local pid=$!
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$waited" -ge "$PUBLISH_TIMEOUT_S" ]; then
+            echo "  PUBLISH STALLED: $dst did not appear in ${PUBLISH_TIMEOUT_S}s (pid $pid)"
+            echo "    state=$(awk '{print $3}' /proc/$pid/stat 2>/dev/null) wchan=$(cat /proc/$pid/wchan 2>/dev/null)"
+            echo "    Not killing it: D state ignores signals. Skipping this rung."
+            return 1
+        fi
+        sleep 2; waited=$(( waited + 2 ))
+    done
+    wait "$pid"
+    local rc=$?
+    [ "$rc" -eq 0 ] || { echo "  PUBLISH FAILED rc=$rc: $(head -3 "$errf" 2>/dev/null)"; return "$rc"; }
+    return 0
+}
+
 # Per-rung stall watchdog. Same shape as vitG384_256n_daos.sh:297-331, but scoped
 # to ONE rung: it must not outlive its rung or it would kill the next one, so it
 # is started before mpiexec and killed after.
@@ -606,8 +661,28 @@ run_rung () {
 
     local rtcfg
     rtcfg=$(runtime_cfg_for "$cfg") || { echo "  rung $spec: config resolve FAILED"; return 1; }
-    cp "$rtcfg" "$params" || return 1
-    $PY - "$params" "$dir" "$ipe" <<'PY'
+
+    # Build params.yaml on tmpfs, publish it to Lustre with rename(), and never
+    # open a Lustre file O_TRUNC. Job 8742027 lost its whole allocation to the
+    # two-step this replaces: `cp` created params.yaml and wrote 3480 bytes to an
+    # OST, and the rewrite heredoc's `open(p, "w")` then TRUNCATED that object.
+    # The truncate wedged the launcher in D state for the rest of the slot --
+    # wchan osc_io_setattr_end (the Lustre OSC truncate path), syscall 257
+    # (openat), flags 0x80241 (O_WRONLY|O_CREAT|O_TRUNC). `stat` showed 0 bytes
+    # while it hung, so the size change had reached the MDS with the OST RPC
+    # still outstanding.
+    #
+    # Blast radius was verified as exactly ONE inode: stat instant, a NEW file in
+    # the same directory instant, dd 1 MB at 441 MB/s, while `head -c 10` and
+    # O_TRUNC on that one file both blocked forever. D state is uninterruptible,
+    # so no watchdog and no signal can recover it -- the only defence is to never
+    # put a Lustre object in the state that wedges. Building on tmpfs means the
+    # truncating write happens in RAM; the Lustre file is created once, at a name
+    # that has never existed, and rename() then replaces the directory entry
+    # without truncating what it replaces.
+    local params_tmp="$JOBTMP/params_${name}.yaml"
+    cp "$rtcfg" "$params_tmp" || return 1
+    $PY - "$params_tmp" "$dir" "$ipe" <<'PY'
 import sys, yaml
 p, d, ipe = sys.argv[1], sys.argv[2], int(sys.argv[3])
 c = yaml.safe_load(open(p))
@@ -626,6 +701,8 @@ meta["save_every_freq"] = 10**6
 yaml.safe_dump(c, open(p, "w"), sort_keys=False)
 PY
     [ $? -eq 0 ] || { echo "  rung $spec: config rewrite FAILED"; return 1; }
+    publish_atomic "$params_tmp" "$params" \
+        || { echo "  rung $spec: params publish FAILED, skipping rung"; return 0; }
 
     # store=staged: copy this rung's capped shard window from DAOS to each
     # node's /tmp first, and point the trainer at /tmp. The window is computed

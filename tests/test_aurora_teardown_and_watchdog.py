@@ -30,6 +30,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import textwrap
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -382,6 +383,79 @@ def test_early_registration_is_not_env_gated():
 def test_ladder_script_is_valid_bash():
     r = subprocess.run(["bash", "-n", LADDER], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+# --------------------------------------------------------------------------
+# 5. The launcher must not be able to lose an allocation to one Lustre file
+# --------------------------------------------------------------------------
+
+
+def test_rung_config_is_built_off_lustre_and_published_by_rename():
+    """Job 8742027 burned its whole slot truncating one params.yaml.
+
+    `cp` wrote 3480 bytes to an OST and the rewrite's open(p,"w") truncated
+    that object; the truncate RPC never returned and the launcher sat in
+    uninterruptible D state on osc_io_setattr_end. D state takes no signals, so
+    no watchdog can recover it -- the only defence is to never issue the
+    truncate. Build on JOBTMP (tmpfs), publish with rename().
+    """
+    src = open(LADDER).read()
+    body = src[src.index("run_rung () {"):src.index("ORPHAN SWEEP")]
+    assert 'cp "$rtcfg" "$params_tmp"' in body, "rung config must be built off Lustre"
+    assert 'cp "$rtcfg" "$params"' not in body, (
+        "copying straight onto the Lustre params.yaml reintroduces the O_TRUNC"
+    )
+    assert 'publish_atomic "$params_tmp" "$params"' in body
+    assert '$PY - "$params" "$dir" "$ipe"' not in body, (
+        "the rewrite heredoc must read/write the tmpfs copy, not the Lustre file"
+    )
+    pub = src[src.index("publish_atomic () {"):]
+    pub = pub[:pub.index("\n}")]
+    assert "mv -f" in pub, "publish must rename, not truncate-and-write in place"
+
+
+def test_a_stalled_publish_skips_the_rung_rather_than_the_job():
+    """The deadline is the half that survives an UNKNOWN Lustre stall.
+
+    Write-once removes the failure we saw; it does not remove every stall. So
+    publish_atomic must be bounded, and its caller must treat a timeout as
+    `skip this rung` (return 0, ladder continues) -- not as a fatal error and
+    not as success, which would launch mpiexec against a config that is not
+    there.
+    """
+    src = open(LADDER).read()
+    pub = src[src.index("publish_atomic () {"):]
+    pub = pub[:pub.index("\n}")]
+    assert "PUBLISH_TIMEOUT_S" in pub and "return 1" in pub
+    assert "kill -9" not in pub, "a D-state writer cannot be killed; claiming so misleads the log"
+
+    caller = src[src.index('publish_atomic "$params_tmp" "$params"'):]
+    caller = caller[:caller.index("\n\n")]
+    assert "return 0" in caller, "a stalled publish must skip the rung, not abort the ladder"
+
+    # And the bound must actually fire: run the real function against a writer
+    # that never finishes, and require it to give up.
+    fn = src[src.index("_PUBLISH_SEQ=0"):src.index("\n}", src.index("publish_atomic () {")) + 2]
+    with tempfile.TemporaryDirectory() as td:
+        # No timeout= on the subprocess: the point is that publish_atomic RETURNS
+        # while its writer is still stuck, and that the stuck writer does not hold
+        # this script's stdout open. Bounding it here would hide both.
+        # Via the env var, not a plain assignment: the extracted body contains
+        # `PUBLISH_TIMEOUT_S=${{VJEPA_LADDER_PUBLISH_TIMEOUT_S:-120}}` and would
+        # overwrite a bare one, silently restoring the 120 s default.
+        harness = textwrap.dedent(
+            f"""
+            export VJEPA_LADDER_PUBLISH_TIMEOUT_S=4
+            JOBTMP={td}
+            {fn}
+            # Shadow cp with something that hangs the way a wedged OST does.
+            cp () {{ sleep 300; }}
+            publish_atomic /dev/null {td}/dst && echo BAD_OK || echo TIMED_OUT
+            """
+        )
+        r = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=60)
+        assert "TIMED_OUT" in r.stdout, f"publish_atomic did not bound a stalled writer: {r.stdout!r}"
+        assert not os.path.exists(os.path.join(td, "dst")), "no destination should be published"
 
 
 def test_watchdog_arms_and_survives_when_the_trainer_is_absent_at_start():
