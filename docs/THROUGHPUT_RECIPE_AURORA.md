@@ -98,7 +98,8 @@ export CCL_PROCESS_LAUNCHER=none CCL_ATL_TRANSPORT=ofi CCL_KVS_IFACE=hsn0
 unset CCL_KVS_MODE CCL_KVS_USE_MPI_RANKS
 export CCL_ALLREDUCE=ring CCL_CHUNK_SIZE=16777216   # both re-validated at 64n
 export CCL_OP_SYNC=1 CCL_WORKER_COUNT=1
-export VJEPA_NUM_WORKERS=0
+export VJEPA_NUM_WORKERS=2        # 3.45x at 64n; was 0 here until 2026-08-07
+export OMP_NUM_THREADS=${VJEPA_OMP_NUM_THREADS:-16}   # NOT ${OMP_NUM_THREADS:-16}
 mpiexec ... --no-vni -o "$DIR/rank.%r.out" -e "$DIR/rank.%r.err"   # NO --pmi=pmix
 ```
 
@@ -110,6 +111,36 @@ mpiexec ... --no-vni -o "$DIR/rank.%r.out" -e "$DIR/rank.%r.err"   # NO --pmi=pm
   inherits the system value and silently discards the recipe — the exact opposite
   of the guard's purpose. They are hard-set. Before adding a `:-` to anything
   new, check `env | grep <VAR>` in a clean login shell.
+- **`OMP_NUM_THREADS` is the same trap, and it bit us.** PBS exports it into
+  *every* Aurora job script, set to the node's **logical** CPU count = **208**
+  (104 cores × 2 HT). So `export OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}` — which
+  is what `aurora_hsdp_env.sh:64` said until 2026-08-07 (`2a3820a`) — **never
+  fired inside a job**, and every launcher sourcing the lib believing it set 16
+  actually set 208. The fix is a distinct override name,
+  `${VJEPA_OMP_NUM_THREADS:-16}`, so a deliberate choice cannot be confused with
+  PBS's inherited value.
+
+  *Scope, stated precisely.* mpiexec passed a literal `--depth 16`, so ranks were
+  CPU-**bound** to 16-HT spans regardless; the 2496 threads were never
+  simultaneously runnable node-wide. Each rank oversubscribed its own 16-HT span
+  13×. Wrong, but **not** a node-wide 24×, and **no past throughput number in
+  this doc is invalidated by this alone.** What IS invalidated: *cross-launcher*
+  comparisons. `vitG384_capacity.sh:170` and `vitG384_256n_shakeout.sh` set 16
+  unconditionally and were never affected; the six that source the lib without an
+  explicit export (`accum_ab_64n`, `bs_vs_accum_ab_64n`, `ccl_knob_sweep`,
+  `probe_tmpdir_pals`, `scaling_ladder`, `vitG384_256n_daos`) got 208. Ladder
+  rungs and capacity runs have therefore been on **different thread counts all
+  along** — any number carried between the two families is confounded.
+
+  *Corollary for `--depth`:* at 12 ranks/node on 208 HT only depth ≤ 16 is
+  launchable. `--depth 208` needs 2496 HT and gives `rc=139` in 0 s.
+
+  *How it was found, and the general lesson.* Only because the ladder's new
+  `:omp<N>` rung field echoed the resolved value for the first time and printed
+  `omp=208`. It was invisible before precisely because **nothing printed it** —
+  the same failure mode as the unlogged `num_workers` that once made a whole
+  scaling comparison unrecoverable. **A knob that is never echoed is a knob
+  nobody is actually setting.** Echo resolved values, not intended ones.
 - **Never `set -u`** — Lmod's init trips it.
 
 ### Taking the throughput without breaking the schedule
@@ -1096,6 +1127,41 @@ measurement yet.
    it is a real input change and the only one in the file. Any quality delta
    attributed to "the re-encode" has to account for it.
 
+#### The live A/B ran (job 8741594): NULL, as predicted
+
+Debt #1 is paid. Three arms serial in one allocation, 16 nodes / 192 ranks,
+nw=2, `ipe=60`, 53 usable iterations each, A/B/A so the baseline brackets the
+treatment. Read with `scripts/tail_arm_compare.py`:
+
+| arm | iter_mean | iter_med | gap | dl mean-of-max | gap/dl | excess | p99 |
+|---|---|---|---|---|---|---|---|
+| `n16_nw2` | 9.87 | 3.82 | 6.05 | 5.91 | 1.02 | 0.087 | 3.85 |
+| `n16_nw2_rep2` | 9.02 | 4.13 | 4.90 | 5.11 | 0.96 | 0.084 | 3.72 |
+| `..._vitG384_lbA_g16` | 8.98 | 3.68 | 5.30 | 5.44 | 0.97 | 0.105 | 5.02 |
+
+**Verdict: the GOP re-encode does not move live s/iter at 16n.** Tail +23.8%
+(MEASURED, wrong direction); wall −4.9% (**below floor**, no claim in either
+direction). This is the outcome the section above predicted — g16 buys the
+*body*, and the body is not what a synchronous step pays for.
+
+**Read the floor before the delta.** The two anchor arms are identical
+configuration and differ by 1.03× on `excess` and **1.09× on `iter_mean`** — so
+this study's own noise floor is ±3.3% on the tail and **±8.9% on wall**. A
+−4.9% wall delta is inside it. An anchor spread of 1.09× passes any reasonable
+"is the baseline tight" gate and *still* swamps a 5% effect, which is why the
+gate is not the test: the test is delta-vs-spread, and `tail_arm_compare.py`
+now computes and prints it (`39a86b9`). A two-repeat range also *understates*
+the true floor. A delta labelled "below floor" supports no claim in either
+direction — report it as a null with the floor attached, never as a small win.
+
+**Do not sum the `excess` column with an nw=0 run's.** Under nw=2 the per-rank
+dataload distribution is zero-inflated (median 0.00), so `excess` degenerates
+to the plain mean and the BODY column carries no information. Still absolute
+and arm-comparable *within* this table; not the same statistic as on nw=0.
+
+Debt #2 (sitl_2026's resolution confound) is unaffected and still open — it is
+a quality question, and this was a throughput measurement.
+
 ## 64n efficiency is 63%, and the dataload tail is only HALF of the loss
 
 Job 8741170, 2026-08-07. `vitG384_lbA`, DAOS, nw=2, `VJEPA_SCALE_PROBE=1`, both
@@ -1198,6 +1264,57 @@ library re-opening the shard — costs ~40x on DAOS, silently. That is why
 **The tail's owner remains unidentified.** Decode is exonerated (worst decode
 4.22 s vs worst gap 53.84 s), read granularity is exonerated, and it is not
 node-count. Do not write a cause into this doc without direct evidence.
+
+### The 68× is an order statistic, and coupling makes it BETTER not worse
+
+`scripts/order_statistic_curve.py` on job 8741594 `n16_nw2` (192 ranks, 53
+iterations, nw=2, DAOS):
+
+    per-rank mean dataload   0.087 s/iter
+    mean of max-over-ranks   5.91  s/iter    <- what the synchronous step pays
+
+Both are correct. The factor of **68** is what taking a maximum over 192
+heavy-tailed draws does, and it is the single largest source of confusion in
+this document's history: a per-rank mean of 87 ms and a "1 second dataload at
+scale" are the same measurement read two ways.
+
+**Coupling suppresses the max by 47%.** Independently permuting each rank's
+series across iterations preserves every marginal *exactly* and destroys only
+the cross-rank alignment. observed/shuffled falls monotonically **1.00 → 0.526**
+from k=1 to k=192. Ranks stall *together*, so extra ranks mostly join an
+iteration already paying; under independence nearly every iteration would catch
+somebody's spike. **So the node-clustering measured above is not the thing to
+remove** — de-clustering the stalls, if it were free, would make this worse.
+The levers that remain are per-rank stall *probability* and *magnitude*.
+
+The curve is still climbing at the largest k measured — β = 0.684 on random
+rank subsets, **0.776 node-contiguous** (the real deployment shape) — so no
+ceiling is in sight at 192 ranks and neither lever is spent.
+
+⚠️ **Do not extrapolate β.** It is fitted within one run's rank range. Production
+64n and 256n came in at 23.19 and 22.92 s/iter — a 4× rank jump at ~zero
+marginal cost, which β > 0 does not predict. The within-run subset curve and the
+across-run node curve **disagree, and that disagreement is unexplained.**
+
+Two further facts recorded as open, not explained:
+
+1. Per-rank mean dataload *falls* with node count: 0.247 s at 1n → 0.056 at 16n
+   → 0.009 at 64n, with both the stall rate (0.0291 → 0.0178 → 0.0066) and the
+   magnitude (8.51 → 3.17 → 1.34 s) falling. No order-statistic account predicts
+   this.
+2. **Prefetch masking does not explain (1), and is refuted.** Marginal
+   r(compute, stall rate) = −0.683 across 15 nw2 runs reads like "a slower step
+   hides more prefetch" — but r(ranks, compute) = +0.545, so it is confounded by
+   rank count. Hold rank count fixed and the sign **flips positive**: 12r
+   −0.030, 24r **+0.979**, 192r **+0.707**. The rank effect is real and
+   independent of step time.
+
+**The prize is bounded, and now measured.** `gap = iter_mean − iter_med` divided
+by the dataload mean-of-max is **0.97–1.02** across all three arms of 8741594:
+the dataload order statistic accounts for the entire hidden part of wall clock,
+with no other phase contributing a tail. Removing the tail moves `iter_mean`
+down to `iter_med` and no further. (This is near-tautological under
+zero-inflation — treat it as a bound on the prize, not as evidence for a cause.)
 
 ### `num_workers=2` is worth 3.45x at 64n — and it survives 768 ranks
 
