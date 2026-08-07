@@ -202,7 +202,8 @@ cache would otherwise be free to use. Three consequences:
   arm therefore does **not** cleanly isolate "page cache" as a tail owner — it
   changes the working set *and* the memory available to cache it, in opposite
   directions. Read such an arm as "does read locality remove the tail", not as
-  "is the tail page-cache pressure".
+  "is the tail page-cache pressure". **Measured — see job 8741855 below: read
+  locality does remove the tail, and costs more than it saves.**
 - It also made host memory a plausible home for the accumulating state behind
   the within-run dataload rise — the one resource not in the per-iteration CSV.
   **That has now been measured and refuted; see below.**
@@ -244,10 +245,88 @@ dataload is 0.00 s on every one, `fwd-context` goes x2.79, and the across-rank
 spread *narrows* (1.026 vs 1.057), so nothing is waiting on a laggard. One run
 only — see `scripts/fwdc_episode_scan.py` for the caveats and the 16n contrast.
 
+### Staging removes the dataload tail and buys something worse (job 8741855)
+
+The arm the caveat above warned about, run properly: 2 nodes x 12 tiles, nw=2,
+ipe=100, `vitG384_lbA`, 24/24 rank CSVs on every arm, all in one allocation.
+Arm 1 read DAOS full-corpus; arm 2 staged a 24-shard/source window to `/tmp`;
+arm 3 read DAOS with **the same 24-shard cap** — the control that separates the
+storage path from the working set. 20-iteration bin means, max-over-ranks:
+
+| arm | col | b0 | b20 | b40 | b60 | b80 |
+|---|---|---|---|---|---|---|
+| 1 daos-full | iter | 10.97 | 6.68 | 5.51 | 4.56 | **3.82** |
+| | dload | 7.26 | 3.48 | 2.12 | 1.07 | 0.47 |
+| | barrier | 6.13 | 3.55 | 2.36 | 1.49 | 0.56 |
+| 2 staged-cap24 | iter | 4.13 | 3.48 | 3.85 | 5.93 | **5.97** |
+| | dload | 0.64 | 0.21 | 0.01 | 0.02 | **0.00** |
+| | barrier | 0.23 | 0.32 | 0.21 | 0.58 | 0.12 |
+| 3 daos-cap24 | iter | 11.08 | 7.44 | 5.02 | 4.57 | **4.11** |
+| | dload | 7.35 | 4.21 | 1.85 | 1.18 | 0.74 |
+
+**Three results, in order of confidence.**
+
+**(a) Working set is NOT the tail's owner.** Arm 1 vs arm 3 — same path, 24x
+smaller per-source window — is a **+4%** warmup excess (317 → 330 s), inside the
+9% archived spread. The trajectories overlay. Capping resident bytes does
+nothing, so page-cache residency is not what the DAOS warmup is made of.
+
+**(b) Staging inverts the curve rather than flattening it.** DAOS descends the
+usual warmup; staged starts *near plateau* — nothing to warm, the bytes are
+local — and then **rises**, ending **slower than the DAOS arm it was supposed to
+beat**, with dataload pinned at 0.00 s. Warmup excess 330 → 154 s is a real
+53% win on the loader and it is the wrong statistic to stop at.
+
+**(c) The rise is node-synchronous, episodic, and rotating.** Per-node 10-iter
+bins of arm 2 (12 ranks/node):
+
+| bin | n0 fwdt | n1 fwdt | n0 bwd | n1 bwd |
+|---|---|---|---|---|
+| 40 | 0.68 | 0.68 | 1.39 | 1.36 |
+| 60 | 0.73 | **1.35** | 3.99 | 2.57 |
+| 80 | **3.79** | 0.97 | 2.56 | 5.02 |
+
+Ranks *within* a node agree to ~0.1%, so this is not an order statistic and not
+a straggler rank — a whole node goes slow at once, showing it in `fwd-target`
+while the other node's `backward` inflates waiting at the collective. And **which
+node is slow alternates** (node 1 at bin 60, node 0 at bin 80), so it is an
+episode either node can have, not a bad node. Reading itr 80-99 alone names
+node 0 and is wrong — the [[ab-window-truncation-trap]] applied to *which unit*
+rather than which window. `scripts/storage_arm_report.py` now computes per-node
+episode counts over the whole window and prints this warning.
+
+`barrier` is the independent check: it tracks max-over-ranks dataload in both
+DAOS arms (6.13→0.56 against 7.26→0.47, i.e. the warmup is rank skew) but stays
+**flat at 0.12-0.58 s in the staged arm while iter doubles**. Nobody is waiting
+for a laggard.
+
+**Mechanism is a hypothesis, not a finding.** `/tmp` is tmpfs, so staged bytes
+are unevictable resident pages; the staged arm floors at 165-198 GiB MemAvail
+where the capped-DAOS control sits at 306-328. Consistent, but `/tmp` read only
+34 G of 504 G after the job, no per-node `/proc/meminfo` was captured, and why
+host-memory pressure would land in a **GPU-compute** column is unexplained.
+
+**How to read this:**
+- A "dataload 0.00 s" column does not mean staging won. Judge a storage path on
+  `iter`, per node, over the whole run.
+- Staging's advantage is front-loaded and its cost is back-loaded, so a short
+  window picks the winner by window choice.
+- Staging also cost **567 s** of the 1 h slot at 2 nodes before iteration 0, at
+  a 24-shard cap. Full corpus at scale is the 0.43 GB/s/node problem.
+
+⚠️ The closing anchor (a repeat of arm 1) was skipped by the soft-deadline guard
+— correct behaviour, but it means this sweep has **no measured noise floor** and
+no plateau verdict ([[wallclock-kill-deletes-the-closing-anchor]]). Everything
+above is read from warmup excess and the per-node phase split, both of which are
+measured against each arm's own floor. ipe=100 leaves only 20 post-warmup
+iterations regardless, so a plateau contrast needs ipe ≥ 250 and a slot longer
+than `debug-scaling`'s 1 h.
+
 ## Tested and found NOT to matter (do not re-run)
 
 | knob | result | where |
 |---|---|---|
+| resident working set (24-shard cap vs full corpus, DAOS) | **+4%** warmup excess, trajectories overlay | job 8741855 |
 | `CCL_ALLREDUCE` double_tree vs ring | **1.00x at 64n**, IQRs overlap | job 8732160 |
 | `CCL_CHUNK_SIZE` 64M vs 16M | 0.97x, IQRs overlap | job 8732160 |
 | `CCL_ALLREDUCE` rabenseifner | ~4% slower | 16n, 2026-06-05 |
