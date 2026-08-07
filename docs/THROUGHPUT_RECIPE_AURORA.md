@@ -1124,6 +1124,21 @@ stall at zero. Median gives a flattering 68%. Wall-clock is the mean.
   backward goes 1.23 s → 2.38 s. Stripping the straggler does not touch it, so
   **every rank pays** — this is the HSDP replicate-dim all-reduce growing with
   node count. **H1 confirmed, for backward only.**
+
+  > **QUALIFIED 2026-08-07 (job 8741386).** "Every rank pays" stands; "growing
+  > with node count" does not follow from these two points. Backward is **not
+  > stationary within a run**: at 16n it drifts 1.68 → 7.43 s across 50
+  > iterations while 1n holds 1.24 s flat, so a window median measures partly
+  > where the window was cut. The 2.38 s above came from 23 iterations and mixes
+  > a clean-phase cost with an unknown amount of drift. Early 64n iterations in
+  > 8741386 sit at ~1.9 s clean-phase, close to 16n's ~1.7 s — the *small*
+  > increment a saturating bandwidth term predicts, with the rest of the gap
+  > being drift rather than node count. Treat the 63/71% split as still directionally
+  > right (both halves are real and both matter) but do not quote 2.38 s as
+  > "the 64n all-reduce cost". See `[[backward-growth-is-drift-not-per-n-cost]]`
+  > and use `scripts/backward_vs_nodes.py`, which withholds a verdict when the
+  > first-vs-last-quarter drift exceeds 1.25x.
+
 - **+1.45 s stall tax**, from the dataload tail.
 
 Killing the tail outright would leave 64n at its 4.21 s floor = **71%**. The
