@@ -102,8 +102,25 @@ export TORCH_DIST_TIMEOUT_SECONDS=${TORCH_DIST_TIMEOUT_SECONDS:-3600}
 # corpus, so local slicing makes all N nodes compute the SAME 12 slices -- Nx
 # data duplication with no error message.
 export WDS_LOCAL_SLICING=${WDS_LOCAL_SLICING:-0}
-# WebDataset streaming is I/O-light; workers cost memory and socket pressure.
-export VJEPA_NUM_WORKERS=${VJEPA_NUM_WORKERS:-0}
+# 2, not 0. The old comment here said "WebDataset streaming is I/O-light; workers
+# cost memory and socket pressure" -- measured at 64n (job 8741170, paired arms,
+# one allocation, 768/768 rank CSVs both) that is wrong by 3.45x:
+#
+#   nw=0: mean 24.65 s/iter, dataload median 20.18 s, ALL 23/23 iters stalled
+#   nw=2: mean  7.15 s/iter, dataload median  0.00 s,      8/23 iters stalled
+#
+# The compute floor moves only +0.22 s between them, so this is purely loading.
+# With nw=0 every rank decodes inline on the critical path; the cost is real,
+# not merely moved into a visible column.
+#
+# Two prerequisites, both landed -- do NOT raise this above 0 on a tree missing
+# either, or it hangs or throws at teardown:
+#   1. TMPDIR=/tmp (a31e1f1). Worker AF_UNIX socket paths must fit sun_path's
+#      107-byte cap; the default PBS TMPDIR is 141 chars and overflows it.
+#   2. The loader-destructor exit fix (281b3fe) + persistent_workers.
+# The xccl-fork deadlock is O(ranks) and was the last open risk; n64_nw2 cleared
+# it at 768 ranks with no `terminate called`.
+export VJEPA_NUM_WORKERS=${VJEPA_NUM_WORKERS:-2}
 # Declared rather than inherited: it is a -3 GB memory lever (not a speed lever)
 # and the code default is already 1, so an outer env setting 0 would silently
 # lose it with no log line.

@@ -1184,6 +1184,36 @@ library re-opening the shard — costs ~40x on DAOS, silently. That is why
 4.22 s vs worst gap 53.84 s), read granularity is exonerated, and it is not
 node-count. Do not write a cause into this doc without direct evidence.
 
+### `num_workers=2` is worth 3.45x at 64n — and it survives 768 ranks
+
+The paired arm, same allocation, same 30 iterations, only `num_workers` differs:
+
+| 64n rung | mean s/iter | median | floor | dataload (mean / med) | iters stalled |
+|---|---|---|---|---|---|
+| `nw=0` | **24.65** | 23.59 | 3.99 | 20.84 / 20.18 | **23/23** |
+| `nw=2` | **7.15** | 4.56 | 4.21 | 2.77 / 0.00 | 8/23 |
+
+**3.45x per-iteration.** The compute floor moves only +0.22 s (3.99 → 4.21 s),
+confirming `num_workers` touches loading and nothing else. Per-tile efficiency
+vs the 1n anchor: **nw=0 gives 18%, nw=2 gives 63%.**
+
+**H3 answered: with nw=0 the cost is real, not merely relocated.** Median
+dataload is 20.18 s and *all 23 of 23* iterations pay it — the bimodal
+0.00-or-spike structure that nw=2 shows is gone, because with inline decode
+every rank decodes every batch on the critical path. `barrier-ms` at 19.93 s
+says the ranks then wait on each other for essentially that whole time.
+
+**Do not quote the rung wall-clock ratio (933 s / 524 s = 1.78x) as the win.**
+30 iterations do not amortize startup, so wall understates it by half. The
+per-iteration figure is what scales to a real run.
+
+**The nw>0 hazard is closed at the node count that matters.** The documented
+failure mode — forking persistent DataLoader workers after `init_device_mesh`
+builds the inter-node xccl subgroups — is O(ranks), so 1n and 8n passes never
+transferred. `n64_nw2` completed rc=0, 30 rows, **768/768 rank CSVs, no
+`terminate called`**. Combined with the `TMPDIR=/tmp` fix for the AF_UNIX
+`sun_path` limit (`a31e1f1`), nw=2 is safe to default at 64n.
+
 ## Scaling ladder (`scripts/scaling_ladder.sh`)
 
 Measures per-tile efficiency across node counts in **one allocation**, so every
