@@ -30,12 +30,20 @@ no notion of a noise floor.
    ([[dataload-tail-survives-at-1-node]]). Both are printed; the wall-clock
    claim is the MEAN.
 
-2. READING A MEAN DELTA THAT IS SMALLER THAN THE ANCHOR SPREAD. Two rungs on
-   the SAME node in the SAME allocation, back-to-back, same config, differed
-   20% in the mean while agreeing to 0.7% in the median and 1% in every phase
-   column ([[1n-anchor-does-not-reproduce]]). So a 20%-scale mean difference
-   between arms is INSIDE the noise. |arm1 - arm4| measures it here directly;
-   anything not clearing it is a null whatever its sign.
+2. COMPARING ARMS THAT HAVE NOT CONVERGED. This is the big one, and it is the
+   defect in the 100-iteration sweep this script was written for. Warmup runs
+   ~50-100 iterations (20-iter bin means: 11 -> 6.7 -> 5 -> 4.3 -> 3.0 s), so a
+   100-iteration arm never reaches plateau and its mean records where it was
+   stopped. Both 2n arms in the archive are still descending at their last
+   quartile. `converged` gates the verdict on this.
+
+   Corollary, and the reason the earlier "the mean is irreproducible" reading
+   was wrong: once BOTH arms converge and the windows match, a same-node pair
+   reproduces to 0.8% in the mean (8741810, 2x280 iters). The 20% and 90%
+   spreads previously attributed to intrinsic noise were unequal-window
+   artifacts -- one arm's warmup against the other's plateau
+   ([[ab-window-truncation-trap]]). Cross-node is a different matter: two long
+   1n runs differ 16.5% on a matched post-warmup window.
 
 3. READING A TRUNCATED SWEEP. If the soft-deadline guard dropped arm 4, the
    noise floor is gone and NOTHING is interpretable
@@ -59,17 +67,49 @@ WRAP_MS = 343597.0          # 32-bit XPU event counter, 2**32 * 80 ns
 EVENT_COLS = {4, 6, 7, 8, 9, 10}   # only these wrap; 3/5/16 are wall, 17/18 MiB
 PHASES = [("dload", 5), ("fwdt", 6), ("fwdc", 7), ("bwd", 8),
           ("opt", 9), ("ema", 10), ("barrier", 16)]
-WARMUP_FRAC = 0.30          # 2n arms are only ~100 iters; warmup is a big share
 TAIL_S = 1.0                # a dataload above this is the tail firing, not decode
 
-# Measured, not assumed: job 8741663's two IDENTICAL back-to-back 2n rungs
-# (n2_nw2 vs n2_nw2_rep2, same allocation, same config) came out
-#   p10 0.7%   median 43.9%   mean 89.7%   dload 130.5%   apart.
-# So at 2n and n~70 the mean is worth roughly +/-90% and only p10 reproduces.
-# This sweep's own arm1-vs-arm4 pair estimates the same quantity from one draw;
-# take the larger of the two, because a small observed floor at n=1 pair is as
-# likely to be luck as to be a genuinely quiet allocation.
-PRIOR_FLOOR = 0.897
+# WARMUP IS ~50-100 ITERATIONS, NOT 30%. Measured across every archived rung as
+# 20-iteration bin means (s/iter):
+#
+#   8741810/n1_nw2       10.03 6.03 4.87 4.31 3.02 2.97 3.12 2.98 3.02 ...
+#   8741810/n1_nw2_rep2  10.65 7.39 4.41 3.79 3.55 3.03 3.04 2.99 2.98 ...
+#   8741855/n2_nw2       10.97 6.68 5.51 4.56 3.82  <- 100 iters, STILL FALLING
+#
+# Two long 1n runs reach within 10% of plateau at iteration 49 and 53. A
+# 100-iteration arm therefore spends most of its life warming up, and its
+# quartile profile is still descending at the last bin.
+#
+# So this constant is a floor in ITERATIONS, not a fraction: dropping 30% of a
+# 100-iteration arm leaves 70 iterations that are still 25% above plateau, and
+# an arm-vs-arm comparison then measures which arm got further down the warmup
+# curve. Fractional warmup also silently penalises the SHORTER arm, which is
+# exactly backwards.
+WARMUP_ITERS = 100
+WARMUP_FRAC_MIN = 0.30      # ... but never keep more than 70% of a long run
+
+# ⚠️ RETRACTED: "the 2n mean is worth +/-90%".
+#
+# That came from job 8741663's n2_nw2 (100 iters) vs n2_nw2_rep2 (52 iters),
+# read over each rung's own post-warmup window. rep2 was killed mid-warmup --
+# its last-20 mean is 7.54 s against its twin's 3.40 s -- so the "noise floor"
+# was one arm's warmup compared against the other's plateau, i.e. the window
+# truncation trap ([[ab-window-truncation-trap]]) rather than run-to-run noise.
+#
+# The honest same-node estimate comes from 8741810, where BOTH rungs ran the
+# full 280 iterations on one node in one allocation:
+#
+#   p10 0.2%   median 0.1%   mean 0.8%   backward 0.5%   fwd-context 3.9%
+#
+# The mean reproduces to UNDER ONE PERCENT once the windows match and both
+# arms have converged. The earlier 20% and 90% figures were both artifacts of
+# reading unequal windows.
+#
+# Between DIFFERENT nodes it is larger: the two long 1n runs differ 16.5% over
+# a matched itr>=100 window (3.63 vs 3.03 s), which is the fwd-context episode
+# phenomenon in 8741769 and remains genuinely unexplained.
+PRIOR_FLOOR_SAME_NODE = 0.008
+PRIOR_FLOOR_CROSS_NODE = 0.165
 
 ARMS = [
     ("n2_nw2", "daos-full", "opening anchor"),
@@ -154,7 +194,11 @@ def summarize(per, label):
     keys = sorted(k for k, v in per.items() if len(v) == nr)
     if len(keys) < 20:
         return dict(label=label, ranks=nr, n=len(keys), partial=True)
-    post = keys[int(WARMUP_FRAC * len(keys)):]
+    # Drop WARMUP_ITERS absolutely, but always keep >=20 iterations so a short
+    # arm still reports something (flagged un-converged rather than dropped).
+    cut = max(int(WARMUP_FRAC_MIN * len(keys)),
+              min(WARMUP_ITERS, len(keys) - 20))
+    post = keys[cut:]
 
     # max-over-ranks: the iteration waits for the slowest rank, so this is the
     # only statistic that prices what the step actually cost.
@@ -174,6 +218,15 @@ def summarize(per, label):
     dl = [max(r["dload"] for r in per[k].values()) for k in post]
     out["dl_hit"] = sum(1 for v in dl if v > TAIL_S) / len(dl)
     out["dl_hit_ci"] = boot_ci(dl, stat=lambda s: sum(1 for v in s if v > TAIL_S) / len(s))
+
+    # CONVERGENCE, in time order -- the thing that actually decides whether this
+    # arm's mean means anything. If the last quarter is still materially below
+    # the previous one, the arm is on the warmup curve and its mean is a
+    # property of where it was stopped, not of the condition under test.
+    ordered = [max(r["iter"] for r in per[k].values()) for k in post]
+    q = max(1, len(ordered) // 4)
+    out["q3"], out["q4"] = st.mean(ordered[-2 * q:-q]), st.mean(ordered[-q:])
+    out["converged"] = out["q4"] >= 0.95 * out["q3"]
     return out
 
 
@@ -214,24 +267,36 @@ def main():
     a1, a4 = ok.get("n2_nw2"), ok.get("n2_nw2_rep2")
     if not (a1 and a4):
         print("\n  NO CLOSING ANCHOR -> NO VERDICT.")
-        print("  Both daos-full arms are required: without the pair there is no")
-        print("  noise floor, and a 20%-scale mean difference is known to occur")
-        print("  between identical back-to-back rungs on one node. Comparing to")
-        print("  a single anchor would read that noise as an effect.")
+        print("  Both daos-full arms are required. The closing anchor is what")
+        print("  separates a real arm effect from allocation drift, and it is also")
+        print("  the only check that the arms in between were converged and")
+        print("  comparable at all -- arm 4 runs last, so if it lands on arm 1 the")
+        print("  whole sweep held still. Comparing to a single anchor cannot.")
         return
 
     floor = abs(a4["mean"] - a1["mean"]) / a1["mean"]
     print(f"\n  NOISE FLOOR |arm1 - arm4| = {100*floor:.1f}% of mean "
           f"({a1['mean']:.2f} vs {a4['mean']:.2f} s)")
-    print(f"  Prior 2n identical pair (job 8741663) put this at {100*PRIOR_FLOOR:.0f}% "
-          f"in the mean")
-    print("  and 130% in dload, against 0.7% in p10. Judge against whichever is")
-    print("  LARGER: a floor that comes back small on one pair is luck, not power.")
+    print(f"  Reference: a converged same-node pair (8741810, 2x280 iters) "
+          f"reproduces to {100*PRIOR_FLOOR_SAME_NODE:.1f}%;")
+    print(f"  two long 1n runs on DIFFERENT nodes differ "
+          f"{100*PRIOR_FLOOR_CROSS_NODE:.1f}% on a matched window.")
+    print("  All four arms here share one allocation, so the same-node figure is")
+    print("  the relevant one -- but only for arms that CONVERGED.")
 
     # ---- the two contrasts that actually separate the hypotheses
     a2, a3 = ok.get("n2_nw2_staged_cap24"), ok.get("n2_nw2_cap24")
     anchor = (a1["mean"] + a4["mean"]) / 2
-    bar = max(floor, PRIOR_FLOOR)
+    bar = max(floor, PRIOR_FLOOR_SAME_NODE)
+
+    unconv = [d for d, r in ok.items() if not r["converged"]]
+    if unconv:
+        print(f"\n  ⚠️  NOT CONVERGED: {', '.join(unconv)}")
+        print("  Warmup runs ~50-100 iterations (11 -> 6.7 -> 5 -> 4.3 -> 3.0 s in")
+        print("  20-iter bins). An arm still descending at its last quartile has a")
+        print("  mean set by where it stopped, not by the condition under test, and")
+        print("  comparing two such arms measures which got further down the curve.")
+        print("  Treat every number below as an UPPER BOUND on that arm's cost.")
 
     def verdict(x, y, lo, hi, owner):
         if not (x and y):
@@ -240,13 +305,18 @@ def main():
         d = (y["mean"] - x["mean"]) / x["mean"]
         overlap = not (x["mean_ci"][1] < y["mean_ci"][0]
                        or y["mean_ci"][1] < x["mean_ci"][0])
-        if abs(d) <= bar or overlap:
+        if not (x["converged"] and y["converged"]):
+            tag = "UNREADABLE (an arm is still on the warmup curve)"
+        elif abs(d) <= bar or overlap:
             why = "CI overlap" if overlap else "inside the anchor spread"
             tag = f"NULL ({why})"
         else:
             tag = f"SIGNAL -> {owner}"
         print(f"\n  {lo} vs {hi}: {x['mean']:.2f} -> {y['mean']:.2f} s "
-              f"({100*d:+.1f}%, bar {100*bar:.0f}%)   {tag}")
+              f"({100*d:+.1f}%, bar {100*bar:.1f}%)   {tag}")
+        print(f"      q3->q4   {x['q3']:.2f}->{x['q4']:.2f}"
+              f"  vs  {y['q3']:.2f}->{y['q4']:.2f}"
+              f"   (converged: {x['converged']}, {y['converged']})")
         print(f"      mean CI  {x['mean_ci'][0]:.2f}-{x['mean_ci'][1]:.2f}"
               f"  vs  {y['mean_ci'][0]:.2f}-{y['mean_ci'][1]:.2f}")
         print(f"      dload    {x['dload']:.2f} -> {y['dload']:.2f} s "
@@ -272,8 +342,9 @@ def main():
     print("  statistic (only the max).")
     print("\n  CONFOUND: capped arms read a fixed 24-shard window per source, so")
     print("  their sampling diversity is not production's. State it either way.")
-    print("  POWER: at n~70 with an 90%-spread mean, only a large effect is")
-    print("  resolvable. A null here bounds the effect; it does not exclude one.")
+    print("  POWER: a converged same-node pair reproduces to <1%, so a converged")
+    print("  arm pair here can resolve a small effect. An UN-converged pair can")
+    print("  resolve nothing. A null bounds the effect; it does not exclude one.")
 
 
 if __name__ == "__main__":
