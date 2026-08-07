@@ -83,12 +83,21 @@ WRAP_MS = 2**32 * 80e-9 * 1000.0  # XPU 32-bit event counter period, 343597 ms
 
 
 def read_rung(d, lo, hi):
-    """-> ({rank: [dload seconds]}, [max-over-ranks dload], [max-over-ranks iter]).
+    """-> (per_rank, dmax, imax, n_files, last_covered_iter).
 
-    Windowed on iteration index so arms of unequal length still compare on a
-    common window, and restricted to iterations where EVERY rank logged -- a
-    max over a partial rank set understates the max, which is precisely how an
-    earlier scaling table came to be wrong.
+    per_rank is {rank: [dload seconds]}; dmax/imax are max-over-ranks series.
+
+    Windowed on iteration index, and restricted to iterations where EVERY rank
+    logged -- a max over a partial rank set understates the max, which is
+    precisely how an earlier scaling table came to be wrong.
+
+    `hi` alone does NOT give a common window: it bounds every arm from above but
+    a truncated arm still ends early, so arms of unequal length are still
+    compared over unequal spans. That matters because dataload is not
+    stationary within an arm (job 8741663: 2.47 s -> 0.04 s across one arm), so
+    the caller needs the last fully-covered iteration to truncate everyone to
+    the shortest. It is returned rather than inferred from len(dmax), which
+    counts covered iterations, not the span they cover.
     """
     per_rank, by_iter = {}, {}
     files = sorted(glob.glob(os.path.join(d, "log_r*.csv")))
@@ -122,11 +131,10 @@ def read_rung(d, lo, hi):
             slot[0].append(dl / 1000.0)
             slot[1].append(itr_s)
     n = len(files)
-    dmax = [max(a) for a, _ in (by_iter[k] for k in sorted(by_iter))
-            if len(a) >= n]
-    imax = [max(b) for _, b in (by_iter[k] for k in sorted(by_iter))
-            if len(b) >= n]
-    return per_rank, dmax, imax, n
+    covered = [k for k in sorted(by_iter) if len(by_iter[k][0]) >= n]
+    dmax = [max(by_iter[k][0]) for k in covered]
+    imax = [max(by_iter[k][1]) for k in covered]
+    return per_rank, dmax, imax, n, (covered[-1] if covered else None)
 
 
 def stats(per_rank, thresh):
@@ -158,14 +166,42 @@ def main():
     ap.add_argument("--hi", type=int, default=10**6)
     ap.add_argument("--thresh", type=float, default=5.0,
                     help="fixed absolute threshold, SHARED by all arms")
+    ap.add_argument("--no-common-window", action="store_true",
+                    help="compare arms over their full lengths even when those "
+                         "differ. Off by default -- see below.")
     a = ap.parse_args()
+
+    # --- COMMON WINDOW ----------------------------------------------------
+    # Truncate every arm to the shortest arm's last iteration. Dataload is not
+    # stationary within an arm: at 2n it decays from 2.47 s to 0.04 s
+    # (max-over-ranks, first quarter to last, job 8741663), so a mean over 93
+    # iterations and a mean over 45 iterations of the SAME arm are different
+    # numbers. Comparing arms of unequal length therefore reports a difference
+    # in window as a difference in configuration.
+    #
+    # This is not hypothetical -- it is why 8741663's closing anchor read as
+    # "did not reproduce, 1.75x". A wall-clock kill truncated it to 45 of 100
+    # iterations; on the common window the same pair is 1.45x, and on dataload
+    # alone 1.17x. The floor was mostly an artifact of this reader.
+    hi = a.hi
+    if not a.no_common_window:
+        last = []
+        for name in sorted(os.listdir(a.ladder)):
+            d = os.path.join(a.ladder, name)
+            if not os.path.isdir(d) or not glob.glob(os.path.join(d, "log_r*.csv")):
+                continue
+            _, _, _, _, mx = read_rung(d, a.lo, a.hi)
+            if mx is not None:
+                last.append(mx)
+        if last and min(last) + 1 < hi:
+            hi = min(last) + 1
 
     arms = []
     for name in sorted(os.listdir(a.ladder)):
         d = os.path.join(a.ladder, name)
         if not os.path.isdir(d) or not glob.glob(os.path.join(d, "log_r*.csv")):
             continue
-        pr, dmax, imax, nf = read_rung(d, a.lo, a.hi)
+        pr, dmax, imax, nf, _ = read_rung(d, a.lo, hi)
         s = stats(pr, a.thresh)
         if not s:
             continue
@@ -179,7 +215,14 @@ def main():
         print(f"no usable rung dirs under {a.ladder}")
         return
 
-    print(f"window: iterations [{a.lo}, {a.hi}), full rank coverage only")
+    if hi != a.hi:
+        print(f"COMMON WINDOW APPLIED: truncated to [{a.lo}, {hi}) because the "
+              f"shortest arm ends there.")
+        print("  Arms are compared over equal spans. Dataload is not stationary "
+              "within an arm,\n  so unequal spans report a window difference as "
+              "a configuration difference.\n  Pass --no-common-window to see the "
+              "full-length (non-comparable) numbers.")
+    print(f"window: iterations [{a.lo}, {hi}), full rank coverage only")
     print(f"fixed threshold for rate: {a.thresh:.1f} s\n")
     print(f"{'arm':<34} {'rks':>4} {'its':>4} | {'iter_mean':>9} {'iter_med':>8} "
           f"{'gap':>6} | {'dl_max':>7} {'gap/dl':>7} | {'BODY':>6} {'excess':>7} "
