@@ -52,6 +52,7 @@ import collections
 import csv
 import glob
 import os
+import random
 import statistics as st
 
 WRAP_MS = 343597.0          # 32-bit XPU event counter, 2**32 * 80 ns
@@ -59,6 +60,16 @@ EVENT_COLS = {4, 6, 7, 8, 9, 10}   # only these wrap; 3/5/16 are wall, 17/18 MiB
 PHASES = [("dload", 5), ("fwdt", 6), ("fwdc", 7), ("bwd", 8),
           ("opt", 9), ("ema", 10), ("barrier", 16)]
 WARMUP_FRAC = 0.30          # 2n arms are only ~100 iters; warmup is a big share
+TAIL_S = 1.0                # a dataload above this is the tail firing, not decode
+
+# Measured, not assumed: job 8741663's two IDENTICAL back-to-back 2n rungs
+# (n2_nw2 vs n2_nw2_rep2, same allocation, same config) came out
+#   p10 0.7%   median 43.9%   mean 89.7%   dload 130.5%   apart.
+# So at 2n and n~70 the mean is worth roughly +/-90% and only p10 reproduces.
+# This sweep's own arm1-vs-arm4 pair estimates the same quantity from one draw;
+# take the larger of the two, because a small observed floor at n=1 pair is as
+# likely to be luck as to be a genuinely quiet allocation.
+PRIOR_FLOOR = 0.897
 
 ARMS = [
     ("n2_nw2", "daos-full", "opening anchor"),
@@ -113,6 +124,29 @@ def read_arm(d):
     return per
 
 
+def boot_ci(xs, stat=st.mean, iters=2000, lo=2.5, hi=97.5, seed=12345):
+    """Percentile bootstrap CI. Deterministic seed so a re-run reproduces.
+
+    The mean of a heavy-tailed sample over ~70 iterations carries far more
+    uncertainty than a point estimate suggests: two identical back-to-back 2n
+    rungs differed 89.7% in the mean. Resampling iterations prices that
+    directly, so an arm comparison can be judged on overlap instead of on the
+    difference of two noisy points.
+
+    Caveat this does NOT cover: resampling iterations treats them as
+    exchangeable, but the tail is CLUSTERED in time. That makes this CI an
+    UNDER-estimate of the true run-to-run spread -- it is a lower bound on the
+    uncertainty, which is why the empirical anchor pair is still reported.
+    """
+    n = len(xs)
+    if n < 8:
+        return (float("nan"), float("nan"))
+    rnd = random.Random(seed)
+    vals = sorted(stat([xs[rnd.randrange(n)] for _ in range(n)])
+                  for _ in range(iters))
+    return (vals[int(lo / 100 * iters)], vals[min(int(hi / 100 * iters), iters - 1)])
+
+
 def summarize(per, label):
     if not per:
         return None
@@ -127,10 +161,19 @@ def summarize(per, label):
     it = sorted(max(r["iter"] for r in per[k].values()) for k in post)
     out = dict(label=label, ranks=nr, n=len(post), partial=False,
                p10=it[len(it) // 10], med=st.median(it), mean=st.mean(it))
+    out["mean_ci"] = boot_ci(it)
     for name, _ in PHASES:
-        out[name] = st.mean([max(r[name] for r in per[k].values()) for k in post])
+        series = [max(r[name] for r in per[k].values()) for k in post]
+        out[name] = st.mean(series)
         out[name + "_rk"] = st.mean(
             [st.median([r[name] for r in per[k].values()]) for k in post])
+    # Tail FRACTION, not tail magnitude. How often the tail fires is a Bernoulli
+    # rate with a well-behaved CI over ~70 iterations, whereas its magnitude is
+    # heavy-tailed and barely estimable at this n. If a storage change removes
+    # the tail, this moves and it moves measurably.
+    dl = [max(r["dload"] for r in per[k].values()) for k in post]
+    out["dl_hit"] = sum(1 for v in dl if v > TAIL_S) / len(dl)
+    out["dl_hit_ci"] = boot_ci(dl, stat=lambda s: sum(1 for v in s if v > TAIL_S) / len(s))
     return out
 
 
@@ -149,7 +192,8 @@ def main():
 
     print(f"\n{a.root}")
     print(f"{'arm':22s}{'kind':14s}{'rk':>4s}{'n':>5s}"
-          f"{'p10':>7s}{'med':>7s}{'mean':>7s}{'dload':>8s}{'bwd':>7s}")
+          f"{'p10':>7s}{'med':>7s}{'mean':>7s}{'mean 95% CI':>16s}"
+          f"{'dload':>8s}{'tail%':>7s}")
     for d, kind, _ in ARMS:
         r = res.get(d)
         if r is None:
@@ -158,9 +202,11 @@ def main():
             print(f"{d:22s}{kind:14s}{r['ranks']:4d}{r['n']:5d}"
                   f"   -- too few fully-covered iters to summarize --")
             continue
+        ci = r["mean_ci"]
         print(f"{d:22s}{kind:14s}{r['ranks']:4d}{r['n']:5d}"
               f"{r['p10']:7.2f}{r['med']:7.2f}{r['mean']:7.2f}"
-              f"{r['dload']:8.2f}{r['bwd']:7.2f}")
+              f"{'[%.2f,%.2f]' % ci:>16s}"
+              f"{r['dload']:8.2f}{100*r['dl_hit']:7.1f}")
 
     ok = {d: r for d, r in res.items() if r and not r.get("partial")}
 
@@ -177,23 +223,42 @@ def main():
     floor = abs(a4["mean"] - a1["mean"]) / a1["mean"]
     print(f"\n  NOISE FLOOR |arm1 - arm4| = {100*floor:.1f}% of mean "
           f"({a1['mean']:.2f} vs {a4['mean']:.2f} s)")
-    print("  Any arm delta below this is a null, whatever its sign.")
+    print(f"  Prior 2n identical pair (job 8741663) put this at {100*PRIOR_FLOOR:.0f}% "
+          f"in the mean")
+    print("  and 130% in dload, against 0.7% in p10. Judge against whichever is")
+    print("  LARGER: a floor that comes back small on one pair is luck, not power.")
 
     # ---- the two contrasts that actually separate the hypotheses
     a2, a3 = ok.get("n2_nw2_staged_cap24"), ok.get("n2_nw2_cap24")
     anchor = (a1["mean"] + a4["mean"]) / 2
+    bar = max(floor, PRIOR_FLOOR)
 
     def verdict(x, y, lo, hi, owner):
         if not (x and y):
             print(f"\n  {lo} vs {hi}: arm missing -> not evaluable")
             return
         d = (y["mean"] - x["mean"]) / x["mean"]
-        tag = "NULL (inside the anchor spread)" if abs(d) <= floor else \
-              f"SIGNAL -> {owner}"
+        overlap = not (x["mean_ci"][1] < y["mean_ci"][0]
+                       or y["mean_ci"][1] < x["mean_ci"][0])
+        if abs(d) <= bar or overlap:
+            why = "CI overlap" if overlap else "inside the anchor spread"
+            tag = f"NULL ({why})"
+        else:
+            tag = f"SIGNAL -> {owner}"
         print(f"\n  {lo} vs {hi}: {x['mean']:.2f} -> {y['mean']:.2f} s "
-              f"({100*d:+.1f}%)   {tag}")
-        print(f"      dload {x['dload']:.2f} -> {y['dload']:.2f} s "
+              f"({100*d:+.1f}%, bar {100*bar:.0f}%)   {tag}")
+        print(f"      mean CI  {x['mean_ci'][0]:.2f}-{x['mean_ci'][1]:.2f}"
+              f"  vs  {y['mean_ci'][0]:.2f}-{y['mean_ci'][1]:.2f}")
+        print(f"      dload    {x['dload']:.2f} -> {y['dload']:.2f} s "
               f"(per-rank median {x['dload_rk']:.2f} -> {y['dload_rk']:.2f})")
+        # The rate is the better-powered statistic: a Bernoulli over ~70 iters
+        # beats the mean of a heavy tail. If the tail rate moves and the mean
+        # does not, believe the rate and say the mean lacks the power.
+        print(f"      tail rate {100*x['dl_hit']:.1f}% "
+              f"[{100*x['dl_hit_ci'][0]:.0f}-{100*x['dl_hit_ci'][1]:.0f}]"
+              f" -> {100*y['dl_hit']:.1f}% "
+              f"[{100*y['dl_hit_ci'][0]:.0f}-{100*y['dl_hit_ci'][1]:.0f}]"
+              f"   (dload > {TAIL_S:.0f}s)")
 
     verdict(a3, a2, "arm3 daos-capped", "arm2 staged-capped",
             "the storage path: DAOS agent / NIC")
@@ -201,11 +266,14 @@ def main():
             "the working set: page cache")
 
     print(f"\n  anchor mean {anchor:.2f} s")
-    print("  Report the MEAN. The median prices the tail ~18% cheap, and the")
-    print("  per-rank median in the dload line shows whether every rank got")
-    print("  slower (real cost) or only the max did (an order statistic).")
+    print("  Report the MEAN for cost, the TAIL RATE for whether the tail moved.")
+    print("  The median prices the tail ~18% cheap; the per-rank median in the")
+    print("  dload line separates a real cost (every rank slower) from an order")
+    print("  statistic (only the max).")
     print("\n  CONFOUND: capped arms read a fixed 24-shard window per source, so")
     print("  their sampling diversity is not production's. State it either way.")
+    print("  POWER: at n~70 with an 90%-spread mean, only a large effect is")
+    print("  resolvable. A null here bounds the effect; it does not exclude one.")
 
 
 if __name__ == "__main__":
