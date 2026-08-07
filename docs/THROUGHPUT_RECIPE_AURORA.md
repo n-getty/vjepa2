@@ -1432,6 +1432,54 @@ every node-local demand. It is not free to run — `PPN` is global in
 (4,6), which halves the shard dim and so changes both per-rank parameter memory
 and backward comms. Two confounds for one answer; needs a design pass first.
 
+### The tail is NOT a warmup transient — it RISES over a run
+
+Job 8741663 raised the alarm: at 2n the dataload order statistic collapses
+*within* a 93-iteration arm — 2.47 s → 0.04 s from first quarter to last, and
+the same shape in all three complete arms. If that were the production shape,
+every efficiency figure in this document taken over ≤100 iterations would be
+measuring warmup rather than steady state.
+
+**It is not the production shape.** `scripts/dload_transient_scan.py` reads the
+84 live-loader segments of 300–800 iterations already sitting in production
+artifacts (zero node-hours). Median dataload by decile of the segment:
+
+| d0 | d1 | d2 | d3 | d4 | d5 | d6 | d7 | d8 | d9 |
+|---|---|---|---|---|---|---|---|---|---|
+| **1.99** | 1.29 | 1.31 | 1.31 | 1.33 | 1.36 | 1.46 | 1.56 | 1.75 | **2.17** |
+
+There **is** a warmup, but it is short and small — 1.99 → 1.29, complete inside
+the first 10% of the run. After that dataload **rises monotonically for the
+remaining 90%: 1.29 → 2.17, +68%**, ending *above* where it started. Spearman
+of decile index against dataload has median +0.30; 41 of 84 segments are rising
+(ρ > +0.3) against 15 falling.
+
+Two consequences:
+
+- **Dropping the first ~10% is sufficient warmup handling.** A longer run does
+  not converge to a floor, so short-window efficiency numbers are not the lower
+  bounds they were feared to be. If anything a short post-warmup window
+  *flatters* the run.
+- **A new question, and it is probably not new.** Something makes dataload
+  degrade ~68% over a run. That is plausibly the same phenomenon as the
+  within-run backward degradation recorded below — seen directly in the dataload
+  column instead of laundered through the backward all-reduce. Candidates
+  (hypotheses, none tested): page-cache pressure accumulating, DAOS container or
+  agent state, shard-list position effects, the epoch boundary.
+
+⚠️ Measured **rank 0 only**, so this is the shape of one rank's own cost, not of
+the order statistic. Rank 0's dataload is not the max over ranks, and the max is
+what the synchronous step pays (0.087 s per-rank mean vs 5.91 s mean-of-max at
+16n). The *shape* is what transfers; the magnitude is not.
+
+**Reader fix this forced.** `tail_arm_compare.py` was comparing arms of unequal
+length on a non-stationary series — the 8741663 anchor's "1.75× did not
+reproduce" was a 45-iteration mean against a 93-iteration one. It now truncates
+every arm to the shortest arm's last fully-covered iteration and prints the
+applied window (`--no-common-window` opts out). The corrected floor is 1.45× on
+`iter_mean` and 1.17× on dataload; the verdict is unchanged, because the anchor
+really did move — the floor was overstated, not invented.
+
 ### `num_workers=2` is worth 3.45x at 64n — and it survives 768 ranks
 
 The paired arm, same allocation, same 30 iterations, only `num_workers` differs:
