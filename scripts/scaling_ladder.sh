@@ -36,7 +36,8 @@
 #     ccl_knob_sweep.sh:37-42 records that across separate jobs the fabric-hour
 #     term swamps the effect being measured. Concurrent rungs would be faster but
 #     would inject cross-rung fabric traffic into a study ABOUT fabric behaviour.
-#   - A rung is `<nodes>` or `<nodes>:nw<N>`, so num_workers is a first-class arm
+#   - A rung is `<nodes>` plus optional `:nw<N>` / `:cfg<NAME>` / `:omp<N>`
+#     fields (full grammar below), so num_workers is a first-class arm
 #     rather than a hidden constant. nw>0 is a HAZARD arm: train.py:207-211
 #     forces 0 under HSDP because forking DataLoader workers after
 #     init_device_mesh can inherit broken xccl state and deadlock on the first
@@ -95,9 +96,14 @@
 # do not have overlapping IQRs, the ladder is measuring its own barrier and the
 # design needs revising before the L1-L3 debug-scaling slots are spent.
 #
-# A rung is <nodes>[:nw<N>][:probe<0|1>][:prof<0|1>][:cfg<NAME>], fields in any
-# order. Unknown fields are rejected, not ignored -- a typo'd arm that silently
-# ran the default config would be indistinguishable from a real null result.
+# A rung is <nodes>[:nw<N>][:probe<0|1>][:prof<0|1>][:cfg<NAME>][:omp<N>], fields
+# in any order. Unknown fields are rejected, not ignored -- a typo'd arm that
+# silently ran the default config would be indistinguishable from a real null
+# result.
+#
+# `:omp<N>` sets OMP_NUM_THREADS and the mpiexec --depth together (see run_rung).
+# It exists for the CPU-oversubscription arm: the default 16 threads x 12 ranks
+# is 192 threads on 104 cores, and decode is CPU work.
 #
 # `:cfg<NAME>` names a config under configs/vitg16_surg_vid_webdataset_single4/
 # and exists for CORPUS arms (e.g. the g16 re-encode), which cannot be expressed
@@ -302,13 +308,14 @@ start_rung_watchdog () {
 
 run_rung () {
     local spec=$1
-    # spec = <nodes>[:nw<N>][:probe0|:probe1]  -- colon-separated, order-free.
+    # spec = <nodes>[:nw<N>][:probe0|:probe1][:prof<0|1>][:cfg<NAME>][:omp<N>]
+    # -- colon-separated, order-free.
     # probe0 exists for the PROBE-OVERHEAD CHECK that gates this whole study: the
     # barrier is supposed to be free (it sits where ranks already synchronize at
     # forward's first FSDP all-gather), but if it is not, the ladder is measuring
     # the probe. Run `16 16:probe0` in one allocation and require overlapping IQRs.
     local R="${spec%%:*}" nw="$VJEPA_NUM_WORKERS" probe="$VJEPA_SCALE_PROBE" prof=0
-    local cfg="$CFG_NAME"
+    local cfg="$CFG_NAME" omp="${OMP_NUM_THREADS:-16}"
     local rest="${spec#*:}" fld
     if [ "$rest" != "$spec" ]; then
         # Split on ':' by SUBSTITUTION, not by setting IFS.
@@ -332,6 +339,7 @@ run_rung () {
                 probe*) probe="${fld#probe}" ;;
                 prof*)  prof="${fld#prof}" ;;
                 cfg*)   cfg="${fld#cfg}" ;;
+                omp*)   omp="${fld#omp}" ;;
                 *) echo "  rung $spec: unknown field '$fld'"; return 1 ;;
             esac
         done
@@ -342,6 +350,12 @@ run_rung () {
     # infers ranks from the n<R> prefix) are unchanged for every non-corpus arm.
     [ "$cfg" = "$CFG_NAME" ] || name="${name}_${cfg}"
     [ "$probe" = "1" ] || name="${name}_probe${probe}"
+    # omp<N>: threads per rank AND the mpiexec --depth, which must move together
+    # -- --depth is the CPU span each rank is bound to, so lowering OMP alone
+    # leaves the binding unchanged and lowering --depth alone oversubscribes the
+    # narrower span even harder. Tagged only when it departs from the default so
+    # existing rung-dir names are unchanged.
+    [ "$omp" = "${OMP_NUM_THREADS:-16}" ] || name="${name}_omp${omp}"
     # prof<0|1>: per-source decode/gap profiling (src/datasets/webdataset.py).
     # This exists because the tail has outgrown the explanation we had for it.
     # The sparse-keyframe finding reproduces the BODY of the per-rank dataload
@@ -424,7 +438,7 @@ yaml.safe_dump(c, open(p, "w"), sort_keys=False)
 PY
     [ $? -eq 0 ] || { echo "  rung $spec: config rewrite FAILED"; return 1; }
 
-    echo "===== RUNG $name : ${R}n x ${PPN} = ${W} ranks, ipe=$ipe, num_workers=$nw, scale_probe=$probe, cfg=$cfg ====="
+    echo "===== RUNG $name : ${R}n x ${PPN} = ${W} ranks, ipe=$ipe, num_workers=$nw, scale_probe=$probe, cfg=$cfg, omp=$omp ====="
     # Sets RUNG_WD_PID -- see the note on start_rung_watchdog for why this must
     # not be a command substitution. Verify it armed: a silently-dead watchdog is
     # exactly the failure that cost job 8739712 half its slot, and it is
@@ -450,7 +464,8 @@ PY
     VJEPA_DECODE_PROFILE=$prof \
     VJEPA_DECODE_PROFILE_EVERY=${VJEPA_DECODE_PROFILE_EVERY:-40} \
     VJEPA_DECODE_PROFILE_RANKS=${VJEPA_DECODE_PROFILE_RANKS:-12} \
-    mpiexec -n $W -ppn $PPN --hostfile "$nf" --cpu-bind depth --depth 16 --no-vni \
+    OMP_NUM_THREADS=$omp \
+    mpiexec -n $W -ppn $PPN --hostfile "$nf" --cpu-bind depth --depth $omp --no-vni \
         -o "$dir/rank.%r.out" -e "$dir/rank.%r.err" \
         python -m app.main_dist_aurora --train_mode \
             --fname "$params" --params_path "$params" \
