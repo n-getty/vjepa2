@@ -2752,3 +2752,44 @@ not unambiguously a win at every scale: 49 s (or 392 s on a busy filesystem) of
 staging against ~45 s/rung of import means a short two-rung job can come out
 behind. `VJEPA_LADDER_STAGE_VENV=0` exists so that is measurable rather than
 assumed.
+## Prefetch depth (pf8 vs pf2) is not a lever at 2n — job 8742102, 2026-08-07
+
+The open question from the ladder work was whether the dataloader's prefetch
+queue depth buys anything: with `nw=2` each worker holds `prefetch_factor`
+batches, and a deeper queue is the obvious candidate for absorbing a bursty
+decode. **It does not, at 2 nodes, and the reason is that there is nothing left
+to absorb.**
+
+Two previous allocations failed to answer this — 8741955 lost its arms to the
+SIGUSR1 default-disposition kill, 8742027 to an import stall and then to the
+launcher's own `O_TRUNC`. Both mechanisms are now removed, and 8742102 produced
+the full bracket: **A/B/B/A, 4 arms × 60 iterations (window 20–80), 24/24 rank
+CSVs on every arm.**
+
+| arm | pf | median-of-max iter | mean | IQR |
+|---|---|---|---|---|
+| `n2_nw2` | 2 | 3.194 s | 5.640 s | 3.16–3.94 |
+| `n2_nw2_pf8` | 8 | 3.246 s | 4.231 s | 3.18–3.39 |
+| `n2_nw2_pf8_rep2` | 8 | 3.176 s | 3.816 s | 3.16–3.23 |
+| `n2_nw2_rep2` | 2 | 3.368 s | 5.937 s | 3.19–3.91 |
+
+**The bracket is what makes this readable.** The two pf2 arms differ by 0.17 s
+and the two pf8 arms by 0.07 s — *within-allocation drift is larger than any
+treatment gap*, every IQR overlaps, and the ordering is A < B < B < A, which is
+drift's signature and not a treatment's. Judged on the first pair alone (3.194
+vs 3.246) one would have written down "pf8 is 1.6% slower"; judged on the middle
+pair, "pf8 is 2.2% faster". Both would have been noise. This is the third time
+the A/B/B/A bracket has earned its cost (`[[ab-window-truncation-trap]]`).
+
+**Why there is no effect:** `dataload` is **0.00 s in all four arms at both
+max-over-ranks and median-over-ranks**. With `nw=2` at 2 nodes the column is
+already empty, so a deeper queue has nothing to hide. Note the mean still spreads
+(3.82–5.94 s) — the tail lives in the mean while the median is clean, exactly as
+`[[dataload-tail-survives-at-1-node]]` describes — but pf8 does not move it.
+
+**Scope, and it matters.** This is 2 nodes, where the dataload column is empty
+to begin with. Per `[[scale-dependent-results-dont-transfer]]` it does **not**
+rule out prefetch depth mattering at 64n, where the tail is real. What it rules
+out is pf8 as a *cheap lever testable at small scale* — the small-scale test
+comes back null because the phenomenon isn't present there, which is a fact
+about the test, not about pf8 at scale.
