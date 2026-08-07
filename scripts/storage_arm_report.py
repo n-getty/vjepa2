@@ -131,6 +131,13 @@ PRIOR_FLOOR_CROSS_NODE = 0.165
 # than the plateau mean, and it is ~90% dataload, i.e. the storage cost itself.
 WARM_SPREAD = 0.094
 
+# Tiles per Aurora node. Used only to group ranks for the per-node split; if the
+# rank count is not a multiple of it the split is skipped rather than guessed.
+LOCAL_RANKS = 12
+# Within-node per-rank spread below this reads as "the whole node is slow
+# together" rather than "one rank is slow". Measured at ~1% on 8741855.
+NODE_TIGHT = 0.05
+
 ARMS = [
     ("n2_nw2", "daos-full", "opening anchor"),
     ("n2_nw2_staged_cap24", "staged-cap24", "tmpfs; agent+NIC out"),
@@ -266,7 +273,112 @@ def summarize(per, label):
     out["warm_excess"] = sum(max(0.0, v - floor_s) for v in it_all)
     out["warm_dload"] = sum(dl_all[:WARMUP_ITERS])
     out["warm_frac_dl"] = out["warm_dload"] / max(out["warm_excess"], 1e-9)
+
+    # ---- PER-NODE SPLIT of the last quarter.
+    #
+    # Every other statistic here is max-over-ranks, which by construction cannot
+    # tell a node-level resource apart from one unlucky rank. Job 8741855's
+    # staged arm needed exactly that distinction: its late iterations split
+    # cleanly 12/12 by node (fwd-target 2.23 vs 0.97 s, backward 2.50 vs 3.22 s)
+    # with the ranks INSIDE each node agreeing to ~1%. A per-rank spread that
+    # tight is a node-level cost, not an order statistic -- the opposite reading
+    # from [[dataload-tail-is-order-statistic]], and only visible if you group.
+    #
+    # WHICH node is slow ALTERNATES, so this is computed over the whole
+    # post-warmup window, not over a last-quarter snapshot. Read at itr 80-99
+    # only, 8741855's staged arm says "node 0 is slow"; at itr 60-69 it says
+    # node 1. A single window names a node; the run says neither is special.
+    # Hence the per-node means below are accompanied by an EPISODE COUNT --
+    # per iteration, which node (if any) is the fwd-target outlier.
+    #
+    # LOCAL_RANKS is the tiles-per-node assumption; the split is skipped rather
+    # than guessed if the rank count is not a clean multiple of it.
+    out["nodes"] = None
+    if nr % LOCAL_RANKS == 0 and nr > LOCAL_RANKS:
+        nn = nr // LOCAL_RANKS
+        groups = {nid: range(nid * LOCAL_RANKS, (nid + 1) * LOCAL_RANKS)
+                  for nid in range(nn)}
+        nodes = {}
+        for nid, rks in groups.items():
+            row = {}
+            for name in ("fwdt", "bwd", "dload"):
+                vals = [per[k][r][name] for k in post for r in rks if r in per[k]]
+                row[name] = st.mean(vals) if vals else float("nan")
+            # Within-node spread: small => the whole node moves together.
+            pr = [st.mean([per[k][r]["iter"] for k in post if r in per[k]])
+                  for r in rks]
+            pr = [v for v in pr if v == v]
+            row["iter"] = st.mean(pr) if pr else float("nan")
+            row["spread"] = ((max(pr) - min(pr)) / st.mean(pr)) if pr else float("nan")
+            av = [per[k][r]["avail"] for k in post for r in rks if r in per[k]]
+            row["avail"] = st.mean(av) if av else float("nan")
+            row["episodes"] = 0
+            nodes[nid] = row
+        # Per iteration: is one node's fwd-target materially above the others?
+        # That is the episode signature, and counting it per node shows whether
+        # a single node owns them or they rotate.
+        n_ep = 0
+        for k in post:
+            mu = {nid: st.mean([per[k][r]["fwdt"] for r in rks if r in per[k]])
+                  for nid, rks in groups.items()}
+            hi = max(mu, key=mu.get)
+            rest = [v for nid, v in mu.items() if nid != hi]
+            if rest and mu[hi] > 1.5 * st.mean(rest):
+                nodes[hi]["episodes"] += 1
+                n_ep += 1
+        out["nodes"] = nodes
+        out["n_episodes"] = n_ep
+        out["n_post"] = len(post)
     return out
+
+
+def node_split(ok):
+    """Print the per-node breakdown of each arm's last quarter.
+
+    Printed unconditionally, before any verdict, because it can overturn one: a
+    12/12 node-level split means the arm's max-over-ranks mean is pricing a node,
+    not the condition under test, and no amount of CI arithmetic on that mean
+    will say so.
+    """
+    any_split = False
+    for d, kind, _ in ARMS:
+        r = ok.get(d)
+        if not r or not r.get("nodes"):
+            continue
+        any_split = True
+        ep, npost = r.get("n_episodes", 0), r.get("n_post", 0)
+        print(f"\n  {d} ({kind}) -- per-node over the whole post-warmup window:")
+        print(f"    {'node':>5s}{'iter':>8s}{'fwdt':>8s}{'bwd':>8s}"
+              f"{'dload':>8s}{'availGiB':>10s}{'in-node':>9s}{'episodes':>10s}")
+        for nid, n in sorted(r["nodes"].items()):
+            tight = " uniform" if n["spread"] <= NODE_TIGHT else ""
+            print(f"    {nid:5d}{n['iter']:8.2f}{n['fwdt']:8.2f}{n['bwd']:8.2f}"
+                  f"{n['dload']:8.2f}{n['avail']:10.0f}"
+                  f"{100*n['spread']:8.1f}%{n['episodes']:10d}{tight}")
+        allt = all(n["spread"] <= NODE_TIGHT for n in r["nodes"].values())
+        if ep and allt:
+            owners = sum(1 for n in r["nodes"].values() if n["episodes"])
+            print(f"    ** NODE-SYNCHRONOUS: {ep}/{npost} iters have one node's"
+                  f" fwd-target >1.5x the rest,")
+            print(f"    ** and ranks within a node agree to <{100*NODE_TIGHT:.0f}%."
+                  f" A whole node is slow at once.")
+            if owners > 1:
+                print("    ** The slow node ROTATES across those episodes -- it is not"
+                      " a bad node, so")
+                print("    ** do NOT name one from a single window. (This is how the"
+                      " first read of")
+                print("    ** 8741855 went wrong: itr 80-99 said node 0, itr 60-69"
+                      " said node 1.)")
+            else:
+                print("    ** One node owns every episode in this arm. Worth checking"
+                      " against the")
+                print("    ** other arms before calling it a bad node -- they share"
+                      " the allocation.")
+    if any_split:
+        print("\n  A slow node shows up in fwdt on the node that IS slow and in bwd")
+        print("  on the others, which are waiting at the collective. Read the pair.")
+        print("  Note `iter` is near-identical across nodes by construction (they")
+        print("  synchronize every step) -- only the phase split names the source.")
 
 
 def warmup_only(ok):
@@ -357,6 +469,7 @@ def main():
               f"{r['warm_excess']:9.0f}{100*r['warm_frac_dl']:6.0f}")
 
     ok = {d: r for d, r in res.items() if r and not r.get("partial")}
+    node_split(ok)
 
     # ---- the noise floor, before any comparison
     a1, a4 = ok.get("n2_nw2"), ok.get("n2_nw2_rep2")
