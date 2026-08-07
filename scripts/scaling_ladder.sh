@@ -61,6 +61,27 @@
 #   L3: qsub -l select=64 -v VJEPA_LADDER_RUNGS="16 64 16:nw2" scripts/scaling_ladder.sh
 #   L4: qsub -q debug -l select=1 \
 #         -v VJEPA_LADDER_RUNGS="1:prof1 1:nw2:prof1" scripts/scaling_ladder.sh
+#   L5: qsub -l select=64 -v VJEPA_LADDER_RUNGS="1:nw2 64:nw2 64 64:nw2:cfgvitG384_lbA_g16" \
+#         scripts/scaling_ladder.sh
+#
+# L5 carries three separate questions in one allocation, in the order that makes
+# each one answerable:
+#   - `1:nw2` is the RE-ANCHOR. The ladder's 100% reference does not reproduce
+#     (memory 1n-anchor-does-not-reproduce: two identical 1n nw=0 rungs differ 2x
+#     with an identical compute floor). Any efficiency-vs-1n figure needs its 1n
+#     measured in the SAME allocation as the rung it divides; cross-job 8n agreed
+#     to 7.8% but cross-job 1n does not. Cheap, and it goes first so a later hang
+#     cannot cost it.
+#   - `64:nw2` is the HAZARD ARM and the last gate on nw>0 as a default. The
+#     xccl-fork deadlock (train.py:207-211) is O(ranks), so the 1n and 8n passes
+#     do not transfer (memory scale-dependent-results-dont-transfer). A HANG IS A
+#     RESULT here, not a failure -- it is the answer to whether nw>0 can ship.
+#   - `64` (nw=0) is its in-allocation control, so the nw pair is same-nodes,
+#     same-fabric-hour. It runs AFTER the hazard arm on purpose: if the hazard
+#     arm hangs it burns its watchdog deadline, and the control is the cheaper
+#     thing to lose.
+#   - `64:nw2:cfg...g16` is the CORPUS arm, paired against `64:nw2` on the same
+#     nodes. It is last because it is the only rung whose result is optional.
 #
 # L4 is the TAIL rung pair and needs only ONE node -- the >ceiling dataload
 # draws are present at 1n, so node count buys nothing here and the cheap queue
@@ -74,9 +95,16 @@
 # do not have overlapping IQRs, the ladder is measuring its own barrier and the
 # design needs revising before the L1-L3 debug-scaling slots are spent.
 #
-# A rung is <nodes>[:nw<N>][:probe<0|1>], fields in any order. Unknown fields are
-# rejected, not ignored -- a typo'd arm that silently ran the default config would
-# be indistinguishable from a real null result.
+# A rung is <nodes>[:nw<N>][:probe<0|1>][:prof<0|1>][:cfg<NAME>], fields in any
+# order. Unknown fields are rejected, not ignored -- a typo'd arm that silently
+# ran the default config would be indistinguishable from a real null result.
+#
+# `:cfg<NAME>` names a config under configs/vitg16_surg_vid_webdataset_single4/
+# and exists for CORPUS arms (e.g. the g16 re-encode), which cannot be expressed
+# as an env knob. It only tags the rung dir when it differs from the job's
+# config, so every existing rung name is unchanged. Remember that a cfg arm may
+# move more than the corpus -- vitG384_lbA_g16 also downscales sitl_2026 to
+# short-side 512 -- so read the config header before attributing its delta.
 #
 # 16n repeats in all three as a CROSS-JOB ANCHOR. It is the only thing that can
 # detect fabric drift between allocations; if the anchor moves by more than its
@@ -188,6 +216,34 @@ RUNTIME_CFG=$($PY $ROOT/scripts/prepare_runtime_config.py \
 [ -r "$RUNTIME_CFG" ] || { echo "FATAL: runtime cfg missing: '$RUNTIME_CFG'"; exit 1; }
 echo "runtime cfg: $RUNTIME_CFG"
 
+# Per-rung config override (`:cfg<NAME>`), memoized. Exists for CORPUS arms: the
+# g16 re-encode is a change to the data, not to a knob, so it can only be A/B'd
+# by swapping the config -- and a corpus A/B across two jobs is not a corpus A/B,
+# it is a fabric-hour measurement (scripts/ccl_knob_sweep.sh:37-42). Same rule
+# that makes every other arm here serial-within-one-allocation.
+#
+# Memoized because prepare_runtime_config.py writes a file and the answer depends
+# only on (name, NNODES, PPN); calling it per rung would rewrite the same path
+# while a previous rung's params.yaml was copied from it. Copy-at-rung-start is
+# what makes that safe today, but the cache removes the hazard entirely.
+declare -A _RTCFG_CACHE
+_RTCFG_CACHE[$CFG_NAME]=$RUNTIME_CFG
+runtime_cfg_for () {
+    local n=$1
+    if [ -z "${_RTCFG_CACHE[$n]+x}" ]; then
+        local base=$ROOT/configs/vitg16_surg_vid_webdataset_single4/${n}.yaml
+        [ -r "$base" ] || { echo "FATAL: no such config: $base" >&2; return 1; }
+        local out
+        out=$($PY $ROOT/scripts/prepare_runtime_config.py \
+              $base --root $ROOT --num-gpus $PPN --num-nodes $NNODES --weak-scale | tail -n1) \
+            || { echo "FATAL: prepare_runtime_config failed for $n" >&2; return 1; }
+        [ -r "$out" ] || { echo "FATAL: runtime cfg missing for $n: '$out'" >&2; return 1; }
+        _RTCFG_CACHE[$n]=$out
+        echo "runtime cfg [$n]: $out" >&2
+    fi
+    printf '%s' "${_RTCFG_CACHE[$n]}"
+}
+
 # Per-rung stall watchdog. Same shape as vitG384_256n_daos.sh:297-331, but scoped
 # to ONE rung: it must not outlive its rung or it would kill the next one, so it
 # is started before mpiexec and killed after.
@@ -252,6 +308,7 @@ run_rung () {
     # forward's first FSDP all-gather), but if it is not, the ladder is measuring
     # the probe. Run `16 16:probe0` in one allocation and require overlapping IQRs.
     local R="${spec%%:*}" nw="$VJEPA_NUM_WORKERS" probe="$VJEPA_SCALE_PROBE" prof=0
+    local cfg="$CFG_NAME"
     local rest="${spec#*:}" fld
     if [ "$rest" != "$spec" ]; then
         local IFS=:
@@ -260,11 +317,16 @@ run_rung () {
                 nw*)    nw="${fld#nw}" ;;
                 probe*) probe="${fld#probe}" ;;
                 prof*)  prof="${fld#prof}" ;;
+                cfg*)   cfg="${fld#cfg}" ;;
                 *) echo "  rung $spec: unknown field '$fld'"; return 1 ;;
             esac
         done
     fi
     local name="n${R}_nw${nw}"
+    # Only tag the dir when the rung departs from the job's config, so existing
+    # rung-dir names (and scripts/scaling_efficiency.py --ladder discovery, which
+    # infers ranks from the n<R> prefix) are unchanged for every non-corpus arm.
+    [ "$cfg" = "$CFG_NAME" ] || name="${name}_${cfg}"
     [ "$probe" = "1" ] || name="${name}_probe${probe}"
     # prof<0|1>: per-source decode/gap profiling (src/datasets/webdataset.py).
     # This exists because the tail has outgrown the explanation we had for it.
@@ -312,7 +374,9 @@ run_rung () {
         [ "${ov%%=*}" = "$spec" ] && ipe="${ov##*=}"
     done
 
-    cp "$RUNTIME_CFG" "$params" || return 1
+    local rtcfg
+    rtcfg=$(runtime_cfg_for "$cfg") || { echo "  rung $spec: config resolve FAILED"; return 1; }
+    cp "$rtcfg" "$params" || return 1
     $PY - "$params" "$dir" "$ipe" <<'PY'
 import sys, yaml
 p, d, ipe = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -333,7 +397,7 @@ yaml.safe_dump(c, open(p, "w"), sort_keys=False)
 PY
     [ $? -eq 0 ] || { echo "  rung $spec: config rewrite FAILED"; return 1; }
 
-    echo "===== RUNG $name : ${R}n x ${PPN} = ${W} ranks, ipe=$ipe, num_workers=$nw, scale_probe=$probe ====="
+    echo "===== RUNG $name : ${R}n x ${PPN} = ${W} ranks, ipe=$ipe, num_workers=$nw, scale_probe=$probe, cfg=$cfg ====="
     # Sets RUNG_WD_PID -- see the note on start_rung_watchdog for why this must
     # not be a command substitution. Verify it armed: a silently-dead watchdog is
     # exactly the failure that cost job 8739712 half its slot, and it is
