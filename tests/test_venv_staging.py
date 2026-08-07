@@ -198,6 +198,60 @@ def test_staging_is_bounded_and_disableable():
     )
 
 
+def test_the_package_list_reaches_every_node_not_just_the_head_one():
+    """Job 8742102, caught in flight, and the most expensive kind of bug: it made
+    the two nodes of an A/B differ while the log looked clean.
+
+    The launcher wrote the closure to $JOBTMP/pkgs.txt. $JOBTMP is /tmp, which is
+    node-local tmpfs, so only the head node could read it. Node 1 hit the
+    `[ -r "$MANIFEST" ]` guard, fell through to the built-in package list, and
+    staged 19462 files against node 0's 22933. The only trace was one line
+    reading "no manifest" and a file count nobody was comparing.
+
+    Putting the manifest on Lustre would fix visibility by restoring the
+    dependency this whole change removes, so the list travels in the environment.
+    """
+    src = open(LADDER).read()
+    assert "export VJEPA_VENV_PKGS=" in src, (
+        "the package list must travel in the environment; a file under $JOBTMP "
+        "is node-local and silently reaches only the head node"
+    )
+    assert 'VJEPA_VENV_MANIFEST=$JOBTMP' not in src, (
+        "$JOBTMP is tmpfs -- a manifest path there is unreadable on every other node"
+    )
+    stager = open(STAGER).read()
+    assert "PKGS=${VJEPA_VENV_PKGS:-}" in stager
+    assert 'printf \'%s\\n\' $PKGS > "$TMP.manifest"' in stager
+
+
+def test_env_package_list_actually_stages(tmp_path):
+    """End-to-end on the env channel: the fix above is only worth anything if the
+    stager consumes it, and the failure mode it replaces was a silent fallback."""
+    site = tmp_path / "venv" / "lib" / "python3.12" / "site-packages"
+    (site / "alpha").mkdir(parents=True)
+    (site / "alpha" / "__init__.py").write_text("pass\n")
+    (site / "beta.py").write_text("pass\n")
+    dest = tmp_path / "stage"
+
+    env = dict(os.environ)
+    env.update(
+        VJEPA_VENV=str(tmp_path / "venv"),
+        VJEPA_VENV_PKGS="alpha beta.py",
+        VJEPA_VENV_LOCAL=str(dest),
+        VJEPA_REPO_ROOT=REPO,
+    )
+    env.pop("VJEPA_VENV_MANIFEST", None)
+    r = subprocess.run(
+        ["bash", STAGER], capture_output=True, text=True, env=env, timeout=900
+    )
+    assert r.returncode == 0
+    assert "no manifest" not in r.stdout, (
+        f"the env list was ignored and the built-in fallback ran: {r.stdout!r}"
+    )
+    assert (dest / "alpha" / "__init__.py").is_file(), r.stdout
+    assert (dest / "beta.py").is_file(), r.stdout
+
+
 def test_missing_manifest_entries_are_dropped_and_counted():
     """A manifest/venv mismatch must be loud and survivable.
 

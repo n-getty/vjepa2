@@ -312,9 +312,22 @@ if [ "${VJEPA_LADDER_STAGE_VENV:-1}" = "1" ]; then
     # a manifest generated against the wrong tree names packages that do not
     # exist under $SITE, and rsync would then stage a subset without saying so.
     # The closure must be captured by the interpreter that will run the trainer.
+    #
+    # Through the ENVIRONMENT, not a file. $JOBTMP is /tmp -- node-local tmpfs
+    # ([[aurora-tmp-is-tmpfs]]) -- so a manifest written there is invisible to
+    # every node but the head one. Job 8742102 did exactly that: node 0 staged
+    # 22933 files from the real closure while node 1 fell back to the built-in
+    # guess and staged 19462, and the only sign was one line reading
+    # "no manifest" in a log that otherwise looked clean. The two nodes of an A/B
+    # ran with different staged trees.
+    #
+    # Lustre would fix the visibility and reintroduce the dependency this whole
+    # change exists to remove. 156 package names is ~2 KB, well inside any
+    # argv/env limit, so the env carries it with no filesystem involved at all.
     if python $ROOT/scripts/gen_import_closure.py --out "$JOBTMP/pkgs.txt" 2>/dev/null \
        && [ -s "$JOBTMP/pkgs.txt" ]; then
-        export VJEPA_VENV_MANIFEST=$JOBTMP/pkgs.txt
+        export VJEPA_VENV_PKGS=$(tr '\n' ' ' < "$JOBTMP/pkgs.txt")
+        echo "  import closure: $(wc -l < "$JOBTMP/pkgs.txt") packages (via env, ${#VJEPA_VENV_PKGS} bytes)"
     else
         echo "  closure generation failed -- stager will use its built-in package list"
     fi

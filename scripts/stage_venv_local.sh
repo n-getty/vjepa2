@@ -66,6 +66,7 @@ VENV=${VJEPA_VENV:-/flare/ModCon/ngetty/venvs/torchtune-pt213-xpu}
 SITE=$VENV/lib/python3.12/site-packages
 DEST=${VJEPA_VENV_LOCAL:-/tmp/vjepa_venv}
 MANIFEST=${VJEPA_VENV_MANIFEST:-}
+PKGS=${VJEPA_VENV_PKGS:-}
 VJEPA_REPO_ROOT=${VJEPA_REPO_ROOT:-/lus/flare/projects/ModCon/ngetty/vjepa2}
 HOST=$(hostname -s)
 
@@ -94,7 +95,18 @@ t0=$(date +%s)
 # closure is known to be dominated by. The fallback is deliberately a SUBSET and
 # not "everything": staging the whole 5.2 GB tree into RAM to save 45 s is the
 # wrong trade, and sys.path fallback makes a subset correct.
-if [ -n "$MANIFEST" ] && [ -r "$MANIFEST" ]; then
+if [ -n "$PKGS" ] || { [ -n "$MANIFEST" ] && [ -r "$MANIFEST" ]; }; then
+    # $VJEPA_VENV_PKGS (space-separated, from the environment) is the primary
+    # channel and $VJEPA_VENV_MANIFEST (a path) the fallback. The env wins
+    # because a manifest FILE has to live somewhere every node can read: /tmp is
+    # node-local so only the head node sees it, and Lustre is the dependency
+    # being removed. Job 8742102 shipped the manifest via /tmp and node 1
+    # silently used the built-in list -- 19462 files staged against node 0's
+    # 22933, with the two nodes of an A/B on different trees.
+    if [ -n "$PKGS" ]; then
+        printf '%s\n' $PKGS > "$TMP.manifest"
+        MANIFEST=$TMP.manifest
+    fi
     # A DIRECTORY list, not a file list: see the header. Names are appended to
     # $SITE/ here rather than in the manifest so the manifest stays venv-agnostic.
     #
@@ -120,7 +132,7 @@ if [ -n "$MANIFEST" ] && [ -r "$MANIFEST" ]; then
     #     nothing inside them. Measured: 0 files without -r, 2 with.
     rsync -a -r --files-from="$TMP.pkgs" "$SITE/" "$TMP/" 2>&1 | tail -3
     rc=$?
-    rm -f "$TMP.pkgs"
+    rm -f "$TMP.pkgs" "$TMP.manifest"
 else
     say "no manifest -- staging the measured dominant packages"
     rsync -a "$SITE"/{triton,torch,numpy,numpy.libs,sympy,timm,PIL,pillow.libs,yaml,torchvision,torchvision.libs,mpmath,cv2,opencv_python_headless.libs,decord,decord.libs} \

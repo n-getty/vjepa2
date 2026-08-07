@@ -2522,16 +2522,56 @@ prepend is doing what it claims. Two caveats that keep this honest:
   stall is a rare transient; the claim available is "the known mechanism is
   removed by construction", not "demonstrated fixed".
 
-**Staging is not free and can be a net loss.** The pass measured **49 s** for
-4463 MB on a login node (an earlier attempt on a busier one took 392 s). Against
-~45 s of import per rung it pays for itself after roughly the first rung at the
-49 s rate — but at the 392 s rate it needs ~9 rungs, and it is immediately worth
-it only against the 900 s pathological case. The ladder therefore reports the
-real elapsed time every job rather than assuming either number, bounds the pass
-at `timeout 900`, and keeps it switchable with `VJEPA_LADDER_STAGE_VENV=0` —
-`/tmp` is RAM (`[[aurora-tmp-is-tmpfs]]`) and 4.5 GB/node of it competes with
-page cache, which the dataload-tail work has already shown is not a free
-resource. If a ladder result ever moves when that flag does, that is a finding.
+**On real compute nodes (job 8742102, 2n), both halves came out different from
+the login-node estimate — one much better, one much worse.**
+
+| | login node (warm) | compute node 8742102 |
+|---|---|---|
+| stage 4.4 GB | 49 s | **417 s** |
+| import per rank | 9.6 s → 4.4 s | **2–5 s** (was 39–53 s) |
+
+The benefit is *larger* than predicted: measured `Running pre-training of app`
+→ first trainer log line across ranks 0/12/23 is **2 s, 5 s, 3 s**, against
+39–53 s on the four unstaged arms. The import essentially disappeared, which is
+what the 0-Lustre-fallback measurement predicted and is a bigger effect than the
+login-node A/B suggested — because the login node was page-cache warm and a
+fresh compute node is not.
+
+The cost is also larger, and it dominates: **417 s of staging to save ~45 s per
+rung.** On this 4-rung job that is a straight **net loss of ~240 s**, ~7% of a
+1 h slot. Break-even is ~9 rungs. The honest summary is:
+
+- **worth it** for the pathological case it was built for — one 900 s+ import
+  stall costs more than the whole staging pass, and the mechanism is removed
+  rather than made less likely;
+- **not worth it** as a throughput optimization on short jobs, which is most of
+  the ladder's use;
+- and the 8.5× gap between the login-node and compute-node staging times means
+  the login-node figure should not be used to predict anything. Both nodes took
+  416/417 s, so this is not a straggler — it is what writing 4.4 GB from Lustre
+  to tmpfs costs there.
+
+Left ON by default because losing an allocation is worse than losing 4 minutes
+of it, but the flag matters: `VJEPA_LADDER_STAGE_VENV=0` for short jobs where the
+import is behaving. The pass is bounded at `timeout 900` — note 417 s is already
+half that budget. `/tmp` is RAM (`[[aurora-tmp-is-tmpfs]]`) and 4.5 GB/node of it
+competes with page cache, which the dataload-tail work has shown is not free, so
+the flag is also the A/B for that. If a ladder result moves when it does, that is
+a finding.
+
+**A silent per-node divergence, caught in flight and worth recording.** The
+launcher first shipped the package list as a file under `$JOBTMP`. `$JOBTMP` is
+`/tmp` — node-local tmpfs — so only the head node could read it. Node 1 hit the
+`[ -r "$MANIFEST" ]` guard, fell through to the built-in package list, and staged
+**19462 files against node 0's 22933**. The two nodes of an A/B ran on different
+staged trees, and the only trace in a clean-looking log was one line reading
+`no manifest`. Fixed by passing the list through the **environment**
+(`VJEPA_VENV_PKGS`, ~2 KB) rather than any filesystem: Lustre would have fixed
+visibility by restoring the dependency this change exists to remove. Two tests
+cover it, both mutation-verified. The general lesson is the one
+`[[aurora-tmp-is-tmpfs]]` keeps teaching — **anything written to `/tmp` in a
+multi-node launcher is invisible to every other node**, and a fallback path that
+"works" is how that stays hidden.
 2. Drop the dead `import torchvision` from `masks_dist.py`. Cheap and correct
    regardless, but it only reorders when the cost is paid.
 3. `PYTHONDONTWRITEBYTECODE` is *not* the issue — all 50 `.pyc` files are
