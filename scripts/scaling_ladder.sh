@@ -497,8 +497,53 @@ PY
     return 0
 }
 
+# Job-level soft deadline. The per-rung watchdogs above catch a HUNG rung; they
+# do not catch the ordinary case of the rungs simply being slower than budgeted,
+# which ends with PBS hard-killing whichever rung is running when the wall
+# expires ([[soft-deadline-watchdog-required-for-self-resubmit]]).
+#
+# That failure is not symmetric across rungs, and that is why it needs handling
+# rather than accepting. Sweeps here are bracketed A/B/B/A so the CLOSING anchor
+# measures the allocation's own drift -- and the closing anchor is precisely the
+# arm a wall-clock kill deletes. Losing it does not cost one arm out of four; it
+# costs the noise floor, and without the floor no delta in the run can be called
+# ([[1n-anchor-does-not-reproduce]]).
+#
+# So: skip a rung we cannot finish, and say so loudly. A skipped-and-logged arm
+# is a known gap; a truncated one silently reports fewer iterations from a
+# different part of the run.
+JOB_START=$(date +%s)
+# Wall in seconds from the #PBS directive, so the two cannot drift apart.
+JOB_WALL_S=${VJEPA_LADDER_JOB_WALL_S:-$(awk -F'walltime=' '/^#PBS -l walltime=/{split($2,t,":"); print t[1]*3600+t[2]*60+t[3]; exit}' "$0")}
+JOB_WALL_S=${JOB_WALL_S:-3600}
+# Reserve: the tail of the last rung (checkpoint save + teardown) plus the
+# LADDER COMPLETE block. Measured rung teardown is under 2 min; 300 s is slack.
+JOB_RESERVE_S=${VJEPA_LADDER_JOB_RESERVE_S:-300}
+
+rung_i=0
+n_rungs=$(echo $RUNGS | wc -w)
+prev_rung_s=0
 for spec in $RUNGS; do
+    rung_i=$((rung_i+1))
+    left=$(( JOB_WALL_S - JOB_RESERVE_S - ($(date +%s) - JOB_START) ))
+    # Budget from the PREVIOUS rung's measured wall, not from ipe x an assumed
+    # s/iter -- rung wall includes 350-500 s of rendezvous startup, and the
+    # whole point of this study is that s/iter is not known in advance.
+    if [ "$prev_rung_s" -gt 0 ] && [ "$left" -lt "$prev_rung_s" ]; then
+        echo
+        echo "  SKIP rung $spec ($rung_i of $n_rungs): ${left}s left, previous rung took ${prev_rung_s}s."
+        echo "       Skipped deliberately rather than started and hard-killed by PBS."
+        if [ "$rung_i" -eq "$n_rungs" ]; then
+            echo "       *** THIS WAS THE CLOSING ANCHOR. The sweep has no measured noise"
+            echo "       *** floor, so tail_arm_compare.py will refuse to rank the arms."
+            echo "       *** Re-run with fewer rungs or a lower ipe; do not read the"
+            echo "       *** remaining arms as a result."
+        fi
+        continue
+    fi
+    t_rung=$(date +%s)
     run_rung "$spec"
+    prev_rung_s=$(( $(date +%s) - t_rung ))
 done
 
 echo
