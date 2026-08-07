@@ -130,7 +130,7 @@
 # s/iter (loss from this ladder is meaningless anyway) but it must be stated.
 #
 # A rung is
-# <nodes>[:nw<N>][:probe<0|1>][:prof<0|1>][:cfg<NAME>][:omp<N>][:store<daos|staged>][:cap<N>],
+# <nodes>[:nw<N>][:pf<N>][:probe<0|1>][:prof<0|1>][:cfg<NAME>][:omp<N>][:store<daos|staged>][:cap<N>],
 # fields in any order. Unknown fields are rejected, not ignored -- a typo'd arm
 # that silently ran the default config would be indistinguishable from a real
 # null result.
@@ -145,6 +145,19 @@
 # (tests/datasets/test_shard_cap.py pins that agreement). Either field forces
 # WDS_LOCAL_SLICING=1, because both give each node a different subset.
 # NEVER use cap on a training run: it sees a fixed prefix of every source.
+#
+# `:pf<N>` sets VJEPA_PREFETCH_FACTOR -- batches each worker queues ahead
+# (webdataset.py:993, default 2). It exists to test the one mechanism the tail
+# analysis names but has never varied: nw=2 does not remove the tail, it makes
+# it RARER (5.35x median vs 1.96x wall at 8n), because "a stall deeper than the
+# prefetch queue stalls the step no matter who is reading". Queue depth is that
+# depth. Prediction if the story is right: deeper queue absorbs deeper stalls,
+# so total wall improves while the median barely moves. A null says the tail
+# stalls are longer than any affordable queue, which is itself informative and
+# closes the lever. It is IGNORED at nw=0 (DataLoader rejects the kwarg with no
+# workers) -- pf without nw>0 is rejected rather than silently dropped.
+# COST: queue depth is memory. Each worker holds pf batches of decoded clips, so
+# node RAM scales nw x pf x bs, on a node whose /tmp is already RAM.
 #
 # `:omp<N>` sets OMP_NUM_THREADS and the mpiexec --depth together (see run_rung).
 # It exists for the CPU-oversubscription arm: the default 16 threads x 12 ranks
@@ -242,6 +255,15 @@ export LOCAL_WORLD_SIZE=$PPN
 # (104 cores x 2 HT) into every job script, so a `:-` default silently never
 # fires; that is the bug this whole line exists to have caught.
 LADDER_OMP_DEFAULT=$OMP_NUM_THREADS
+# Prefetch queue depth. Resolved and EXPORTED here rather than left to the
+# loader's internal default, for the same reason as omp above: a rung's `:pf<N>`
+# field must be comparable against a value this script knows, not against one
+# buried in webdataset.py that could drift. The 2 mirrors that loader default
+# (src/datasets/webdataset.py:993) and tests/test_ladder_rung_spec.py pins the
+# two together, so a change on either side fails a test instead of silently
+# retagging every rung.
+export VJEPA_PREFETCH_FACTOR=${VJEPA_PREFETCH_FACTOR:-2}
+LADDER_PF_DEFAULT=$VJEPA_PREFETCH_FACTOR
 export VJEPA_TRUE_ACCUM=${VJEPA_TRUE_ACCUM:-1}
 export VJEPA_SCALE_PROBE=1          # the point of this job
 export VJEPA_ITER_WATCHDOG_S=${VJEPA_ITER_WATCHDOG_S:-600}
@@ -371,6 +393,7 @@ run_rung () {
     # the probe. Run `16 16:probe0` in one allocation and require overlapping IQRs.
     local R="${spec%%:*}" nw="$VJEPA_NUM_WORKERS" probe="$VJEPA_SCALE_PROBE" prof=0
     local cfg="$CFG_NAME" omp="$LADDER_OMP_DEFAULT" store=daos cap=0
+    local pf="$LADDER_PF_DEFAULT"
     local rest="${spec#*:}" fld
     if [ "$rest" != "$spec" ]; then
         # Split on ':' by SUBSTITUTION, not by setting IFS.
@@ -391,6 +414,7 @@ run_rung () {
         for fld in "$@"; do
             case "$fld" in
                 nw*)    nw="${fld#nw}" ;;
+                pf*)    pf="${fld#pf}" ;;
                 probe*) probe="${fld#probe}" ;;
                 prof*)  prof="${fld#prof}" ;;
                 cfg*)   cfg="${fld#cfg}" ;;
@@ -413,6 +437,20 @@ run_rung () {
     # narrower span even harder. Tagged only when it departs from the default so
     # existing rung-dir names are unchanged.
     [ "$omp" = "$LADDER_OMP_DEFAULT" ] || name="${name}_omp${omp}"
+    # pf<N>: prefetch queue depth. Reject rather than silently drop at nw=0 --
+    # DataLoader takes no prefetch_factor without workers (webdataset.py:993
+    # makes the kwarg conditional for exactly that reason), so a `1:nw0:pf4`
+    # rung would run as a plain nw0 rung under a name promising otherwise, and
+    # would then read as a null for the lever.
+    if [ "$pf" != "$LADDER_PF_DEFAULT" ]; then
+        if [ "$nw" = "0" ]; then
+            echo "  rung $spec: pf${pf} requires nw>0 (DataLoader ignores"
+            echo "          prefetch_factor at num_workers=0); refusing to run an"
+            echo "          arm whose name would not describe what it ran."
+            return 1
+        fi
+        name="${name}_pf${pf}"
+    fi
     # store/cap: the two fields of the staged-vs-DAOS arm. Both tag the dir so
     # a capped arm can never be mistaken for a full-corpus one at analysis time
     # -- a capped run reads a fixed subset of every source, so its loss and its
@@ -543,7 +581,7 @@ PY
         echo "  staging done in $(( $(date +%s) - t_stage ))s"
     fi
 
-    echo "===== RUNG $name : ${R}n x ${PPN} = ${W} ranks, ipe=$ipe, num_workers=$nw, scale_probe=$probe, cfg=$cfg, omp=$omp, store=$store, cap=$cap, local_slicing=$slicing ====="
+    echo "===== RUNG $name : ${R}n x ${PPN} = ${W} ranks, ipe=$ipe, num_workers=$nw, prefetch=$pf, scale_probe=$probe, cfg=$cfg, omp=$omp, store=$store, cap=$cap, local_slicing=$slicing ====="
     # Sets RUNG_WD_PID -- see the note on start_rung_watchdog for why this must
     # not be a command substitution. Verify it armed: a silently-dead watchdog is
     # exactly the failure that cost job 8739712 half its slot, and it is
@@ -565,6 +603,7 @@ PY
     MASTER_PORT=$(( PORT_BASE + R )) \
     WORLD_SIZE=$W \
     VJEPA_NUM_WORKERS=$nw \
+    VJEPA_PREFETCH_FACTOR=$pf \
     VJEPA_SCALE_PROBE=$probe \
     VJEPA_DECODE_PROFILE=$prof \
     VJEPA_DECODE_PROFILE_EVERY=${VJEPA_DECODE_PROFILE_EVERY:-40} \
