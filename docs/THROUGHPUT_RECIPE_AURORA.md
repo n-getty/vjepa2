@@ -2333,3 +2333,61 @@ in the same allocation opened at **999 GiB** MemAvailable where the first had
 just floored at 228 GiB. The ~690 GiB is released on process exit, so it does
 not need a fresh allocation — and every rung therefore starts from a cold cache
 and re-pays the warmup tail.
+
+### Archive screen: the fwd-context episodes are node-attached, but the node is not the whole story
+
+`scripts/cross_node_episode_screen.py` applied to every archived multi-node
+ladder arm with ≥25 post-warmup iterations. It groups ranks by `rank//12`,
+validates that grouping against the hang-watchdog's `host=` field, and reports
+which node's ranks hold the argmax on each episodic iteration. It deliberately
+does **not** report coincidence: above 1 node the HSDP all-gather inside forward
+makes co-occurrence automatic whatever the cause, so a shared-vs-independent
+verdict from these arms would be an artifact of coupling.
+
+| job | arm | iters | episodic iters | top node | share | verdict |
+|---|---|---|---|---|---|---|
+| 8741594 | `n16_nw2` | 46 | 3 (6.5%) | 0 `x4514c3s6b0n0` | 100% | too few to call |
+| 8741594 | `n16_nw2_vitG384_lbA_g16` | 46 | **0** | — | — | none |
+| 8741594 | `n16_nw2_rep2` | 46 | 7 (15.2%) | 0 `x4514c3s6b0n0` | 100% | CONCENTRATED |
+| 8741490 | `n16_nw2` | 46 | 1 (2.2%) | 3 | 100% | too few to call |
+| 8741490 | `n16_nw2_rep2` | 46 | 1 (2.2%) | 12 | 100% | too few to call |
+| 8741386 | `n16_nw2` | 38 | **20 (52.6%)** | 12 | 25% | **SPREAD** |
+| 8740311 | `n16_nw0` | 31 | 0 | — | — | none |
+
+**Two distinct signatures, and job 8741594 is the informative one.** Its three
+arms ran serially in one allocation on the same 16 nodes — rank 0 is
+`x4514c3s6b0n0` in all three, verified from `rank.0.out`. Yet the episode rate
+went 6.5% → 0% → 15.2%, and in both arms that had episodes, **100% of them sat
+on node 0**. Same node, same hour, same neighbours, rates differing by 15
+points. So:
+
+* **within an allocation the episodes attach to one node** — 10/10 episodic
+  iterations across the two arms picked node 0, where uniform would be 6.2%;
+* **but node identity does not predict whether an arm has them at all** — the
+  middle arm, on that same node 0, had zero.
+
+The per-node mean `fwdc` says the same thing quietly: node 0 runs 1102 / 1033 /
+1210 ms across the three arms against a node-1 baseline of 1055 / 1039 / 1045
+ms. Node 1 is flat to 1.5%; node 0 moves 17%. Whatever the episodes are, they
+are a property of *that node during that arm*, not of the node permanently and
+not of the fabric globally.
+
+The middle arm is the `g16` corpus arm, so its zero is confounded with the
+corpus change and cannot be read as "the episodes stopped on their own".
+
+**Job 8741386's `n16_nw2` is the counter-shape:** 52.6% of iterations episodic
+with **all 15 non-head nodes** firing at rates 0.053–0.158 and the top node
+holding only 25%. That is not one bad node. Whether it is a rotating node-local
+effect or a genuinely global one cannot be settled from the rate column alone.
+
+Note also that 8741386's 16n arm is the *second* rung of a `1:nw2 16:nw2 64:nw2`
+job while 8741594's arms are 1st/2nd/3rd of a 16n job — rung position and
+allocation both differ, so the CONCENTRATED-vs-SPREAD contrast is between jobs
+and carries the usual fabric-hour confound.
+
+**What this does and does not license.** It is a screen, not a verdict. The
+open question (#29) — *are the episodes node-local?* — still needs the
+uncoupled test it was written for: two concurrent 1n sub-worlds (`1:node0
+1:node1`) in one allocation, where neither rung's forward can wait on the
+other's and coincidence therefore means something. The archive can show
+concentration; it cannot show independence.
