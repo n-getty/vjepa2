@@ -187,6 +187,16 @@ export PYTHONPATH=$ROOT:$PYTHONPATH
 # Overrides go BELOW the source.
 source $ROOT/scripts/lib/aurora_hsdp_env.sh
 export LOCAL_WORLD_SIZE=$PPN
+# Read AFTER the source, so an omp-less rung uses whatever the recipe resolved
+# rather than a second, independently-drifting default. Captured into its own
+# variable because a rung's `:omp<N>` field overwrites OMP_NUM_THREADS in the
+# rung's env -- comparing against the live variable would then make every rung
+# look like the default and suppress the _omp<N> dir tag.
+#
+# Do NOT write this as ${OMP_NUM_THREADS:-16}. PBS exports OMP_NUM_THREADS=208
+# (104 cores x 2 HT) into every job script, so a `:-` default silently never
+# fires; that is the bug this whole line exists to have caught.
+LADDER_OMP_DEFAULT=$OMP_NUM_THREADS
 export VJEPA_TRUE_ACCUM=${VJEPA_TRUE_ACCUM:-1}
 export VJEPA_SCALE_PROBE=1          # the point of this job
 export VJEPA_ITER_WATCHDOG_S=${VJEPA_ITER_WATCHDOG_S:-600}
@@ -315,7 +325,7 @@ run_rung () {
     # forward's first FSDP all-gather), but if it is not, the ladder is measuring
     # the probe. Run `16 16:probe0` in one allocation and require overlapping IQRs.
     local R="${spec%%:*}" nw="$VJEPA_NUM_WORKERS" probe="$VJEPA_SCALE_PROBE" prof=0
-    local cfg="$CFG_NAME" omp="${OMP_NUM_THREADS:-16}"
+    local cfg="$CFG_NAME" omp="$LADDER_OMP_DEFAULT"
     local rest="${spec#*:}" fld
     if [ "$rest" != "$spec" ]; then
         # Split on ':' by SUBSTITUTION, not by setting IFS.
@@ -355,7 +365,7 @@ run_rung () {
     # leaves the binding unchanged and lowering --depth alone oversubscribes the
     # narrower span even harder. Tagged only when it departs from the default so
     # existing rung-dir names are unchanged.
-    [ "$omp" = "${OMP_NUM_THREADS:-16}" ] || name="${name}_omp${omp}"
+    [ "$omp" = "$LADDER_OMP_DEFAULT" ] || name="${name}_omp${omp}"
     # prof<0|1>: per-source decode/gap profiling (src/datasets/webdataset.py).
     # This exists because the tail has outgrown the explanation we had for it.
     # The sparse-keyframe finding reproduces the BODY of the per-rank dataload

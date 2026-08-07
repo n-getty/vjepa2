@@ -61,7 +61,20 @@ export PYTHONFAULTHANDLER=1
 # already export TMPDIR=/tmp. /tmp on Aurora compute is a 504 G node-local
 # tmpfs, so nothing is lost by moving off the PBS dir.
 export TMPDIR=/tmp
-export OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
+# NOT `${OMP_NUM_THREADS:-16}`. PBS exports OMP_NUM_THREADS into every job
+# script, set to the node's logical CPU count -- 208 on Aurora (104 cores x 2
+# hyperthreads). So the `:-` default NEVER fired inside a PBS job, and every
+# run that sourced this file believing it got 16 actually got 208 threads per
+# rank: 12 ranks x 208 = 2496 threads on 104 cores, 24x oversubscribed.
+#
+# Caught 2026-08-07 when scaling_ladder.sh echoed the resolved value for the
+# first time (`omp=208`). It was invisible before precisely because nothing
+# printed it -- the same failure mode as the unlogged num_workers that made an
+# earlier scaling comparison unrecoverable.
+#
+# VJEPA_OMP_NUM_THREADS is the deliberate override: a distinct name, so an
+# intentional choice cannot be confused with PBS's inherited value.
+export OMP_NUM_THREADS=${VJEPA_OMP_NUM_THREADS:-16}
 export http_proxy="http://proxy.alcf.anl.gov:3128"
 export https_proxy="http://proxy.alcf.anl.gov:3128"
 export ftp_proxy="http://proxy.alcf.anl.gov:3128"
