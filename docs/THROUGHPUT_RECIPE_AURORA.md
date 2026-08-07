@@ -314,12 +314,27 @@ host-memory pressure would land in a **GPU-compute** column is unexplained.
 - Staging also cost **567 s** of the 1 h slot at 2 nodes before iteration 0, at
   a 24-shard cap. Full corpus at scale is the 0.43 GB/s/node problem.
 
+**The clean step is untouched by any of it.** p10 of max-over-ranks `iter` over
+all 99 iterations, and every phase floor with it:
+
+| arm | p05 | p10 | p25 | fwdt | fwdc | bwd | dload | barrier |
+|---|---|---|---|---|---|---|---|---|
+| daos-full | 3.14 | 3.14 | 3.17 | 0.69 | 1.03 | 1.40 | 0.00 | 0.08 |
+| staged-cap24 | 3.13 | 3.14 | 3.15 | 0.69 | 1.04 | 1.40 | 0.00 | 0.07 |
+| daos-cap24 | 3.15 | 3.16 | 3.19 | 0.69 | 1.05 | 1.40 | 0.00 | 0.07 |
+
+**0.6% apart on the floor and bit-identical per phase.** So the storage path
+never makes the step itself slower — in all three arms it changes only how often
+the clean step is *missed*. That is the same floor-stable / tail-unstable
+structure as the 1n anchor, and it is the reason `p10` is the only statistic here
+that needs no closing anchor to be trusted.
+
 ⚠️ The closing anchor (a repeat of arm 1) was skipped by the soft-deadline guard
 — correct behaviour, but it means this sweep has **no measured noise floor** and
 no plateau verdict ([[wallclock-kill-deletes-the-closing-anchor]]). Everything
-above is read from warmup excess and the per-node phase split, both of which are
+above is read from warmup excess, the per-node phase split, and p10 — all three
 measured against each arm's own floor. ipe=100 leaves only 20 post-warmup
-iterations regardless, so a plateau contrast needs ipe ≥ 250 and a slot longer
+iterations regardless, so a *plateau* contrast needs ipe ≥ 250 and a slot longer
 than `debug-scaling`'s 1 h.
 
 ## Tested and found NOT to matter (do not re-run)
