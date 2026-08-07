@@ -1326,6 +1326,85 @@ with no other phase contributing a tail. Removing the tail moves `iter_mean`
 down to `iter_med` and no further. (This is near-tautological under
 zero-inflation — treat it as a bound on the prize, not as evidence for a cause.)
 
+### CPU is NOT the scarce node-local resource — thread sweep, job 8741663
+
+The tail is a per-rank stall, so *something* node-local is scarce. CPU was the
+leading candidate: decode is CPU work, 12 ranks share 104 physical cores, and
+`OMP_NUM_THREADS` had been silently wrong for months (trap above). Tested
+directly — 2 nodes / 24 ranks, `ipe=100`, arms **A/B/C/A** so the closing anchor
+gives the floor:
+
+| arm | wall | iter_mean | iter_med | gap | dl mean-of-max | gap/dl | p99 |
+|---|---|---|---|---|---|---|---|
+| omp16 (default) | 751 s | 4.90 | 3.28 | 1.62 | 1.62 | 1.00 | 8.18 |
+| omp8  | 725 s | 4.95 | 3.16 | 1.79 | 1.78 | 1.01 | 8.92 |
+| **omp4** | **1368 s** | **11.17** | 3.37 | 7.81 | 3.09 | **2.52** | 22.70 |
+
+**Halving each rank's CPU is free (+1.0% wall, inside the floor); quartering it
+costs 2.3×.** So the production setting sits with **at least 2× CPU headroom**,
+and CPU cannot be what the tail is competing for.
+
+Note what `:omp<N>` actually varies. It moves `--depth` with `OMP_NUM_THREADS`,
+because lowering threads alone leaves the binding unchanged and lowering `--depth`
+alone oversubscribes a narrower span. So the arms are 12 ranks bound to
+**disjoint** spans of N hardware threads — 192 of 208 HT in use at omp16, 96 at
+omp8, 48 at omp4. Ranks never contend with each other for CPU in *any* arm; what
+changes is each rank's exclusive allocation. This is a test of CPU *sufficiency*,
+not of CPU contention between ranks.
+
+**The omp4 blowup has a distinct fingerprint, and it is worth knowing on sight.**
+Max-over-ranks across all 24 ranks, 93 fully-covered iterations, counter-wrap
+unwrapped (mean-of-max / med-of-max, seconds):
+
+| phase | omp16 | omp8 | omp4 | omp4 mean/med |
+|---|---|---|---|---|
+| dload | 1.62 / 0.00 | 1.78 / 0.00 | 3.09 / 0.00 | — |
+| fwd-target | 0.71 / 0.71 | 0.71 / 0.71 | **1.25 / 0.71** | **1.76** |
+| fwd-context | 1.17 / 1.09 | 1.09 / 1.05 | **3.01 / 1.20** | **2.51** |
+| backward | 1.53 / 1.46 | 1.44 / 1.40 | **4.80 / 1.45** | **3.31** |
+| barrier | 1.69 / 0.09 | 1.84 / 0.07 | 4.50 / 0.08 | 56 |
+| **iter** | 4.90 / 3.28 | 4.95 / 3.16 | **11.17 / 3.37** | **3.32** |
+
+**Every median is flat across all three arms; every mean inflates at omp4.** The
+clean step is not slower — the entire cost is tail. And the tail is in *every*
+phase, including `fwd-target`, which is pure XPU math that touches no CPU: its
+median is identical at 0.71 s while its max nearly doubles. A thread setting
+cannot make GPU math slower, so this is ranks intermittently **losing the CPU**,
+with every subsequent phase inheriting the skew through the next collective.
+That is also why `gap/dl` broke its long-standing 0.96–1.02 identity for the
+first time (2.52): dataload stops being the only tail once starvation injects one
+everywhere.
+
+**That fingerprint is what rules CPU out at production scale**, and it is
+stronger evidence than the omp8 null. Same statistic on job 8741594 `n16_nw2`
+(192 ranks, 53 iterations, the real 16n workload):
+
+| mean-of-max ÷ med-of-max | omp16 (2n) | omp4 (2n, starved) | **production 16n** |
+|---|---|---|---|
+| fwd-target | 1.00 | **1.76** | **1.03** |
+| fwd-context | 1.07 | **2.51** | **1.05** |
+| backward | 1.05 | **3.31** | **1.10** |
+| iter | 1.49 | 3.32 | 2.58 |
+
+Production carries a 2.58× tail in `iter` while its compute phases are
+essentially tail-free (1.03 / 1.05 / 1.10 — the *un-starved* signature). Under
+CPU starvation those numbers are 1.76 / 2.51 / 3.31. **The production tail is not
+made of CPU starvation**; it lives in dataload and in the barrier that absorbs
+dataload's skew.
+
+⚠️ **What this does and does not establish.** It shows CPU starvation *can*
+manufacture a tail, and that the production tail does not look like one. It does
+**not** identify the production tail's owner. Ruled out so far: shard-open cost,
+payload size, keyframe spacing (owns the body, not the tail — above), and now
+CPU. Still live: node page cache, node NIC, and the per-node DAOS agent.
+
+The cleanest next discriminator is **ranks-per-node at fixed rank count** (24
+ranks as 4n×6 vs 2n×12): it holds the order statistic fixed at k=24 while halving
+every node-local demand. It is not free to run — `PPN` is global in
+`scripts/scaling_ladder.sh`, and changing it moves the HSDP mesh from (2,12) to
+(4,6), which halves the shard dim and so changes both per-rank parameter memory
+and backward comms. Two confounds for one answer; needs a design pass first.
+
 ### `num_workers=2` is worth 3.45x at 64n — and it survives 768 ranks
 
 The paired arm, same allocation, same 30 iterations, only `num_workers` differs:
