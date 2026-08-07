@@ -1583,3 +1583,67 @@ run, so `scripts/vitG384_256n_daos.sh` carries `VJEPA_SUSTAINED=1`: stall watchd
 (1800 s, above the ~544 s worst recoverable spike), SIGUSR1 stack forensics,
 `ipe=30` so each epoch banks in ~5 min, and a guarded self-resubmit that refuses
 to relaunch when no epoch was banked.
+
+## Backward degrades WITHIN a run — job 8741386, 2026-08-07
+
+The "backward all-reduce grows with node count" reading is **not what the data
+shows**, and the bandwidth-vs-latency question this ladder was built to answer is
+**mis-framed rather than answered**. Rungs `1:nw2 16:nw2 64:nw2`, ipe=50, one
+allocation, identical config, all rc=0 with full rank coverage (12 / 192 / 768).
+
+Backward **median-over-ranks**, first vs last quarter of the itr 7-49 window:
+
+| rung | Q1 | Q4 | drift | min-over-ranks @ Q4 | window median |
+|---|---|---|---|---|---|
+| 1n | 1.24 | 1.38 | 1.11x | 1.36 | 1.24 |
+| 16n | 1.68 | 7.43 | **4.43x** | 2.23 | 2.46 |
+| 64n | 1.93 | 8.83 | **4.59x** | 4.72 | 8.06 |
+
+**A window median is not a per-step cost here.** 16n reads 2.46 s over the window
+while actually travelling 1.68 → 7.43 s across it; the median describes where the
+run was cut off. Both the ring model and every efficiency number assume a
+*stationary* per-step cost, so fitting either to these medians fits the drift.
+`scripts/backward_vs_nodes.py` now refuses a verdict above 1.25x Q1→Q4 drift.
+
+**What is ruled out, by columns in the same rows:**
+
+- **Not dataload skew.** `dataload` is 0.00 s on every rank from itr 1 (nw=2
+  prefetch working) and `barrier-ms` — the scale probe, which measures skew
+  arriving at the top of the step — is ~0.1 s on the degraded iterations. Ranks
+  enter the step synchronized with data in hand. This is the *opposite* regime
+  from the nw=0 tail.
+- **Not forward absorbing skew.** `fwd-ctx` stays flat at ~1.0 s while backward
+  goes to 12 s.
+- **Not memory.** `l0-free-mib` flat at 12147, `l0-ext-mib` flat at 46788.
+- **Not the model or schedule.** 1n runs the identical config for the identical
+  50 iterations and holds 1.24 s. The only thing 16n/64n add is an inter-node
+  all-reduce (at 1n the HSDP replicate group is size 1, so only the intra-node
+  ReduceScatter runs).
+
+**Mostly wait, partly work.** Per-iteration, min-over-ranks often stays at ~1.5 s
+while p50 ≈ max hits 12.8 — ranks blocked on peers. But reduced over the last
+quarter, min does rise (1.68 → 2.23 at 16n), so a smaller real per-rank component
+sits underneath. Quote both; "min stays at the floor" is true per-iteration and
+false per-quarter.
+
+**Onset is not a fixed iteration:** itr 26 at 16n (357 s in-loop), itr 17 at 64n
+(271 s). And the ordering is suggestive — the 16n rung *ended* degraded at 7.43 s
+and the 64n rung, more nodes on the same allocation minutes later, *started* clean
+at 1.93 s. A persistent machine- or fabric-wide slowdown cannot do that; something
+cleared by process restart / CCL-context re-creation can. **Not yet controlled** —
+node count and restart changed together. Job 8741490 (`16:nw2 16:nw2`, ipe=60)
+runs two identical 16n rungs back to back to separate them.
+
+**What survives of the original framing:** clean-phase cost is 1.24 / ~1.7 /
+~1.9 s at 1 / 16 / 64 nodes. The 16→64 increment is *small*, which is what a
+saturating bandwidth term predicts. The large numbers are drift, not node count.
+
+**Consequences.** Short shakeout rungs spend most of their iterations in the clean
+phase, so they *understate* what a long production run pays — the opposite of the
+usual warmup bias, and a reason not to extrapolate a 30-50 iteration rung to a
+multi-hour epoch. Cause is UNKNOWN; reset-on-restart narrows it to something with
+process/CCL-context lifetime (oneCCL or Level-Zero resource accumulation across
+collectives is the natural family), but no column here identifies which, so do not
+label it. `[[vitG-2b-allreduce-spikes]]`'s 9 s → 150 s 16n spike may be the same
+phenomenon at larger amplitude and makes `CCL_ZE_CACHE_OPEN_IPC_*` worth a paired
+arm — but that was a hypothesis, and the two have not been shown to be the same.
