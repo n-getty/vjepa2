@@ -2134,3 +2134,50 @@ equally well. No column identifies which, so do not label it
 ([[no-lazy-cause-labels]]). `[[vitG-2b-allreduce-spikes]]`'s 9 s → 150 s 16n spike may be the same
 phenomenon at larger amplitude and makes `CCL_ZE_CACHE_OPEN_IPC_*` worth a paired
 arm — but that was a hypothesis, and the two have not been shown to be the same.
+
+---
+
+## The 1n anchor: quote the p10 floor, not the mean (2026-08-07)
+
+Every efficiency-vs-1n number divides by a 1n rung, and that denominator has now
+been wrong twice — first `arm_B_lr6e5`, a 192-rank run misfiled as 1n, then a
+pair of nw=0 rungs that differed 2× (`[[1n-anchor-does-not-reproduce]]`). Three
+independent 1n **nw=2** rungs now close the question about *which statistic* to
+quote:
+
+| job | rung | n | p10 | p50 | mean | dload mean | fwdc episodes |
+|---|---|---|---|---|---|---|---|
+| 8741045 | `n1_nw2_prof` | 61 | 2.97 | 3.03 | 5.00 | 1.96 | 0.0% |
+| 8741769 | `n1_nw2` | 266 | 2.98 | 3.07 | 3.74 | 0.11 | 14.3% |
+| 8741810 | `n1_nw2` | 213 | 2.93 | 2.96 | 3.08 | 0.06 | 0.0% |
+
+**p10 spans 2%. The mean spans 62%.** Same config, same DAOS path, same worker
+count, different nodes and hours. So nw=2 does not buy a reproducible anchor —
+it lowers `dload mean` when the tail happens not to fire, which is not the same
+thing.
+
+The two inflated runs are inflated by *different* mechanisms: 8741769's excess
+is node-synchronous fwd-context episodes with `dload == 0`, 8741045's is
+dataload (and it carries profiling overhead besides). Two owners, one symptom —
+which is exactly why a single mean cannot serve as a denominator.
+
+**Rule:** if a 1n anchor must be quoted, quote **p10**, say that it is a floor,
+and label the resulting efficiency an **upper bound** — it prices the compute,
+not the run. Anything quoted from a mean needs the anchor re-measured *in the
+same allocation as the rung being compared*.
+
+⚠️ The fwd-context episode phenomenon (20.3% of wall, `fwdc` ×2.79, tiles
+*tighter* not looser) **did not reproduce**: 15/69 episodes on `x4610c4s3b0n0`
+vs **0/69** on `x4104c2s1b0n0` in the matched iteration band 150-218, at
+near-identical thresholds. `scripts/fwdc_episode_scan.py` still fires on the
+original, so the detector is sound. Leading hypothesis is node-local, but the
+runs were separate allocations, so node is confounded with fabric-hour and run
+length — stated as a hypothesis, not a finding (`[[no-lazy-cause-labels]]`).
+The actionable part is narrow: **8741769 is not usable as a 1n reference**, and
+the 20.3% is not a property of 1n runs.
+
+One thing that *is* settled, from the twin-rung pair in 8741810: a second rung
+in the same allocation opened at **999 GiB** MemAvailable where the first had
+just floored at 228 GiB. The ~690 GiB is released on process exit, so it does
+not need a fresh allocation — and every rung therefore starts from a cold cache
+and re-pays the warmup tail.
