@@ -1,6 +1,33 @@
 #!/usr/bin/env python3
 """Node-synchronous compute EPISODES: a second cost with a different owner.
 
+⚠️ THE REPLICATION FAILED -- READ THIS BEFORE USING ANY NUMBER BELOW
+--------------------------------------------------------------------
+Job 8741810 re-ran the rung this script was written from: same config, same DAOS
+path, 1 node / 12 tiles / nw=2, ~280 iters. **Zero episodes.** Matched iteration
+band 150-218, near-identical thresholds (1.539 vs 1.505 s):
+
+    8741769  on x4610c4s3b0n0    15/69 = 21.7%
+    8741810  on x4104c2s1b0n0     0/69 =  0.0%
+
+Not a coverage artifact -- that band is where the original's rate is already
+high. Max fwdc/median anywhere in the replication's window is 1.74, with no
+node-synchronous iteration at any threshold. This script still reports 20.3% on
+8741769, so the detector is sound; the data differ.
+
+The replication has its own 13.2% excess over a 2.93 s floor, but it is the
+DATALOAD tail, not this: 100.4% of the iter excess is dataload, in 7 spikes,
+each 1-2 ranks of 12, with fwdc flat at x1.01. The two costs separate cleanly.
+
+Leading hypothesis, NOT a finding: the episodes are node-local -- the physical
+node is the one uncontrolled variable between the two runs. Two rungs on the
+same node cannot confirm that; it needs two 1n rungs on DIFFERENT nodes in ONE
+allocation, which also reads wall-clock coincidence (shared/external vs
+per-node). Everything below describes the ORIGINAL run only. Do not cite the
+20.3% as a property of 1n runs, and do not use 8741769 as a 1n throughput
+reference -- in that window it carries a ~20% wall inflation the other node
+does not.
+
 WHY THIS EXISTS
 ---------------
 Job 8741769 was submitted to ask whether host memory tracks the within-run
