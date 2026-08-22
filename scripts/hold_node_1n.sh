@@ -47,8 +47,9 @@ export MASTER_ADDR=$HOST MASTER_PORT=29500
 export http_proxy="http://proxy.alcf.anl.gov:3128" https_proxy="http://proxy.alcf.anl.gov:3128"
 
 # Poll loop: run any run_*.sh dropped into CMD_DIR (once each). Each runs in the
-# BACKGROUND so a hung command never blocks the queue or the hold itself; output
-# -> run_N.out, a run_N.done marker is written with the rc when it finishes.
+# SERIALIZED: one injected run at a time; output -> run_N.out, a run_N.done
+# marker is written with the rc when it finishes. Hang protection comes from the
+# injected script's own `timeout`, NOT from backgrounding -- see the loop below.
 seen=""
 end=$(( $(date +%s) + 3500 ))
 while [ "$(date +%s)" -lt "$end" ]; do
@@ -57,8 +58,17 @@ while [ "$(date +%s)" -lt "$end" ]; do
         [ -e "$c" ] || continue
         case " $seen " in *" $c "*) continue;; esac
         seen="$seen $c"
-        echo "=== LAUNCH $c @ $(date) (background) ==="
-        ( bash "$c" > "${c%.sh}.out" 2>&1; echo "rc=$?" > "${c%.sh}.done" ) &
+        # SERIALIZE -- do not background. Distributed runs contend for the
+        # rendezvous port AND for all tiles on the node, so two concurrent
+        # injections produce garbage timings (or EADDRINUSE) rather than two
+        # results. Per-run MASTER_PORT so a leftover socket cannot poison the
+        # next. Same fix as 4b99560 on hold_nodes_daos.sh -- this copy never
+        # got it.
+        port=$(( 29500 + RANDOM % 500 ))
+        echo "=== LAUNCH $c @ $(date)  MASTER_PORT=$port ==="
+        MASTER_PORT=$port bash "$c" > "${c%.sh}.out" 2>&1
+        echo "rc=$?" > "${c%.sh}.done"
+        echo "=== DONE $(basename $c) rc=$(cat ${c%.sh}.done) @ $(date) ==="
     done
     sleep 5
 done
