@@ -1,0 +1,108 @@
+cpus_per_task: 16
+eval_name: video_classification_frozen
+folder: /flare/ModCon/ngetty/surg_2_1_v2_final/probes/grasp_step_headwidth_ab/d1664_dr00_s0
+mem_per_gpu: 220G
+nodes: 1
+num_workers: 16
+resume_checkpoint: true
+tag: gstep-ab-d1664_dr00-s0
+tasks_per_node: 4
+model_kwargs:
+  checkpoint: /flare/ModCon/ngetty/checkpoints/daos_shakeout/vitG384_prod_37M_n256_8766188/e199.pth.tar
+  module_name: evals.video_classification_frozen.modelcustom.vit_encoder_multiclip_v21
+  pretrain_kwargs:
+    encoder:
+      checkpoint_key: target_encoder
+      img_temporal_dim_size: 1
+      model_name: vit_gigantic_xformers
+      patch_size: 16
+      tubelet_size: 2
+      uniform_power: true
+      use_rope: true
+      use_sdpa: true
+  wrapper_kwargs:
+    max_frames: 128
+    use_pos_embed: false
+    preserve_clip_dim: true
+experiment:
+  classifier:
+    name: asformer
+    asformer_kwargs:
+      num_clips: 4
+      tokens_per_clip: 8
+      temporal_tokens: 32
+      num_layers: 10
+      num_heads: 8
+      mlp_ratio: 4.0
+      dropout: 0.0
+      return_sequence: true
+  data:
+    dataset_type: VideoDataset
+    dataset_train: /flare/ModCon/ngetty/data/grasp_ctx_official/csv/grasp_step_asformer_ctx_seq_train.csv
+    dataset_val: /flare/ModCon/ngetty/data/grasp_ctx_official/csv/grasp_step_asformer_ctx_seq_val.csv
+    num_classes: 21
+    frames_per_clip: 16
+    frame_step: 1
+    resolution: 384
+    num_segments: 4
+    num_views_per_segment: 1
+    sequence_labels: true
+    normalization: null
+    class_weights:
+    - 0.167504
+    - 0.538087
+    - 0.667938
+    - 0.981315
+    - 2.012261
+    - 0.713975
+    - 4.938411
+    - 2.213232
+    - 0.66439
+    - 2.260383
+    - 2.016897
+    - 33.993528
+    - 17.506667
+    - 1.89159
+    - 1.683333
+    - 1.515729
+    - 2.431481
+    - 1.829328
+    - 0.682122
+    - 0.984627
+    - 2.8443
+    cache_num_workers: 8
+    train_cache_root: /flare/ModCon/ngetty/surg_2_1_v2_final/probes/grasp_cache_official_ctx16_step/prod37M_e199/train
+    val_cache_root: /flare/ModCon/ngetty/surg_2_1_v2_final/probes/grasp_cache_official_ctx16_step/prod37M_e199/val
+  optimization:
+    batch_size: 2
+    num_epochs: 20
+    use_bfloat16: true
+    loss_smoothing_weight: 0.15
+    loss_smoothing_threshold: 4.0
+    use_pos_embed: false
+    multihead_kwargs:
+    - warmup: 0.05
+      start_lr: 5.0e-05
+      lr: 0.0005
+      final_lr: 5.0e-06
+      weight_decay: 0.05
+      final_weight_decay: 0.4
+    - warmup: 0.05
+      start_lr: 1.5e-05
+      lr: 0.00015
+      final_lr: 5.0e-06
+      weight_decay: 0.05
+      final_weight_decay: 0.4
+    - warmup: 0.05
+      start_lr: 5.0e-06
+      lr: 5.0e-05
+      final_lr: 5.0e-06
+      weight_decay: 0.1
+      final_weight_decay: 0.4
+    profile_timing: true
+    profile_log_interval: 50
+    profile_warmup_iters: 5
+early_stop_patience: 6
+log_val_f1: true
+write_status_json: true
+save_every_iters: 1000000000
