@@ -4498,3 +4498,91 @@ Reproduce: `python scripts/aggregate_triplet_seeds.py --root
 - Segmentation (§2b) probe code: `evals/video_segmentation_frozen/{eval.py,models.py}`,
   `src/models/segmentation_head.py`, `src/datasets/video_seg_dataset.py`,
   `scripts/build_sarrarp50_seg_csv.py`
+
+---
+
+## §4b-infra — three reporting/provisioning defects found while auditing the queue (2026-08-25)
+
+None of these changed a published number. All three would have, on the next run.
+
+### 1. A queued job was provisioned 57 minutes short of its own arm's measured pace
+
+`eft_prod9m_e29_s1` (job **176647**) carried the default 5 h wall. Its arm,
+`prod9m_e29_ft_last4`, runs at **1070 s/epoch** measured on its own two completed
+seeds (s0 1065.2, s2 1070.7) → **5.95 h for 20 epochs**.
+
+This was the relaunch of the seed already lost once to the `run_ft_seed.sh`
+GPU-wait bug (job 175628, 2026-08-20). A walltime kill would have lost the same
+seed a second time, from an unrelated cause, leaving the budget ladder's bottom
+rung permanently at n=2.
+
+Caught before it ran. `qalter` is broken on Sophia (`account_check` hook throws),
+so: `qdel 176647` + resubmit with `-l walltime=08:00:00` → **176648**. Free,
+because it was blocked on `queue_tags` at the back of a 12-deep queue.
+
+**Epoch pace is a property of the ARM, not the node.** Verified across every
+completed run:
+
+| arm family | s/epoch | 20 ep |
+|---|---:|---:|
+| `ft_last4` (plain) | 1060–1071 | 5.9 h |
+| `ft_aug` / `ft_aug_last8` / `ft_augpe` (`--augment`) | 746–770 | 4.3 h |
+| `lemonfm_ft_last4` | 385–388 | 2.1 h |
+
+prod18m's three seeds ran hours apart on gpu-08/02 and landed within 4 s of each
+other; gpu-01/03/05/07 each appear in *both* the 1065 and 750 groups. The other
+seven queued jobs were checked against their own siblings and all fit — `pw200`
+and `augstr` both carry `--augment`, putting them in the 4.3 h family.
+
+**Augmented arms are ~30% FASTER, and that is not a bug.** `_load_frame` crops
+*before* it resizes, so the augmented path feeds ~10% fewer pixels to the
+BILINEAR resize. That the saving is measurable at all says these epochs are
+**CPU image-loading bound, not GPU bound**.
+
+### 2. `CODE_STAMP` never covered the data pipeline
+
+`run_ft_seed.sh` / `run_ft_3seed.sh` guard against resuming across a code change
+with `md5sum $WS/train_esad_unfreeze.py`. But **`ESADWindowDataset` — the crop,
+jitter, squash-resize and normalisation that define what a sample *is* — lives in
+`export_esad_cache.py`** and was unstamped. A change there could mix two data
+pipelines into one arm's mean with no guard firing.
+
+Added `DATA_STAMP` over `export_esad_cache.py`, written to `$OUT/.data_stamp`,
+**warn-only, never wiping**: the trainer guard wipes because it prevents resuming
+from a checkpoint written by different code (a corrupt curve); the data guard is a
+*reporting* hazard, and a false-positive wipe destroys ~6 h of training.
+Falsified all five cases (no stamp → silent; match → silent; stale → WARN;
+refreshed → silent; empty file → WARN, no crash). Backups
+`.bak-datastamp-20260825`.
+
+**Audit: no damage.** Four trainer versions exist on disk (`57bf34a8c83f`,
+`676b13319054` = the whole budget ladder, `49195c600401` = `ft_aug`,
+`ccd269244fbc` = current) and **no completed arm mixes them**. The three versions
+are behaviourally identical when no aug flag is passed — the diffs are an
+`--augment` flag, an opt-in `--aug-per-epoch`, and env-overridable aug-strength
+defaults that preserve the published values — so **176648 is comparable to
+prod9m s0/s2** despite running under a newer stamp.
+
+### 3. The collector starred a paired t-test at df=1
+
+`collect_esad_arms.py` ran its paired test at `len(d) >= 2` and printed the
+`p < 0.05` claim marker regardless of df. Two arms starred off **two seeds**:
+
+```
+ft_aug_last8              0.2280±0.002  n=2  +0.0245  p_pair 0.007*  2/2
+meta1b_frozen_augonly     0.1432±0.003  n=2  −0.0602  p_pair 0.004*  0/2
+```
+
+At n=2 the paired sd *is* the gap between the two deltas — if they land close,
+`t = mean/(sd/√2)` explodes off one coincidence. `ft_aug_last8`'s ±0.002 looks
+like the tightest arm in the table and is the least informative row in it; its
+honest Welch p is **0.115**.
+
+`pf()` now takes the df and emits `*` only at `df >= 2`, `~` otherwise, with a
+legend line. Verified it demotes exactly those two n=2 arms and leaves **every**
+n=3 star intact (21 starred rows → 19). Backup `.bak-df1-20260825`.
+
+Note the two defects compounded: `meta1b_frozen_augonly` is n=2 *because* its s0
+collapsed (§4b-augext), so an arm that lost a seed to a failure was the one
+printing p=0.004. **No published claim rested on either star.**
+
