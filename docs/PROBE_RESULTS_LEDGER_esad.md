@@ -2246,6 +2246,71 @@ early-stopped seed re-enters and re-stops without damaging its checkpoint.
 
 Artifacts: `runs/esad_double_prod37m_e199_frozen_{augonly,aug}_s{0,1,2}/`.
 
+### 4b-selmetric. Selecting `best.pt` on IoU instead of presence — RESOLVED: it makes localization WORSE, 11/11 (2026-08-25)
+
+This arm finished on 2026-08-20 and sat unread for five days because `collect_esad_arms.py`
+lists it as "unscored": it writes `test_summary{,_by_iou}.json`, not a detection-AP JSON, so the
+collector's `det_ap()` finds nothing. **All 12 seeds were fully scored the whole time.** Worth
+remembering — the collector's "unscored" means "no AP JSON", not "no result".
+
+**The question.** `train_esad_double_head.py` picks `best.pt` on presence alone
+(`val_well_supported_map`). meta1b's val presence and val IoU correlated at only r = 0.765 (vs
+0.970–0.997 for the other three checkpoints), so its presence-selected epoch could land far from
+its own best localization epoch — a plausible explanation for meta1b's low `mean_iou`/`map50`
+that would be a *selection artifact*, not a backbone limit. The trainer was patched to track a
+second checkpoint, `best_by_iou.pt`, from the **same trajectory and seed** — no second run, no
+seed confound, so the per-seed delta is the entire signal.
+
+**The answer is the opposite of the hypothesis, and it is not close.**
+
+| backbone | Δ test_mean_iou | Δ test_map50 | Δ test_well_sup_map | seeds worse on map50 |
+|---|---:|---:|---:|---:|
+| meta1b (the anomaly) | −0.0109 | −0.0245 | +0.0034 | 2/2 informative |
+| v1 | −0.0133 | −0.0322 | +0.0108 | 3/3 |
+| meta2b | −0.0270 | −0.0606 | +0.0190 | 3/3 |
+| ours1b_e19 | −0.0084 | −0.0157 | +0.0017 | 3/3 |
+
+`by_iou − presence`, paired within seed. **Selecting on IoU degrades test IoU in 11 of 11
+informative seeds** (meta1b s2 is a tie — both selectors chose epoch 14, so its delta is exactly
+0.0000 on every metric, which is a consistency check passing, not a data point). Sign test on
+11: p ≈ 1/2048. meta1b, the checkpoint the arm was built for, shows the *smallest* box penalty of
+the four, so its low localization is a property of the backbone, not of the selector.
+
+**The selection is not broken — verified before believing the direction.** For all 12 seeds the
+epoch stored in `best_by_iou.pt` equals `argmax(val_iou)` from `log_r0.csv` exactly, and val IoU
+at that epoch is ≥ val IoU at the presence-selected epoch by construction (mean +0.0350, up to
++0.1023). So the arm did what it claimed; the gain simply does not transfer.
+
+**It is selection overfitting, and the effect size scales with the amount of selecting.** Across
+the 12 seeds, the val-IoU *gain* and the test-IoU *loss* are anti-correlated: r = **−0.633** for
+`test_mean_iou`, **−0.587** for `test_map50`. The harder the selector chased val IoU, the more
+test localization it gave back. v1 s0 is the clearest instance: +0.1023 val IoU (epoch 9 over
+epoch 13) bought −0.0319 test map50. Per-epoch val IoU on a 5,903-frame val split is noisy enough
+that its argmax is substantially noise, and picking the argmax of a noisy metric is picking the
+noise.
+
+**Why presence-selection wins anyway:** presence and localization are positively correlated
+across epochs on every backbone (r = 0.77–0.997), so presence acts as a *smoothed* proxy for
+localization — it selects a good box epoch without chasing the box metric's own noise. That the
+by_iou checkpoint also gains presence mAP (+0.0017 to +0.0190, positive on all four backbones)
+while losing box mAP says both selectors land in the same good region and differ only in which
+noise they fit.
+
+**Keep `best.pt` selection on presence.** No change to the trainer; the second checkpoint costs
+nothing and can stay for diagnostics.
+
+**Not the same question as §4b-rare**, which also swept a "selection metric" and returned NULL.
+That axis was `well_supported_map` vs `macro_map` — *two presence metrics*, differing only in
+whether rare classes count — and it was unseeded, so its arms sat inside a 0.0316 same-config
+spread. This axis is presence vs **localization**, seeded, and paired within run. Its 11/11 sign
+consistency is exactly what §4b-rare demanded before further head-side tuning ("3 seeds × 2
+configs, not 1 seed × N configs"), which is why this one is readable and that one was not.
+
+Artifacts: `runs/esad_double_{meta1b,v1,meta2b,ours1b_e19}_selmetric_ablation_s{0,1,2}/` —
+`test_summary.json` (presence-selected) vs `test_summary_by_iou.json`. Note the by_iou summary
+has **no `best_epoch` field**; its epoch lives only in the checkpoint (`ckpt['epoch']`).
+Launcher: `run_selection_metric_ablation.sh`.
+
 ### 4b-ens. Cross-seed ensembling on the FINE-TUNED arms — beats the seed MEAN 6/6, and the gain is localization (2026-08-25)
 
 Extends §4f's frozen seed-ensemble to the fine-tuned path. The reason this needed a separate
@@ -3867,6 +3932,17 @@ Reproduce: `python scripts/aggregate_triplet_seeds.py --root
       **AP 0.1403 → 0.2005 (+0.0602, spread 0.0191, 3.2× the spread)**, beating the paper's
       0.1928 on the identical full-denominator protocol. Gain holds at all 3 IoU thresholds.
       Single checkpoint (v1/e159), n=3.
+- [x] **ESAD: is meta1b's weak localization a `best.pt` selection artifact?** — DONE 2026-08-25
+      (§4b-selmetric), **NO, and selecting on IoU is actively harmful.** 4 checkpoints × 3 seeds,
+      paired within run (`best.pt` vs `best_by_iou.pt`, same trajectory): IoU-selection loses
+      test `mean_iou` in **11 of 11** informative seeds (p ≈ 1/2048), mean −0.0149 IoU /
+      −0.0332 map50. Selection verified correct (ckpt epoch == argmax val_iou on all 12) and val
+      IoU does improve — it just does not transfer. Val gain and test loss are anti-correlated
+      (r = −0.63): classic selection overfitting on a noisy val metric. meta1b, the checkpoint
+      that motivated the arm, has the *smallest* penalty of the four. Keep presence selection.
+      **These 12 seeds finished 2026-08-20 and went unread for 5 days** because the collector
+      reports arms without a detection-AP JSON as "unscored" — it means "no AP JSON", not "no
+      result". Sweep the run dirs, not just the collector, for finished work.
 - [ ] **ESAD: run the other 3 checkpoints through FT** (meta1b/meta2b/ours1b_e19). Now that
       the readout is no longer the bottleneck, the CPT-vs-raw comparison may finally be
       measurable — every frozen comparison was inside noise.
