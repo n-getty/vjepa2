@@ -428,6 +428,25 @@ fusions rank every arm identically, but `maxpick` is the convention.
 This also means the "+aug" arm's advantage was **not** the doubled window count: `augonly`
 trains on 2,468 windows, the same as the baseline. The augmentation is doing the work.
 
+🛑 **Third correction (~04:10) — seed 1 lands and the effect does not survive.** Everything
+above is **n=1**. `frozen_augonly` s1 = **0.1631** maxpick vs s0's 0.2155:
+
+| arm | n | maxpick | delta vs baseline |
+|---|---:|---:|---:|
+| `frozen_presrep` (baseline) | 3 | 0.1793 ± 0.0101 | — |
+| `frozen_augonly` s0 only | 1 | 0.2155 | +0.0362 ← published |
+| `frozen_augonly` s0+s1 | 2 | **0.1893** | **+0.0100** |
+| `ft_aug` (unaffected, best) | 3 | 0.2319 ± 0.0243 | +0.0526 |
+
+The delta is now inside the baseline's own sd, and the arm's between-seed spread (0.0524) is
+**5× the effect**. Not a scoring artifact — s1's presence head never converged (final `bce`
+0.4515 vs 0.2163, `val_wellmap` 0.2024 vs 0.3403), so it genuinely trained worse. **No frozen
+augmentation effect is established.** Treat any frozen delta under ~0.05 as unresolved until
+n=3. `ft_aug` is unaffected and remains the best arm on record.
+
+The recurring error: a 1-seed arm has no error bar, so "4 sd above baseline" was measuring the
+*baseline's* spread. See [[one-seed-has-no-error-bar]].
+
 Probe-internal metrics for the same seed (retained to show why the real metric was needed — on
 these the arms looked nearly tied and ranked *oppositely* across columns):
 
@@ -439,10 +458,12 @@ these the arms looked nearly tied and ranked *oppositely* across columns):
 Ledger §4b-frozctl.
 
 **Does it hold across checkpoints? — 6-checkpoint campaign LAUNCHED 2026-08-25.** The result
-above is one checkpoint. If it is a property of *augmentation* it should reproduce on other
-backbones; if it is a property of *this* checkpoint it will not — and until that is measured,
-every frozen "ours vs theirs" comparison here is unfair in our favour, because our arm would
-have the augmentation and the externals would not. `augonly` × 3 seeds is now running for
+above is one checkpoint *and* (see the third correction) one lucky seed. If there is a property
+of *augmentation* here it should reproduce on other backbones; if it was a property of *this*
+checkpoint — or of that seed — it will not. Until that is measured, every frozen "ours vs
+theirs" comparison here is unfair in our favour, because our arm would have the augmentation and
+the externals would not. The campaign now asks whether the effect **exists**, not merely whether
+it generalises; at 3 seeds × 6 backbones it is properly powered to answer either way. `augonly` × 3 seeds is now running for
 **meta2b, meta1b, ours1b_e19, lemonfm, snx, endovit** (Polaris `preemptable`, jobs
 7555007/9/10/11/14/15).
 

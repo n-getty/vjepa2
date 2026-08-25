@@ -1812,6 +1812,13 @@ backbones; if it is a property of *this checkpoint* it will not. Until it is mea
 than one backbone, every "ours vs theirs" frozen comparison in this ledger is unfair in our
 favour — our arm would have the augmentation and the externals would not.
 
+> 🛑 **Superseded premise (2026-08-25 ~04:10, after launch).** That +0.0415 was **one seed**.
+> Seed 1 scored 0.1631, dropping the arm to 0.1893 at n=2 and the delta to **+0.0100** — inside
+> the baseline's own sd. See the third correction in §4b-frozctl. This campaign was launched to
+> ask whether a large effect *generalises*; it is now asking whether the effect *exists*. The
+> design is unchanged and is the right one either way — 3 seeds × 6 backbones is exactly the
+> power that was missing — but do not treat +0.0415 as a target these arms must reproduce.
+
 **Six checkpoints, 3 seeds each, all `augonly`.** Launched on Polaris `preemptable` as jobs
 7555007/9/10/11/14/15.
 
@@ -1948,6 +1955,47 @@ augmentation helps both paths, and FT+aug is still the best arm on record:
 What survives: frozen+augonly beats the frozen baseline by ~4 sd, and beats *un-augmented* FT —
 i.e. augmentation buys more on this probe than unfreezing four blocks does. That is still a real
 and useful finding; it is just not "frozen beats fine-tuning."
+
+---
+
+🛑 **THIRD CORRECTION, 2026-08-25 ~04:10 — seed 1 lands and the effect does not survive it.**
+Everything above this line is an **n=1** result. `frozen_augonly` **s1 = 0.1631 maxpick**
+(0.1674 wbf), against s0's 0.2155. Two seeds of the same arm, 0.0524 apart:
+
+| arm | n | maxpick AP | delta vs frozen baseline |
+|---|---:|---:|---:|
+| `frozen_presrep` (baseline) | 3 | 0.1793 ± 0.0101 | — |
+| `frozen_augonly` **s0 only** | 1 | 0.2155 | **+0.0362** ← what was published |
+| `frozen_augonly` **s0+s1** | 2 | **0.1893** | **+0.0100** |
+
+**The "+0.0415 = 4.0 baseline sd" headline was a single lucky draw.** At n=2 the delta is
++0.0100 — inside the baseline's own sd (0.0101) — and the between-seed spread (0.0524) is
+**five times the effect**. Nothing here is significant, and with n=2 nothing here is testable.
+
+**This is not a scoring artifact; s1 genuinely trained worse.** Both seeds ran the full 20
+epochs, but the presence head never converged on s1: final-epoch `bce = 0.4515` vs s0's
+`0.2163`, and `val_wellmap = 0.2024` vs `0.3403`. The AP gap is downstream of a worse head, so
+the variance is in the *training*, not the measurement. That also means seed variance on this
+arm is far larger than the ±0.0101 the 3-seed baseline suggested, so **any frozen-arm delta
+below ~0.05 needs 3 seeds before it means anything.**
+
+**What this does to the campaign in flight:** §4b-augext (six checkpoints × 3 seeds) was
+launched to test whether a +0.0362 effect replicates across backbones. The effect it was
+chasing may not exist. The campaign is still the right experiment — it is now *powered*
+(3 seeds/arm, 6 backbones = the replication this needed from the start) and it will answer the
+question either way. But its framing changes from "does the gain generalise?" to "is there a
+gain at all?" Do not read the earlier sections as an established baseline it must beat.
+
+`ft_aug` (0.2319 ± 0.0243, n=3) is unaffected and remains the best arm on record.
+
+**The lesson, again and more expensively:** this is the *second* correction to the same claim in
+one night. The first ([[run-the-collector-before-the-verdict]]) was comparing against a
+hand-picked subset; this one is publishing a delta from a single seed against a 3-seed baseline.
+A 1-seed arm has no error bar — "4 sd above baseline" measures the *baseline's* spread and says
+nothing about the arm's own. The correct move at n=1 was to state the number and withhold the
+comparison until n=3. See [[one-seed-has-no-error-bar]].
+
+---
 
 **Second correction, methodological.** The table above reports `wbf_meanconf`, but
 `collect_esad_arms.py` — the repo's own collector, and therefore every other AP number in this

@@ -2322,6 +2322,11 @@ needed a collector edit, and any stale entry silently produced a wrong table.
 
 ### 4b-augext. Does the augmentation gain hold across checkpoints? — LAUNCHED 2026-08-25
 
+> 🛑 **Premise superseded (2026-08-25 ~04:10):** the +0.0415 below was **one seed**. Seed 1
+> scored 0.1631, taking the arm to 0.1893 at n=2 and the delta to **+0.0100** — inside the
+> baseline's sd. This campaign now asks whether the effect *exists*, not whether it generalises.
+> The design (3 seeds × 6 backbones) is unchanged and is the right one either way.
+
 §4b-frozctl measured `frozen_augonly` on **one** checkpoint (prod37m_e199) and found +0.0415 AP
 = 4.0 baseline sd. If that is a property of *augmentation* it should reproduce on other
 backbones; if it is a property of *this checkpoint* it will not. Until it is measured on more
@@ -2423,6 +2428,17 @@ It also clears the **un-augmented** fine-tuned last-4 mean (0.2035). And it gain
 IoU thresholds together** (+0.048 / +0.045 / +0.049 vs the baseline mean), the signature of a
 genuine improvement rather than the presence-vs-localisation trade that FT shows. One seed is
 still one seed, but 4 sd is well outside where a single draw normally lands.
+
+> 🛑 **That last sentence was wrong, and seed 1 proved it (2026-08-25 ~04:10).**
+> `frozen_augonly` s1 = **0.1631** vs s0's 0.2155 — 0.0524 apart. At n=2 the arm means
+> **0.1893** and the delta over baseline is **+0.0100**, *inside* the baseline's own sd
+> (0.0101). "4 sd" was computed from the **baseline's** spread; the arm's own spread turned out
+> to be 5× larger, which is exactly what one seed cannot tell you. Not a scoring artifact —
+> s1's presence head never converged (final `bce` 0.4515 vs 0.2163, `val_wellmap` 0.2024 vs
+> 0.3403). **No frozen augmentation effect is established**; any frozen delta under ~0.05 is
+> unresolved until n=3. `ft_aug` (0.2319 ± 0.0243, n=3) is unaffected and remains best on
+> record. Full detail in `PROBE_RESULTS_LEDGER_esad.md` §4b-frozctl third correction; lesson in
+> [[one-seed-has-no-error-bar]].
 
 ⚠ **Correction (same night, 02:45).** The line above originally read "a frozen probe beating
 fine-tuning, which no other arm in this campaign has done." That is **wrong**, and the error is
