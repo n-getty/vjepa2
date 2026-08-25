@@ -427,6 +427,7 @@ fusions rank every arm identically, but `maxpick` is the convention.
 
 This also means the "+aug" arm's advantage was **not** the doubled window count: `augonly`
 trains on 2,468 windows, the same as the baseline. The augmentation is doing the work.
+*(Superseded — at n=3 neither is doing any work; see the three-arm table below.)*
 
 🛑 **Third correction (~04:10) — seed 1 lands and the effect does not survive.** Everything
 above is **n=1**. `frozen_augonly` s1 = **0.1631** maxpick vs s0's 0.2155:
@@ -487,6 +488,30 @@ signature seen in the third correction above (presence head collapses, box head 
 bimodality in whether the presence head trains, not measurement noise. The three ext arms
 (lemonfm/snx/endovit) were still queued at time of writing; they extend the table but cannot
 change this verdict.
+
+**Augmentation, or just more windows? — NEITHER. (2026-08-25 ~07:00)** `frozen_aug` s2 landed
+at 0.1552, completing all three prod37m frozen arms at n=3 and closing §4b-frozctl's original
+question:
+
+| arm | windows/ep | AP (n=3) | oracle wellMAP (n=3) | Δ vs `presrep` |
+|---|---:|---:|---:|---:|
+| `frozen_presrep` | 2,468 | 0.1793 ± 0.0101 | 0.2507 ± 0.0052 | — |
+| `frozen_augonly` | 2,468 | 0.1802 ± 0.0306 | 0.2464 ± 0.0379 | +0.0009 |
+| `frozen_aug` | 4,936 | **0.1733 ± 0.0303** | 0.2416 ± 0.0362 | **−0.0060** |
+
+The doubled-window arm is now the *worst* of the three, and the oracle pass — an independent
+measurement path from detection AP — reproduces the ordering. So the s0 result was neither
+augmentation nor extra data.
+
+The seed split has a visible mechanism. Train BCE at a **fixed epoch 5**: presrep
+0.495/0.545/0.519; augonly **0.490**/0.695/0.754; aug **0.491**/0.642/0.543. Seed 0 fits
+augmented data as easily as the control while s1/s2 fall behind, **in both augmented arms** —
+two arms that differ in window count showing the identical split means seed-dependent
+optimisation under augmented inputs, not data volume, and not a cache artifact (`aug_seed = 0`
+is shared by all three training seeds, so none of them "matched the draw"). Counterexample worth
+keeping: `frozen_aug` s0 reaches the lowest final train BCE of all nine frozen runs (0.171) and
+still scores below `augonly` s0 (0.2084 vs 0.2155 at BCE 0.216) — the extra windows bought
+overfitting, not AP.
 
 Original framing, retained:
 
