@@ -403,16 +403,48 @@ the augmented cache **alone**, at the baseline's 2,468 windows. Seed 0 of 3, pro
 metrics only (the deciding full-denominator detection AP is scored after all three seeds and
 does not exist yet):
 
+**★ Seed-0 detection AP is now measured** (job 176612, an early 1-GPU score pass — scoring needs
+one GPU and 1-GPU jobs place immediately while the 4-GPU arms wait for Thu Aug 27). Canonical
+population, `wbf_meanconf`:
+
+| arm | AP_mean | AP10 | AP30 | AP50 |
+|---|---:|---:|---:|---:|
+| baseline `frozen_presrep` (3-seed) | 0.1812 ± 0.0103 | 0.2529 | 0.2106 | 0.0802 |
+| **`frozen_augonly` s0** | **0.2227** | **0.2901** | **0.2510** | **0.1270** |
+
+**+0.0415 = 4.0 baseline sd**, +0.0305 over the *best* baseline seed, and above the fine-tuned
+last-4 mean (0.2035) — **a frozen probe beating fine-tuning**, which nothing else in this
+campaign has done. It gains at all three IoU thresholds together, unlike FT's
+presence-for-localisation trade. Still one seed; s1/s2 pending.
+
+This also means the "+aug" arm's advantage was **not** the doubled window count: `augonly`
+trains on 2,468 windows, the same as the baseline. The augmentation is doing the work.
+
+Probe-internal metrics for the same seed (retained to show why the real metric was needed — on
+these the arms looked nearly tied and ranked *oppositely* across columns):
+
 | metric† | baseline s0 | `augonly` s0 | `frozen_aug` s0 |
 |---|---:|---:|---:|
 | macro mAP | 0.3187 | **0.3506** | 0.3345 |
 | box mAP@50 | 0.5087 | 0.5573 | **0.5641** |
 
-Leaning **"it's the augmentation"** — `augonly` matches or beats `frozen_aug` on mAP using half
-the windows, and beats the baseline on all four columns. But the baseline's own 3-seed spread
-is 0.0112 and one seed cannot carry a 0.03 gap. Note the two columns rank the arms *oppositely*
-(the same presence-vs-localisation split as FT) — verdict deferred to the 3-seed detection AP.
 Ledger §4b-frozctl.
+
+**Does it hold across checkpoints? — 6-checkpoint campaign LAUNCHED 2026-08-25.** The result
+above is one checkpoint. If it is a property of *augmentation* it should reproduce on other
+backbones; if it is a property of *this* checkpoint it will not — and until that is measured,
+every frozen "ours vs theirs" comparison here is unfair in our favour, because our arm would
+have the augmentation and the externals would not. `augonly` × 3 seeds is now running for
+**meta2b, meta1b, ours1b_e19, lemonfm, snx, endovit** (Polaris `preemptable`, jobs
+7555007/9/10/11/14/15).
+
+Each arm mirrors *its own* baseline, which differ by family and must not be mixed: the V-JEPA
+arms use rep-mode presence overrides and score on `cov_p0`+`cov_p1` → `combined_not_isolated`
+(5,903 frames); the image arms (lemonfm/snx/endovit) use tubelet-1 manifests, no presence
+override, and score fairness-masked to V-JEPA's covered stems. Config fairness was verified by
+diffing all seven probe YAMLs rather than assumed: only `embed_dim` and the two token-count keys
+differ, and all three are fixed by the backbone's width and patch grid, not chosen. Ledger
+§4b-augext.
 
 **Seed-ensemble (frozen only):**
 

@@ -1804,14 +1804,122 @@ in, and writes `results_index.json` so the next reader parses results instead of
 This replaces `collect_ft.py`, which carried its numbers as a hardcoded literal dict — every new arm
 needed a collector edit, and any stale entry silently produced a wrong table.
 
+### 4b-augext. Does the augmentation gain hold across checkpoints? — LAUNCHED 2026-08-25
+
+§4b-frozctl measured `frozen_augonly` on **one** checkpoint (prod37m_e199) and found +0.0415 AP
+= 4.0 baseline sd. If that is a property of *augmentation* it should reproduce on other
+backbones; if it is a property of *this checkpoint* it will not. Until it is measured on more
+than one backbone, every "ours vs theirs" frozen comparison in this ledger is unfair in our
+favour — our arm would have the augmentation and the externals would not.
+
+**Six checkpoints, 3 seeds each, all `augonly`.** Launched on Polaris `preemptable` as jobs
+7555007/9/10/11/14/15.
+
+| checkpoint | family | run tag | baseline it mirrors |
+|---|---|---|---|
+| `meta2b` | vjepa | `frozen_augonly` | `meta2b_frozen_presrep` |
+| `meta1b` | vjepa | `frozen_augonly` | `meta1b_frozen_presrep` |
+| `ours1b_e19` | vjepa | `frozen_augonly` | `ours1b_e19_frozen_presrep` |
+| `lemonfm` | ext | `t1_augonly` | `lemonfm_t1` |
+| `snx` | ext | `t1_augonly` | `snx_t1` |
+| `endovit` | ext | `t1_augonly` | `endovit_t1` |
+
+**`augonly`, not `aug` — the arm choice is the whole point.** `aug` passes `--train-cache`
+twice (deterministic + augmented). Since that flag is `action="append"`, it **doubles**
+windows/epoch from 2,468 to 4,936, so its delta conflates augmentation with 2× data
+([[frozen-aug-is-a-different-treatment]]). `augonly` passes only the augmented cache: identical
+window count, identical optimiser steps, the sole difference is that the pixels were
+crop/jitter-perturbed at export. That is the arm whose delta is attributable, so it is the one
+replicated across all six.
+
+**The two families are NOT scored the same way, and must not be.** They inherit different
+baselines and mixing them would produce a number comparable to nothing:
+
+* **vjepa** (meta2b / meta1b / ours1b_e19) — mirrors `frozen_presrep`: rep-mode presence
+  overrides at load time, features from `cache_<n>`, scored on `cov_p0`+`cov_p1` and read from
+  `combined_not_isolated` (5,903 frames, `gt_full=11207`).
+* **ext** (lemonfm / snx / endovit) — mirrors `<n>_t1`: tubelet-1 manifests, `cache_<n>_t1`,
+  **no** presence override, scored fairness-masked to V-JEPA's covered frame stems (the image
+  arms reach ~100% test coverage at tubelet=1, so the unmasked number is a secondary column and
+  never the comparison column).
+
+**Config fairness was verified before spending the compute**, not asserted. Flattening all seven
+probe YAMLs and diffing against prod37m leaves exactly three differing keys —
+`model_kwargs.embed_dim`, `head_kwargs.tokens_per_clip`, `head_kwargs.temporal_tokens` — and all
+three are **backbone-determined, not free choices**: `embed_dim` is the encoder's output width,
+and the token counts follow each backbone's patch grid (16/48 for the image arms, 8/24 for the
+V-JEPA tubelet-2 arms). Every tunable knob already matches across all seven: `w_presence 1.0`,
+`w_box 1.0`, `w_l1 5.0`, `w_giou 2.0`, `pos_weight_cap 50.0`, `batch_size 8`, `num_epochs 20`,
+`warmup_epochs 2.0`, `early_stop_patience 6`, `lr 1.0e-3`, `weight_decay 0.05`,
+`presence_num_layers 4`, `presence_dropout 0.2`, `num_segments 3`. The export YAMLs differ only
+in checkpoint path and encoder arch.
+
+**Why Polaris and not Sophia.** Sophia's `by-gpu` allows `max_run=5` / `max_queued=20` per
+*project* and the FT campaign already held 17 of those slots — six more jobs would have been
+refused by the server, not queued. Polaris `preemptable` allows 10 concurrent single-node jobs
+at Priority 155 with a 72 h walltime, and Polaris is `force_exclhost` so each job gets all 4
+A100s: 4-way parallel export, then 3 seeds in parallel, then 3 scores in parallel. Note `debug`
+is **not** usable here — its 1 h cap already walltime-killed two of these runs at epoch 18/20
+(7551194, 7551483). See [[polaris-preemptable-is-the-capacity-queue]].
+
+**Two gates the launcher enforces, both from failures already on record:**
+
+1. **Export completeness is summed across shards, not per-rank.** `export_esad_cache.py`
+   resolves world size from `(PMI_SIZE, PMIX_SIZE, OMPI_COMM_WORLD_SIZE, PALS_SIZE, WORLD_SIZE)`
+   *in that order*, and each rank writes its own manifest marked `completed`. So a stray
+   `PMI_SIZE` — or one dead rank — yields a cache that passes every per-rank check while holding
+   a fraction of the training set, under a full-size name. The gate sums `num_samples` over all
+   `rank_*/manifest.json` and demands it equal the window count (2,468).
+2. **Epoch count, not `best.pt`, is the completion signal.** `best.pt` is written from epoch 0
+   onward, so gating on it publishes a killed 17/20-epoch run as finished — which is exactly how
+   a "20 epochs in 37 minutes" run got past review earlier ([[wall-clock-hides-a-resume]]).
+   Training gates at `>=20` epochs in `log_r0.csv`; scoring gates at `>=19`.
+
+The vjepa arms additionally assert `presence override ACTIVE` in the train log — without it a run
+trains on *union* labels under a `presrep` name, a plausible answer to the wrong question.
+
 ### 4b-frozctl. Is the frozen "+aug" gain augmentation, or just more windows? — SEED 0 ONLY, preliminary (2026-08-25)
 
-**Status: 1 of 3 seeds. Do not cite these deltas as a result.** The deciding metric
-(full-denominator detection AP) is produced by a score pass that runs only *after* all three
-seeds finish, so it does not exist for either arm yet. What follows is the probe-internal
-`test_summary.json` from seed 0, which is available now and is enough to say which way the
-control is leaning — and, more usefully, enough to say that it is leaning by less than the
-noise.
+**Status: 1 of 3 seeds. Do not cite these deltas as a final result** — but the seed-0 detection
+AP is now measured, and it is much larger than the probe-internal metrics suggested.
+
+**★ UPDATE 2026-08-25 02:05 — the deciding metric now exists for `frozen_augonly` s0, via an
+early 1-GPU score pass (job 176612).** The original text below said the deciding metric "does not
+exist for either arm yet," which was true of the *chained* score passes: those run only after all
+three seeds finish, and the 4-GPU arms are queued behind a Thu Aug 27 estimate. But scoring needs
+**one** GPU, and 1-GPU jobs place on Sophia in seconds
+([[one-gpu-jobs-place-while-quads-wait]]). Gated at `>=19` epochs so it cannot score a
+mid-training seed.
+
+**Full-denominator detection AP, canonical population** (`gt_full=11207`, `frames=5903`,
+node `combined_not_isolated`, fusion `wbf_meanconf`):
+
+| arm | seed | AP_mean | AP10 | AP30 | AP50 |
+|---|---|---:|---:|---:|---:|
+| `frozen_presrep` (baseline) | s0 | 0.1717 | 0.2417 | 0.2007 | 0.0727 |
+| | s1 | 0.1922 | 0.2635 | 0.2211 | 0.0921 |
+| | s2 | 0.1796 | 0.2534 | 0.2099 | 0.0757 |
+| | **mean** | **0.1812 ± 0.0103** | | | |
+| **`frozen_augonly`** | **s0** | **0.2227** | **0.2901** | **0.2510** | **0.1270** |
+
+**+0.0415 over the baseline mean = 4.0 baseline sd**, and +0.0305 over the *best* baseline seed.
+It also clears the fine-tuned last-4 mean (0.2035) — **a frozen probe beating fine-tuning**,
+which no other arm in this campaign has done. And it gains at **all three IoU thresholds
+together** (+0.048 / +0.045 / +0.049 vs the baseline mean), the signature of a genuine
+improvement rather than the presence-vs-localisation trade that FT shows. One seed is still one
+seed, but 4 sd is well outside where a single draw normally lands.
+
+⚠ **Read the right node.** These JSONs carry four population nodes. `source0_only` scores only
+**3,467** frames and gives ~0.10 for the same checkpoints; the canonical
+`combined_not_isolated` / `coverage_isolated` nodes score **5,903** and reproduce the ledger's
+published 0.1707/0.1905/0.1767 → 0.1793 exactly. I first read `source0_only` here and got numbers
+that looked catastrophically low. Always check `num_frames_scored == 5903` before comparing.
+Also note `ap_by_iou_threshold` is the **threshold list** `[0.1,0.3,0.5]`, not per-threshold AP —
+the AP breakdown is `nanmean(per_class_ap_by_iou, axis=0)`.
+
+The probe-internal `test_summary.json` table further below is retained because it shows why this
+needed the real metric: on those columns the two aug arms looked nearly tied and split
+oppositely across metrics. On detection AP the picture is much cleaner.
 
 **The design.** §4b-aug showed that adding an augmented cache to the *frozen* probe helps. But
 `--train-cache` in `train_esad_double_head.py` is `action="append"`, so passing clean + augmented
