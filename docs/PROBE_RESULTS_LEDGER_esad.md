@@ -1844,6 +1844,29 @@ of **+0.0009**. The two later seeds agree with each other to within 0.001 and bo
 every one of the three presrep seeds (0.1707 / 0.1905 / 0.1767). Seed 0 was the outlier, and the
 entire published claim was that outlier.
 
+**Scope of the null: this tests ONE FIXED augmented rendering, not augmentation-as-regulariser.**
+Every `*_augtrain` cache carries `aug_seed = 0` in its rank manifests, and the features are
+exported **once** and then read for all three training seeds. So the trainer sees the *same*
+perturbed pixels every epoch and across every seed — there is no per-epoch resampling and
+therefore no variance-injection mechanism for a regulariser to act through. What this campaign
+actually measured is "does training on one fixed alternative rendering of the 2,468 windows beat
+training on the deterministic rendering," and the answer is no. It does **not** rule out
+augmentation that resamples per epoch, which is the live cached-path gap tracked as open task #7
+(`aug RNG has no epoch term`) and is how the FT path — where `--augment` is a *runtime* flag and
+does redraw — gets its `ft_aug` gain. That asymmetry is the most likely reason FT benefits and
+frozen does not, and it is a testable claim, not an explanation to assume.
+
+Window counts verified equal at 2,468 for `cache_prod37m_e199/train` and
+`cache_prod37m_e199_augtrain/train`, so the `augonly` arm is clean of the 2× confound by
+measurement, not by assertion.
+
+**The doubled-window arm reproduces the same seed pattern.** `frozen_aug` (both caches, 4,936
+windows/epoch) is at 0.2084 / 0.1564 → 0.1824 ± 0.0367 (n=2, s2 pending). Both *augmented* arms
+therefore show a high seed 0 and a much lower tail, with sd 0.031–0.037, while the un-augmented
+control sits at sd 0.0101 over three seeds. The instability tracks the augmented caches, not the
+window count. Note the `aug_seed=0` finding rules out the tempting reading that training seed 0
+is somehow matched to the cache draw: all three training seeds read identical pixels.
+
 ⚠ **Read `variants_full_denominator.maxpick.ap_mean`, not the scorer log's printed number.**
 The `[DET-AP]` line the scorer emits is from `variants` — the *covered*-denominator column — and
 runs ~0.007–0.008 higher (s2: 0.1696 printed vs **0.1621** full-denominator). `det_ap()` in
