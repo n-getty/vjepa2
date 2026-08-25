@@ -4766,3 +4766,34 @@ knobs measured separately in §6.
 
 Magnitude of the difference being tested (400 sampled windows): kept area
 0.946 → 0.839, max edge shift 0.029 → 0.087, colour deviation 0.113 → 0.226.
+
+### 10. 26 of 122 scored seeds trained fewer than 20 epochs — a hygiene defect, not a corrupted result
+
+Found while auditing a job that exited `-29` (`176587`, killed at 03:00:20 on a
+3 h wall, mid-seed-2) and a sibling (`176599`) left `job_state=F Hold_Types=d`,
+i.e. deleted while held and never run. **No seed was actually lost** — those jobs
+were re-running seeds already complete on disk (one monitor logged
+`RESUME OK: appended epoch 17 ... did not restart`), and all prod37m frozen arms
+hold 3 scored seeds. Earlier numbers in this ledger stand.
+
+What the audit *did* surface: **26 of 122 scored seeds ran 14–19 epochs instead
+of 20**, and 7 arms average short and full seeds together.
+
+Is the damage real? Two checks:
+
+| check | result |
+|---|---|
+| short seeds still improving when cut (best_epoch within 2 of end) | **1 of 11** |
+| short-seed mean vs full-seed mean | 0.1483 vs 0.1676 — but confounded |
+| in the 7 mixed-length arms, is the short seed the weak one? | **best in 4/7, worst in 1/7** |
+
+The headline gap is a family effect, not a length effect: short runs cluster in
+the weak `frozen_presrep` / `frozen` families. Within an arm the short seed is
+usually the *better* one. And 10 of 11 had peaked well before their cut, so
+truncation did not cost them their best checkpoint — consistent with these
+probes converging early (`best_epoch` typically 7–15 of 20).
+
+**Verdict:** comparability hygiene issue, no result requires retraction. The
+fix belongs on new arms — one seed per job, and a wall derived from the arm's
+own measured pace (§4b-infra 1) — not on re-running 26 seeds to move numbers
+inside their own noise floor.
