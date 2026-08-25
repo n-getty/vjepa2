@@ -178,8 +178,18 @@ score_seed() {
   # "[TRAIN] early stop at epoch N" and breaks; a PBS kill prints nothing.
   # Gating on epoch count alone silently dropped every converged seed that
   # stopped before 19 -- historically ~38% of frozen runs.
-  if [ "$NEP" -lt 19 ] && ! grep -q "early stop at epoch" "$OUT/stdout.log" 2>/dev/null; then
-    echo "[score] skip s$SEED: only $NEP epochs and no early-stop line (killed?)"; return 0
+  # Second witness, from the CSV alone: stdout.log can be absent even for a
+  # complete run (prod37m s2 had all 20 epochs in log_r0.csv and no log at
+  # all), and grep-on-a-missing-file fails CLOSED -- safe, but it discards a
+  # finished seed. The trainer stops when (last_epoch - best_epoch) >= patience,
+  # so that condition is itself proof it stopped on its own rather than by kill.
+  local CONVERGED=no
+  if [ -f "$OUT/log_r0.csv" ]; then
+    CONVERGED=$(awk -F, 'NR>1{le=$1; be=$NF} END{if(NR>1 && (le-be)>=6) print "yes"; else print "no"}' "$OUT/log_r0.csv")
+  fi
+  if [ "$NEP" -lt 19 ] && [ "$CONVERGED" = no ] \
+     && ! grep -q "early stop at epoch" "$OUT/stdout.log" 2>/dev/null; then
+    echo "[score] skip s$SEED: only $NEP epochs, no early-stop line, not converged (killed?)"; return 0
   fi
   if [ "$FAMILY" = "vjepa" ]; then
     local RJ=$OUT/test_detection_ap_cov_fulldenom.json
