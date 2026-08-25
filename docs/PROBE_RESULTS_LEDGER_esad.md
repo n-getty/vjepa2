@@ -2311,6 +2311,63 @@ Artifacts: `runs/esad_double_{meta1b,v1,meta2b,ours1b_e19}_selmetric_ablation_s{
 has **no `best_epoch` field**; its epoch lives only in the checkpoint (`ckpt['epoch']`).
 Launcher: `run_selection_metric_ablation.sh`.
 
+### 4b-heads. Do the presence and box heads interfere? — NO, confirmed (2026-08-25)
+
+The negative control §4b-selmetric's launcher called for. `ESADDoubleHead`'s `presence_head` and
+`box_head` are disjoint modules — no shared weights, only a shared frozen input tensor — and
+`loss = w_pres*bce + w_box*bl` goes through one `.backward()`, with autograd routing each term to
+its own subgraph. So training them separately should buy nothing. meta1b, 3 seeds each, same
+cache and same config as the joint run, selection matched to the joint side it is compared against
+(`boxonly` uses `selection_metric: mean_iou` → joint's `best_by_iou.pt`; `presonly` keeps the
+default → joint's `best.pt`).
+
+| comparison (paired within seed, n=3) | metric | mean Δ | sd | t |
+|---|---|---:|---:|---:|
+| `boxonly` − joint | test_mean_iou | +0.0012 | 0.0142 | 0.15 |
+| `boxonly` − joint | test_map50 | +0.0127 | 0.0406 | 0.54 |
+| `presonly` − joint | test_macro_map | +0.0251 | 0.0368 | 1.18 |
+| `presonly` − joint | test_well_supported_map | +0.0260 | 0.0397 | 1.14 |
+| **same-config REPEAT** | test_macro_map | +0.0093 | 0.0304 | 0.53 |
+| **same-config REPEAT** | test_well_supported_map | **+0.0256** | 0.0479 | 0.93 |
+| **same-config REPEAT** | test_mean_iou | −0.0225 | 0.0374 | −1.04 |
+| **same-config REPEAT** | test_map50 | −0.0587 | 0.0956 | −1.06 |
+
+**Read the last four rows before the first four.** `esad_double_meta1b_frozen_s{0,1,2}` and
+`esad_double_meta1b_selmetric_ablation_s{0,1,2}` were launched from the *same* yaml at the *same*
+seeds, six days apart — a free same-config repeat. Confirmed same-seed by epoch-0 `train_bce`:
+matched pairs differ by 0.0141 on average, mismatched-seed pairs by 0.0780, a 5.5× separation.
+Its presence delta is **+0.0256**, which is `presonly`'s **+0.0260** to three decimals, and its
+box deltas are *larger* than either ablation's. Every ablation delta is inside the floor measured
+by running the identical config twice. **The heads do not interfere. Separate training buys
+nothing**, exactly as designed.
+
+**Only compare the metrics whose head was trained.** `presonly` sets `w_box=0`, so its box head
+never receives a gradient and its `test_mean_iou` 0.2291 / `test_map50` 0.1023 are untrained noise,
+not a regression; `boxonly` is the same in reverse (presence 0.1148/0.1512). Scoring the
+untrained head would manufacture a large fake effect in both arms.
+
+**A coupling the launcher's reasoning missed, and why it is still inert.** The autograd argument
+is correct but incomplete: both heads also share one `GradScaler` and one `optimizer.step()`, so
+under fp16 a box-loss overflow makes `scaler.step()` a no-op that skips the *presence* update too,
+and the scale-backoff schedule is driven by both heads' gradients. That is a real path autograd
+does not cover, so it was tested rather than assumed — `presonly` vs joint diverge from epoch 0
+(|Δ train_bce| = 0.0128/0.0166/0.0147). But the same-config repeat diverges by 0.0161/0.0159/0.0104
+on the same measure, so the divergence is ordinary run-to-run nondeterminism in GPU reductions,
+not scaler coupling. **Divergence-from-epoch-0 is not evidence of anything until you know what two
+identical runs do.**
+
+Convergence checked before use, header-driven, never `$NF` (see §4b-augext): `boxonly` s0/s2 ran
+only 12/10 of 20 epochs but both self-stopped — last−best = 6 = `early_stop_patience` — so they
+are complete, not killed. All 9 runs qualify.
+
+Artifacts: `runs/esad_double_meta1b_{boxonly,presonly}_ablation_s{0,1,2}/`, compared against
+`runs/esad_double_meta1b_selmetric_ablation_s{0,1,2}/`; floor from
+`runs/esad_double_meta1b_frozen_s{0,1,2}/`. Launcher: `run_freeze_head_ablation.sh`.
+
+**What this closes.** §4b-selmetric asked whether meta1b's weak localization was a selection
+artifact or head interference. Neither: selection-on-IoU makes it *worse* (11/11), and separate
+training does nothing. The gap is the checkpoint's, not the head's — stop tuning the head for it.
+
 ### 4b-ens. Cross-seed ensembling on the FINE-TUNED arms — beats the seed MEAN 6/6, and the gain is localization (2026-08-25)
 
 Extends §4f's frozen seed-ensemble to the fine-tuned path. The reason this needed a separate
@@ -3950,6 +4007,14 @@ Reproduce: `python scripts/aggregate_triplet_seeds.py --root
       tails; ~12 epochs would cut cost ~40% at likely no loss.
 - [ ] **ESAD: any future head experiment needs ≥8 seeds or an effect >0.06** — n=3 cannot
       resolve the effect sizes this probe produces. Budget accordingly or don't run it.
+      **Now measured, not estimated (§4b-heads, 2026-08-25):** the same yaml at the same 3 seeds,
+      run twice, moves `well_supported_map` by **+0.0256** and `map50` by **−0.0587**, with
+      per-seed swings up to 0.1185. Use `runs/esad_double_meta1b_frozen_s{0,1,2}` vs
+      `runs/esad_double_meta1b_selmetric_ablation_s{0,1,2}` as the standing floor — a free
+      same-config repeat, already on disk. **Any frozen-head arm reporting a delta smaller than
+      that is reporting nothing**, and two arms of this campaign (`presonly` +0.0260,
+      `boxonly` +0.0127) sat entirely inside it. Same seed does NOT mean same run here: GPU
+      reductions are nondeterministic and the trajectories split from epoch 0.
 - [ ] **ESAD: train on RARP1 too (n=2 → 3 surgeries, +7120 GT boxes, +25%).** STATUS.md names
       n=2 as the top limitation; test is RARP3 so folding val into train is legitimate — hold
       out part of RARP4 for selection. Gains are uneven: cls 20 +269%, cls 9 +62%, cls 10 +45%,
