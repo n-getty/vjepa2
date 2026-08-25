@@ -513,6 +513,36 @@ keeping: `frozen_aug` s0 reaches the lowest final train BCE of all nine frozen r
 still scores below `augonly` s0 (0.2084 vs 0.2155 at BCE 0.216) — the extra windows bought
 overfitting, not AP.
 
+**The frozen-probe noise floor, measured rather than estimated (2026-08-25).** Two runs of the
+*same yaml at the same 3 seeds* — `esad_double_meta1b_frozen_s{0,1,2}` vs
+`esad_double_meta1b_selmetric_ablation_s{0,1,2}`, launched six days apart and confirmed same-seed
+by epoch-0 train BCE (matched pairs differ 0.0141, mismatched 0.0780) — disagree by:
+
+| metric | Δ (repeat − original), n=3 paired | max per-seed |
+|---|---:|---:|
+| `well_supported_map` | **+0.0256** | 0.0755 |
+| `macro_map` | +0.0093 | 0.0428 |
+| `mean_iou` | −0.0225 | 0.0472 |
+| `map50` | **−0.0587** | 0.1185 |
+
+Same seed does not mean same run: GPU reductions are nondeterministic and the trajectories split
+at epoch 0. **Any frozen-head delta smaller than this is reporting nothing** — which is the hard
+number behind the standing "≥8 seeds or an effect >0.06" rule, and which retires two arms below.
+
+**Do the presence and box heads interfere? — NO (§4b-heads, 2026-08-25).** Negative control:
+train meta1b's heads separately (`w_box=0` / `w_presence=0`), 3 seeds each, vs the joint run at
+the matching selection. `presonly` moves presence by +0.0260 and `boxonly` moves map50 by +0.0127
+— against a same-config repeat floor of +0.0256 and −0.0587. Both are inside it; the presence
+delta matches the floor to three decimals. Separate training buys nothing, as the launcher
+predicted from the heads being disjoint autograd subgraphs. Two traps: `presonly`'s box head
+never receives a gradient, so its IoU/map50 are untrained noise and scoring them would fake a
+large effect; and the disjoint-subgraph argument misses that both heads share one `GradScaler`
+and one `optimizer.step()` — tested, and the resulting epoch-0 divergence turned out to match the
+same-config repeat's, so it is nondeterminism, not coupling.
+
+Together with the selection-metric result above, this closes the meta1b localization question:
+the gap is neither a selection artifact nor head interference. It belongs to the checkpoint.
+
 Original framing, retained:
 
 **Does it hold across checkpoints? — 6-checkpoint campaign LAUNCHED 2026-08-25.** The result
