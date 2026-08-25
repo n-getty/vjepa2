@@ -4948,3 +4948,31 @@ the variant borrows the export and cannot overwrite the arm it borrows from.
 Before submitting, confirmed the export gate *passes* on the borrowed cache — a
 gate miss runs `rm -rf "$AUGC/train"`, which would have deleted endovit's cache
 and silently re-exported it under the variant's seed.
+
+### §11d — The other truncated seeds are noise; only endovit needed action
+
+§11c flagged endovit at 3/3 seeds still rising. Four other arms carry exactly
+one still-rising seed each, so the obvious follow-up is whether the table is
+biased downward unevenly. It is not:
+
+| arm | truncated seed | vs its arm's converged mean |
+|---|---|---:|
+| snx | s0 | +0.0220 |
+| meta1b | s2 | +0.0047 |
+| lemonfm | s2 | +0.0026 |
+| meta2b | s0 | **−0.0541** (the truncated seed is the arm's BEST) |
+| | **mean** | **−0.0062** |
+
+Positive in 3 of 4, but the mean is *negative* and every individual gap is
+inside the arm's own seed spread (sd 0.011–0.041). In meta2b the still-rising
+seed leads its siblings by a wide margin — a seed can be both unconverged and
+the best one on the arm, so "still rising" does not imply "handicapped".
+
+This is the same shape as the short-seed audit (§10): a truncation signal that
+looks systematic until you check it within-arm, where it dissolves into noise.
+
+**Conclusion:** no action on the single-seed truncations; re-running them would
+move numbers inside their own noise floor. endovit is categorically different —
+3/3 rather than 1/3, and with no converged sibling there is no within-arm
+comparison available to bound it at all. That is why it alone got the 40-epoch
+arm (7557222), and why the fix is an *added* row rather than a re-run.
