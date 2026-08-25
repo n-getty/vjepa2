@@ -4626,3 +4626,32 @@ A positive reading will be a draw on classes 0 and 12.
 When a 21-class mAP has 8 classes under 50 positives, that mAP is substantially
 a lottery over those 8.
 
+
+### 5. How much does the epoch-selection metric actually tell us? (calibration)
+
+Every FT run selects its reported epoch by `val_well_map`. Since
+[[selecting-on-the-target-metric-overfits-val]] (GraSP: argmax on the target
+metric lost test IoU 11/11), this selector needed a number rather than an
+assumption. Measured over every scored seed on disk:
+
+| question | answer | n |
+|---|---|---:|
+| Pearson r(`best_metric`, canonical det-AP) | **0.801** | 83 seeds |
+| Same-arm seed pairs ordered concordantly | **62/79 = 78.5%** | 79 pairs |
+| Global argmax `val_well_map` = 0.4779 | det-AP **0.1877** | — |
+| Global argmax det-AP = **0.2585** | val_well only 8th | — |
+
+**Read:** the selector is sound as a coarse filter — r=0.80 is real signal, and
+78.5% within-arm concordance beats the 50% coin flip. It is *not* sound as a
+result: it is wrong on one seed pair in five, and its own global maximum picks a
+run scoring 0.07 AP below the actual best. Selecting a headline arm this way
+would have cost more than any treatment in this ledger has gained.
+
+Practical rule, unchanged but now quantified: no ordering claim — between arms
+or between seeds — is stated from `val_well_map`. It waits for
+`combined_not_isolated.variants_full_denominator.maxpick.ap_mean`.
+
+*(Correction: an earlier note in this campaign described `augpe` s0 as holding
+the highest `val_well_map` of any arm. That read a mid-run CSV row rather than
+the `best_metric` column; its actual best is 0.4361, rank 12 of 120. Read CSV
+fields by header — the FT and augonly trainers put different columns last.)*
