@@ -4687,3 +4687,31 @@ re-crop. `augpe` tests *freshness* at weak strength, `augstr` tests *strength* �
 two different questions, and neither subsumes the other. (This also explains the
 ~30% epoch speedup of the augmented arms: the crop discards pixels before the
 BILINEAR resize.)
+
+### 7. `augpe` seed 0 — first real per-epoch augmentation, and it did not help (n=1)
+
+Canonical det-AP (`combined_not_isolated.variants_full_denominator.maxpick`),
+prod37m_e199 arms:
+
+| arm | mean det-AP | sd | n |
+|---|---:|---:|---:|
+| `ft_aug` | **0.2319** | 0.0243 | 3 |
+| `ft_aug_last8` | 0.2280 | 0.0025 | 2 (sd is not tightness — see §4b-infra 3) |
+| `ft_last4` | 0.2035 | 0.0162 | 3 |
+| **`ft_augpe_last4`** | **0.1942** | — | **1** |
+| `frozen_augonly` / `frozen_presrep` / `frozen_aug` | 0.173–0.180 | ~0.03 | 3 |
+
+`augpe` s0 = **0.1942**, below every `ft_aug` seed (0.2107–0.2585) and below the
+`ft_last4` baseline mean. Against `ft_last4`'s own sd of 0.0162 this is inside
+one standard deviation of 0.2035 — **consistent with no effect, not with a
+regression**. No ordering is claimed at n=1 ([[one-seed-has-no-error-bar]]);
+176563/64 decide the arm.
+
+**The selection metric disagreed, as calibrated.** `augpe` s0 ranked 12/120 on
+`val_well_map` (0.4361) but sits near the bottom on det-AP — an instance of the
+21.5% within-arm discordance measured in §5 *before* this number was read. Had
+the arm been called from its selection metric it would have been called wrong.
+
+Read together with §6: making the weak default recipe *fresh* every epoch bought
+nothing on this seed, which points at recipe **strength** (`augstr`, 176575-77)
+rather than freshness as the remaining lever — if either is one.
