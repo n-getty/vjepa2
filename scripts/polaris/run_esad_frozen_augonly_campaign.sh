@@ -183,9 +183,21 @@ score_seed() {
   # all), and grep-on-a-missing-file fails CLOSED -- safe, but it discards a
   # finished seed. The trainer stops when (last_epoch - best_epoch) >= patience,
   # so that condition is itself proof it stopped on its own rather than by kill.
+  # Find best_epoch BY HEADER NAME, never by position. The two ESAD trainers
+  # write different columns -- frozen has `lr` and ends on best_epoch; the FT
+  # trainer (train_esad_unfreeze.py) has no `lr` and ends on `secs`. Both are
+  # 11 fields wide and both land in a file called log_r0.csv, so $NF silently
+  # reads seconds on an FT run. That mistake has already been made once here
+  # (it read best_epoch as a timing column and concluded head-training was
+  # free). This script only scores frozen arms today, but the failure is silent
+  # and the fix is one awk clause.
   local CONVERGED=no
   if [ -f "$OUT/log_r0.csv" ]; then
-    CONVERGED=$(awk -F, 'NR>1{le=$1; be=$NF} END{if(NR>1 && (le-be)>=6) print "yes"; else print "no"}' "$OUT/log_r0.csv")
+    CONVERGED=$(awk -F, '
+      NR==1 { for (i=1;i<=NF;i++) if ($i=="best_epoch") bi=i; next }
+      !bi   { next }
+            { le=$1; be=$bi; n++ }
+      END   { if (n && bi && (le-be)>=6) print "yes"; else print "no" }' "$OUT/log_r0.csv")
   fi
   if [ "$NEP" -lt 19 ] && [ "$CONVERGED" = no ] \
      && ! grep -q "early stop at epoch" "$OUT/stdout.log" 2>/dev/null; then
