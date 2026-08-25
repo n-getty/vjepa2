@@ -467,13 +467,15 @@ three V-JEPA campaign jobs finished. Against **its own** `frozen_presrep` contro
 
 | backbone | `frozen_augonly` | `frozen_presrep` | Δ |
 |---|---:|---:|---:|
-| `prod37m_e199` | 0.1893 (n=2) | 0.1793 ± 0.010 (n=3) | +0.0100 |
+| `prod37m_e199` | **0.1802 ± 0.031 (n=3)** | 0.1793 ± 0.010 (n=3) | **+0.0009** |
 | `meta2b` | 0.1362 ± 0.041 (n=3) | 0.1278 ± 0.012 (n=3) | +0.0084 |
 | `meta1b` | 0.1432 (n=2) | 0.1459 ± 0.022 (n=3) | −0.0027 |
 | `ours1b_e19` | 0.1545 (n=2) | 0.1339 ± 0.011 (n=3) | +0.0206 |
 
-Mean **+0.0091**, one of four negative, all far inside the ~0.05 between-seed spread. **The
-+0.0415 does not reproduce on any backbone, including the one it came from.** `ft_aug`
+Mean **+0.0068**, one of four negative, all far inside the between-seed spread. **The
++0.0415 does not reproduce on any backbone, including the one it came from** — completed to
+n=3, that arm is 0.2155 / 0.1631 / 0.1621, and its two later seeds both fall below every
+presrep seed. Seed 0 was the outlier, and the published claim was that outlier. `ft_aug`
 (0.2319 ± 0.024) is untouched and remains the best arm.
 
 The treatment is real but unhelpful: at a **fixed epoch 5**, augonly's train BCE exceeds its own

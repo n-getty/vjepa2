@@ -1827,16 +1827,29 @@ the collector's `vs base` column (that is against `ft_last4` and answers a diffe
 
 | backbone | `frozen_augonly` | `frozen_presrep` | Δ |
 |---|---:|---:|---:|
-| `prod37m_e199` | 0.1893 (n=2) | 0.1793 ± 0.0101 (n=3) | +0.0100 |
+| `prod37m_e199` | **0.1802 ± 0.0306 (n=3)** | 0.1793 ± 0.0101 (n=3) | **+0.0009** |
 | `meta2b` | 0.1362 ± 0.041 (n=3) | 0.1278 ± 0.012 (n=3) | +0.0084 |
 | `meta1b` | 0.1432 (n=2) | 0.1459 ± 0.022 (n=3) | −0.0027 |
 | `ours1b_e19` | 0.1545 (n=2) | 0.1339 ± 0.011 (n=3) | +0.0206 |
 
-Mean **+0.0091**, one of four negative, and between-seed spread on these arms is ~0.05 — **five
-times the effect**. **No effect is established for frozen augmentation.** The retracted +0.0415
-does not reproduce on any backbone including the one it came from. `ft_aug` (0.2319 ± 0.024,
-n=3) is unaffected and remains the best arm on record; the FT augmentation result in
-§4b stands.
+Mean **+0.0068**, one of four negative, and between-seed spread on these arms is ~0.03–0.05 —
+**several times the effect**. **No effect is established for frozen augmentation.** The retracted
++0.0415 does not reproduce on any backbone including the one it came from. `ft_aug`
+(0.2319 ± 0.024, n=3) is unaffected and remains the best arm on record; the FT augmentation
+result in §4b stands.
+
+**The originating arm, completed to n=3, lands on its control.** `prod37m_e199_frozen_augonly`
+per-seed is **0.2155 / 0.1631 / 0.1621** → 0.1802 ± 0.0306 vs presrep's 0.1793 ± 0.0101: a delta
+of **+0.0009**. The two later seeds agree with each other to within 0.001 and both fall *below*
+every one of the three presrep seeds (0.1707 / 0.1905 / 0.1767). Seed 0 was the outlier, and the
+entire published claim was that outlier.
+
+⚠ **Read `variants_full_denominator.maxpick.ap_mean`, not the scorer log's printed number.**
+The `[DET-AP]` line the scorer emits is from `variants` — the *covered*-denominator column — and
+runs ~0.007–0.008 higher (s2: 0.1696 printed vs **0.1621** full-denominator). `det_ap()` in
+`collect_esad_arms.py` reads `variants_full_denominator`, so the log and the collector disagree
+by design. Quoting the log line into a comparison against collector-sourced numbers silently
+mixes two denominators.
 
 **The treatment is doing something — it just isn't helping.** Sorting all 27 frozen seeds by
 final train `bce` puts `augonly` at the high-loss end and `presrep` at the low end (8 of the 12
