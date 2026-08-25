@@ -4798,3 +4798,69 @@ probes converging early (`best_epoch` typically 7–15 of 20).
 fix belongs on new arms — one seed per job, and a wall derived from the arm's
 own measured pace (§4b-infra 1) — not on re-running 26 seeds to move numbers
 inside their own noise floor.
+
+---
+
+## §11 — Frozen + augmentation-only: the fair six-checkpoint comparison
+
+Answering the standing "matched configs, apples to apples" request. Every arm
+below is **frozen backbone + augmented-train-cache-only** (`augonly`, not `aug`
+— same 2468 windows and same optimiser steps, only the pixels differ, so the
+delta is attributable to augmentation rather than to 2× data).
+
+All six are read off the **same 5903-frame scored denominator** via
+`variants_full_denominator.maxpick.ap_mean`.
+
+| arm | mean det-AP | sd | n |
+|---|---:|---:|---:|
+| **prod37m_e199 (ours)** | **0.1802** | 0.0306 | 3 |
+| ours1b_e19 | 0.1545 | 0.0057 | 2 → 3 pending |
+| meta1b | 0.1432 | 0.0033 | 2 → 3 pending |
+| meta2b | 0.1362 | 0.0410 | 3 |
+| lemonfm (external) | 0.1327 | 0.0126 | 3 |
+| snx (external) | 0.1304 | 0.0128 | 3 |
+
+endovit is still exporting (7555015). **Our checkpoint leads the frozen+augonly
+readout**; the +0.050 margin over the best external is ~1.6 sd of prod37m's own
+spread, so it is suggestive at n=3, not decisive.
+
+**Two reader traps hit while building this table**, both now fixed in
+`~/.ng_readap.py`:
+
+1. **`single_source` schema.** Arms with one prediction source (the externals)
+   write the identical structure under `single_source`, not
+   `combined_not_isolated`. The reader returned nothing and snx was silently
+   absent from the table — a complete arm reading as missing. Denominators do
+   match (`frames_scored` 5903, `gt_full` 11207); only the node name differs.
+2. **Filename variant.** snx writes `test_detection_ap_masked_fulldenom.json`
+   where the vjepa arms write `cov_`. The reader hardcoded `cov_`. Worse, my
+   *monitor* was emitting snx's `unmasked_` numbers (`frames=6088`), which are
+   a different population and not poolable — they differ from the masked ones
+   by up to 0.003. Read the filename, not just the number.
+
+The reader now prefers `cov_`, falls back to `masked_`, accepts either schema
+node, and **fails closed (exit 1) on a pattern that matches nothing** — the
+previous fail-open behaviour printed nothing at exit 0, indistinguishable from
+"not scored yet".
+
+### §11a — A collapsed run emits the early-stop line
+
+Two augonly seeds were trained-but-unscored. Both had `early stop at epoch N`,
+which is normally completion, not truncation. Only one was:
+
+| seed | epochs | best | verdict |
+|---|---:|---|---|
+| `ours1b_e19` s2 | 18 | 0.2282 **@11** | converged — rises, plateaus, stops. Scoreable. |
+| `meta1b` s0 | 7 | 0.0829 **@0** | **collapsed** — epoch 0 was its best; val_well_map 0.078 vs ~0.21 healthy |
+
+`meta1b` s0 never learned: it printed the same "early stop (no improve 6 >= 6)"
+line purely because nothing ever beat its epoch-0 checkpoint. Gating on the
+early-stop *string* would have published it. The gate must test **improvement**
+(`best_epoch > 0` and best_metric within range of siblings), not the fact of
+stopping. Quarantined to `runs/_collapsed/`; re-running as 7557043. 7557044
+re-runs the `ours1b_e19` arm to pick up its unscored s2.
+
+**Note for the campaign script:** its train gate skips a seed when
+`grep -q "early stop at epoch"` matches, so a collapsed seed is skipped forever
+on resubmit. Quarantining the directory is the workaround; the durable fix is
+to add the improvement test to that gate.
