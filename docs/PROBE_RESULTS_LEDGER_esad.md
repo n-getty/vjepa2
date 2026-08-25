@@ -4586,3 +4586,43 @@ Note the two defects compounded: `meta1b_frozen_augonly` is n=2 *because* its s0
 collapsed (§4b-augext), so an arm that lost a seed to a failure was the one
 printing p=0.004. **No published claim rested on either star.**
 
+### 4. The rare-class rebalancing arm (`pw200`) is bounded below the noise floor
+
+Measured the ceiling **before** the treatment reads out, per
+§4b-slot2's lesson. `pos_weight = ((rows-pos)/pos).clamp(max=cap)` over 2468
+train windows; at `cap=50` it binds on **8 of 21 classes**:
+
+| cls | pos windows | raw ratio | | cls | pos | raw |
+|---|---:|---:|---|---|---:|---:|
+| 12 | **9** | 273.2 | | 6 | 30 | 81.3 |
+| 2 | 17 | 144.2 | | 17 | 36 | 67.6 |
+| 3 | 20 | 122.4 | | 18 | 40 | 60.7 |
+| 0 | 24 | 101.8 | | 16 | 45 | 53.8 |
+
+So `pw200` is a **real treatment**, not a no-op — worth confirming, since a cap
+that never binds would have been three wasted seeds. Only class 12 still clips
+at 200.
+
+**But its ceiling is one standard deviation.**
+
+| arm | headline sd | rare-block sd | rare share of noise | ceiling if all 8 hit best-seed |
+|---|---:|---:|---:|---:|
+| `ft_last4` | 0.0162 | 0.0111 | **69%** | **+0.0171** |
+| `ft_aug` | 0.0243 | 0.0094 | 39% | +0.0147 |
+
+The 8 classes are 38% of the metric by count and do underperform (mean AP 0.153
+vs the common 13's 0.235), so rebalancing aims at the right target. But their
+seed swings are enormous — class 0 spans **0.271** across three `ft_aug` seeds;
+class 12, with **9 positives**, spans 0.192 on `ft_last4` — and they carry 69%
+of the baseline's headline noise while being 38% of it. The *entire* achievable
+gain, an unreachable bound where all 8 simultaneously hit their best observed
+value, is **+0.0171 against a baseline sd of 0.0162**.
+
+**No rare-class rebalancing arm can produce a claimable result at n=3 on this
+probe.** `pw200` (176569/70/71) was already running when this was measured and
+is left to finish, but its outcome must be reported as bounded-by-construction.
+A positive reading will be a draw on classes 0 and 12.
+
+When a 21-class mAP has 8 classes under 50 positives, that mAP is substantially
+a lottery over those 8.
+
