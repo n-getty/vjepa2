@@ -1693,22 +1693,52 @@ All five land in **0.18-0.21** regardless of where they started. That band reads
 **IN FLIGHT (2026-08-25): the budget-scaling arms.** `prod18m_e59` and `prod9m_e29`
 are being FT-scored now (Sophia 176644/176645) to test whether the CPT budget
 signal that shows up in fine-tuning (`[[budget-scaling-shows-up-in-finetune]]`)
-survives on ESAD. **First cells: `prod18m_e59_ft_last4` s0 = 0.2175,
-`prod9m_e29_ft_last4` s0 = 0.1925.** Those are single seeds — do not read them
-against the table above, whose rows are 3-seed means and whose noise bar is
-0.022-0.063. They are logged here so the numbers have a home, not as a result.
-The s0-vs-s0 gap (+0.0250, the higher-budget checkpoint ahead) is the *direction*
-`[[budget-scaling-shows-up-in-finetune]]` predicts, but it is one paired draw and
-sits inside the noise bar; it is not evidence yet.
+survives on ESAD. All three rungs share the **identical** `ft_last4` recipe, so
+this is a matched ladder, not a cross-arm comparison:
+
+| CPT budget | s0 | s1 | s2 | n | mean | spread |
+|---|---|---|---|---:|---|---|
+| `prod9m_e29` | 0.1925 | *(176647 Q)* | *(pending)* | 1 | 0.1925 | — |
+| `prod18m_e59` | 0.2175 | 0.2157 | *(pending)* | 2 | **0.2166** | 0.0018 |
+| `prod37m_e199` | **0.1849** | 0.2146 | 0.2108 | 3 | 0.2034 | **0.0297** |
+
+**⚠ The ladder is NOT monotone, and that is the whole point of showing it.** At
+face value 18M beats 37M by +0.0132 — the wrong direction for a budget effect.
+**Do not report that.** prod37M's own three seeds span **0.0297**, more than
+twice the gap, so the ordering is decided by which seed you happen to draw:
+against 37M's s1 (0.2146) the 18M mean *loses*, against its s0 (0.1849) 18M wins
+by 0.032. Verified 2026-08-25 that s0 is a **genuine draw, not a damaged run** —
+all three seeds ran the full 20 epochs, 190 s, with normal best-epoch gaps
+(8/6/10) — so the spread cannot be cleaned away by dropping it.
+
+The honest reading: **all three rungs land inside the same 0.18-0.22 band as the
+five checkpoints in the table above.** The budget signal that
+`[[budget-scaling-shows-up-in-finetune]]` found elsewhere is **not resolvable
+here at n≤3** — consistent with that band being a task ceiling rather than a
+checkpoint ranking. The earlier "s0-vs-s0 gap of +0.0250 is the predicted
+direction" note is superseded: adding one seed to 18M and reading 37M's full
+n=3 moved the apparent ordering, which is exactly what a noise-dominated
+comparison does. Revisit only at ~8-10 seeds/rung or with an effect >0.06.
 
 ⚠ **`prod9m_e29_ft_last4` is n=2, not n=3** — its s1 never trained (see the
 never-trained-dir note in the Open items table); relaunched 2026-08-25 as 176647.
 
-⚠ **Read the JSON, not the console.** That seed's `[DET-AP]` log line prints
-`maxpick=0.2262` — the *covered*-denominator variant. The canonical figure is
-`combined_not_isolated.variants_full_denominator.maxpick.ap_mean` = **0.2175**, a
-**0.0087** gap. Every number in this ledger is full-denominator; transcribing a
-console line silently inflates an arm by roughly a third of the noise bar. See
+⚠ **Read the JSON, not the console.** The `[DET-AP]` log line prints the
+*covered*-denominator variant; the canonical figure is
+`combined_not_isolated.variants_full_denominator.maxpick.ap_mean`. Measured on
+every cell scored 2026-08-25 — the gap is systematic and always in the same
+direction (console reads high):
+
+| cell | console | canonical | gap |
+|---|---|---|---|
+| `prod18m_e59` s0 | 0.2262 | 0.2175 | 0.0087 |
+| `prod18m_e59` s1 | 0.2221 | 0.2157 | 0.0064 |
+| `prod9m_e29` s0 | 0.1986 | 0.1925 | 0.0061 |
+| `ft_aug_last8` s1 | 0.2375 | 0.2297 | 0.0078 |
+
+Every number in this ledger is full-denominator; transcribing a console line
+silently inflates an arm by 0.006-0.009 — roughly a third of the noise bar, and
+enough to flip a close ordering. See
 `[[esad-scorer-log-prints-a-different-denominator]]`.
 prod37M_e199 FT is nominally the best number on record — above e159 FT and the paper's
 0.1928 — but **+0.030 over e159 does not clear the n=3 noise bar** (§4b-seeded: spreads
