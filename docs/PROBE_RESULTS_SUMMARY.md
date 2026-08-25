@@ -457,6 +457,32 @@ these the arms looked nearly tied and ranked *oppositely* across columns):
 
 Ledger §4b-frozctl.
 
+**Does it hold across checkpoints? — ANSWERED, V-JEPA family: no. (2026-08-25 ~04:45)** The
+three V-JEPA campaign jobs finished. Against **its own** `frozen_presrep` control, each backbone:
+
+| backbone | `frozen_augonly` | `frozen_presrep` | Δ |
+|---|---:|---:|---:|
+| `prod37m_e199` | 0.1893 (n=2) | 0.1793 ± 0.010 (n=3) | +0.0100 |
+| `meta2b` | 0.1362 ± 0.041 (n=3) | 0.1278 ± 0.012 (n=3) | +0.0084 |
+| `meta1b` | 0.1432 (n=2) | 0.1459 ± 0.022 (n=3) | −0.0027 |
+| `ours1b_e19` | 0.1545 (n=2) | 0.1339 ± 0.011 (n=3) | +0.0206 |
+
+Mean **+0.0091**, one of four negative, all far inside the ~0.05 between-seed spread. **The
++0.0415 does not reproduce on any backbone, including the one it came from.** `ft_aug`
+(0.2319 ± 0.024) is untouched and remains the best arm.
+
+The treatment is real but unhelpful: at a **fixed epoch 5**, augonly's train BCE exceeds its own
+presrep control for all four backbones — augmentation makes the presence head harder to fit, and
+that regularisation does not convert to test AP. Two augonly seeds failed outright with the same
+signature seen in the third correction above (presence head collapses, box head fine):
+`meta2b_s2` (`bce` 0.820 vs 0.407, `wellmap` 0.103 vs 0.256, IoU unchanged) and `meta1b_s0`
+(`bce` 0.913, `wellmap` 0.078, IoU 0.210 — both heads). So the wide frozen spread is a genuine
+bimodality in whether the presence head trains, not measurement noise. The three ext arms
+(lemonfm/snx/endovit) were still queued at time of writing; they extend the table but cannot
+change this verdict.
+
+Original framing, retained:
+
 **Does it hold across checkpoints? — 6-checkpoint campaign LAUNCHED 2026-08-25.** The result
 above is one checkpoint *and* (see the third correction) one lucky seed. If there is a property
 of *augmentation* here it should reproduce on other backbones; if it was a property of *this*

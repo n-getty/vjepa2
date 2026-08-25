@@ -1804,7 +1804,7 @@ in, and writes `results_index.json` so the next reader parses results instead of
 This replaces `collect_ft.py`, which carried its numbers as a hardcoded literal dict — every new arm
 needed a collector edit, and any stale entry silently produced a wrong table.
 
-### 4b-augext. Does the augmentation gain hold across checkpoints? — LAUNCHED 2026-08-25
+### 4b-augext. Does the augmentation gain hold across checkpoints? — V-JEPA ARMS RESOLVED: NULL (2026-08-25)
 
 §4b-frozctl measured `frozen_augonly` on **one** checkpoint (prod37m_e199) and found +0.0415 AP
 = 4.0 baseline sd. If that is a property of *augmentation* it should reproduce on other
@@ -1818,6 +1818,47 @@ favour — our arm would have the augmentation and the externals would not.
 > ask whether a large effect *generalises*; it is now asking whether the effect *exists*. The
 > design is unchanged and is the right one either way — 3 seeds × 6 backbones is exactly the
 > power that was missing — but do not treat +0.0415 as a target these arms must reproduce.
+
+#### RESULT (V-JEPA family, 2026-08-25 ~04:45): the effect does not exist
+
+The three V-JEPA campaign jobs finished. Comparing each `frozen_augonly` arm against **its own**
+`frozen_presrep` control — which is the comparison this campaign was designed to make, and *not*
+the collector's `vs base` column (that is against `ft_last4` and answers a different question):
+
+| backbone | `frozen_augonly` | `frozen_presrep` | Δ |
+|---|---:|---:|---:|
+| `prod37m_e199` | 0.1893 (n=2) | 0.1793 ± 0.0101 (n=3) | +0.0100 |
+| `meta2b` | 0.1362 ± 0.041 (n=3) | 0.1278 ± 0.012 (n=3) | +0.0084 |
+| `meta1b` | 0.1432 (n=2) | 0.1459 ± 0.022 (n=3) | −0.0027 |
+| `ours1b_e19` | 0.1545 (n=2) | 0.1339 ± 0.011 (n=3) | +0.0206 |
+
+Mean **+0.0091**, one of four negative, and between-seed spread on these arms is ~0.05 — **five
+times the effect**. **No effect is established for frozen augmentation.** The retracted +0.0415
+does not reproduce on any backbone including the one it came from. `ft_aug` (0.2319 ± 0.024,
+n=3) is unaffected and remains the best arm on record; the FT augmentation result in
+§4b stands.
+
+**The treatment is doing something — it just isn't helping.** Sorting all 27 frozen seeds by
+final train `bce` puts `augonly` at the high-loss end and `presrep` at the low end (8 of the 12
+worst are augonly; 7 of the 9 best are presrep). That ranking is not an artifact of unequal run
+lengths: read at a **fixed epoch 5**, augonly's train BCE exceeds its own presrep control for
+all four backbones (meta1b 0.92/0.89/0.94 vs 0.64/0.62/0.54; meta2b 0.77/0.80/0.94 vs
+0.56/0.73/0.64; ours1b 0.82/0.86/0.80 vs 0.67/0.58/0.62; prod37m 0.49/0.69/0.75 vs
+0.49/0.55/0.52). Higher train loss under augmentation is the regulariser working as intended. It
+does not convert to test AP here.
+
+**Two seeds failed to converge outright, both in the augonly arm, with one signature: the
+presence head collapses while the box head is fine.** `meta2b_s2` — final `bce` 0.820 vs s0's
+0.407, `val_wellmap` 0.103 vs 0.256, yet IoU 0.458 vs 0.466. That is the same shape as
+`prod37m_s1` in the §4b-frozctl retraction. `meta1b_s0` is worse — `bce` 0.913, `wellmap` 0.078,
+**IoU 0.210** (both heads failed) — and early-stopped at epoch 6. So the wide frozen-arm spread
+is **not measurement noise**: it is a real bimodality in whether the presence head trains at all,
+and augmentation raises the rate of that failure. Any future frozen arm should report final
+`bce`/`val_wellmap` next to AP so a collapsed head is visible rather than averaged in.
+
+**Still pending:** the three ext arms (`lemonfm`/`snx`/`endovit`, jobs 7555011/14/15) were queued
+on Polaris `preemptable` when this was written. They extend the table but cannot change the
+V-JEPA verdict above.
 
 **Six checkpoints, 3 seeds each, all `augonly`.** Launched on Polaris `preemptable` as jobs
 7555007/9/10/11/14/15.
@@ -1906,6 +1947,22 @@ any early-stopped seed among them trains and goes unscored. This is recoverable 
 So **a seed missing from the table below means "not yet scored", not "failed"** — check the
 catch-up pass before reading anything into it. See
 [[early-stop-is-completion-not-truncation]].
+
+**This played out exactly as predicted, and cost three seeds — all recovered.** When the jobs
+ended, `meta1b_s0` (early stop @6) and `ours1b_e19_s2` (early stop @17) were unscored by the
+spooled pre-patch gate, as expected. A **third**, `prod37m_e199_s2`, was missed for a different
+reason worth recording: it ran all 20 epochs — every row present in `log_r0.csv`, best at epoch
+17 — but its `stdout.log` was **never written at all**. The gate greps that file for the
+early-stop line, and `grep -q ... 2>/dev/null` on a missing file fails **closed**: safe, but it
+discards a finished seed ([[grep-guard-on-a-file-nobody-writes]]). Fixed in `8f9a8d9` with a
+second witness derived from the CSV alone — the trainer breaks when
+`(last_epoch − best_epoch) >= patience`, so that arithmetic is itself proof it stopped on its
+own rather than by kill. A seed now scores if it ran ≥19 epochs, **or** printed the early-stop
+line, **or** shows the converged signature in its own CSV. Falsified before use: accepts
+`meta1b_s0` (6−0) and `ours1b_e19_s2` (17−11), rejects a synthetic 10-epoch kill with best at 9.
+The catch-up scorer also omitted `prod37m_e199` from its backbone list entirely (it was written
+for the six campaign checkpoints); patched, dry-run to confirm it selected those three and no
+live run, and submitted as job 7555181.
 
 ### 4b-frozctl. Is the frozen "+aug" gain augmentation, or just more windows? — SEED 0 ONLY, preliminary (2026-08-25)
 
