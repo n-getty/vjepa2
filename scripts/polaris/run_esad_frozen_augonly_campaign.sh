@@ -47,12 +47,21 @@ LABEL_DIR=$ESAD_ROOT/test_labels
 CFG=$WS/esad_double_probe_${NAME}.yaml
 ECFG=$WS/esad_double_export_polaris_${NAME}.yaml
 
+# CACHE_NAME lets a variant arm (e.g. a longer-schedule endovit) reuse an
+# already-exported cache instead of re-exporting 2468 windows for 40 min to
+# produce byte-identical features. It changes only which cache is READ; CFG,
+# TAG_SUFFIX and the run dir still come from NAME, so the variant cannot
+# overwrite the arm it borrows from. Defaults to NAME (previous behaviour).
+CACHE_NAME="${CACHE_NAME:-$NAME}"
+# TAG_SUFFIX appends to the run-dir tag so a variant lands in its own dirs.
+TAG_SUFFIX="${TAG_SUFFIX:-}"
+
 if [ "$FAMILY" = "vjepa" ]; then
-  BASE=$CR/cache_${NAME}; AUGC=$CR/cache_${NAME}_augtrain
-  TRAIN_WIN=$WS/esad_windows_train.pt; TAG=frozen_augonly
+  BASE=$CR/cache_${CACHE_NAME}; AUGC=$CR/cache_${CACHE_NAME}_augtrain
+  TRAIN_WIN=$WS/esad_windows_train.pt; TAG=frozen_augonly${TAG_SUFFIX}
 else
-  BASE=$CR/cache_${NAME}_t1; AUGC=$CR/cache_${NAME}_t1_augtrain
-  TRAIN_WIN=$MAN/esad_windows_train_tubelet1_m1.pt; TAG=t1_augonly
+  BASE=$CR/cache_${CACHE_NAME}_t1; AUGC=$CR/cache_${CACHE_NAME}_t1_augtrain
+  TRAIN_WIN=$MAN/esad_windows_train_tubelet1_m1.pt; TAG=t1_augonly${TAG_SUFFIX}
 fi
 
 # ---- Polaris env. NOT `module load conda`: that is broken site-wide (unknown
