@@ -2205,6 +2205,26 @@ here (see the table), so nothing downstream changes, but quoting a non-default f
 section invites exactly the apples-to-oranges comparison that produced the error above. Prefer
 `maxpick` unless there is a stated reason not to.
 
+**Checked across ALL arms, not just these five (2026-08-25).** The claim above was made on a
+5-arm table; swept every scored arm on the canonical node (31 arms, 94 seed-cells, population
+asserted). **The fusion choice is not load-bearing:** `wbf_meanconf` sits **+0.0014** above
+`maxpick` on average (range −0.0006 to +0.0077), **top-1 is unchanged**, and only **6/31** arms
+move rank — all by ≤2 places, all inside ties. So no verdict in this ledger depends on it.
+
+One structured caveat, since it is not noise-shaped. Splitting per-seed gaps by *trainer*
+(read from the CSV header — `secs` ⇒ FT, `lr` ⇒ frozen, never the dir name):
+
+| trainer | n | mean gap | median | positive |
+|---|---:|---:|---:|---:|
+| FT | 27 | **+0.0002** | +0.0000 | 14/27 (a coin flip) |
+| frozen | 67 | **+0.0018** | +0.0017 | **54/67** |
+
+Box fusion buys something on a **frozen** encoder and essentially nothing once the encoder is
+fine-tuned — consistent with FT already sharpening localization (§4b-prod37M-e199-FT). The
+effect is +0.0015 between arm types, far inside the 0.022–0.063 noise bar, so it changes nothing
+today. But a **frozen-vs-FT** gap quoted in `wbf_meanconf` is systematically ~0.0015 *smaller*
+than the same gap in `maxpick`, so don't mix fusions across that particular boundary.
+
 **The general lesson:** run the collector before writing the verdict. It reads every arm on
 record and prints the significance columns; I had the numbers for `ft_aug` on disk while writing
 a claim that contradicted them. A comparison against a hand-picked subset of arms is not a
