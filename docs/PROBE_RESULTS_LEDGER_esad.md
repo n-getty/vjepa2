@@ -1698,9 +1698,20 @@ this is a matched ladder, not a cross-arm comparison:
 
 | CPT budget | s0 | s1 | s2 | n | mean | spread |
 |---|---|---|---|---:|---|---|
-| `prod9m_e29` | 0.1925 | *(176647 Q)* | *(pending)* | 1 | 0.1925 | — |
+| `prod9m_e29` | 0.1925 | *(176647 Q)* | 0.1925 | 2 | 0.1925 | **0.0000** |
 | `prod18m_e59` | 0.2175 | 0.2157 | *(pending)* | 2 | **0.2166** | 0.0018 |
 | `prod37m_e199` | **0.1849** | 0.2146 | 0.2108 | 3 | 0.2034 | **0.0297** |
+
+⚠ **prod9m's two seeds agree to four decimals (0.19249 vs 0.19253) and this is a
+COINCIDENCE, not a duplicate run** — checked, because a 0.0000 spread next to a
+neighbour spanning 0.0297 is not credible at face value. They are independent:
+epoch-0 `train_bce` differs by **0.0647** (cross-seed threshold is ≥0.032 per
+`[[esad-same-config-repeat-noise-floor]]`), **0/20** epochs are bitwise
+identical, best epochs differ (10 vs 11), and the val trajectories diverge by up
+to 0.052 `val_well_map`. `wbf_meanconf` — same runs, different fusion — reads
+0.1880 vs 0.1938, a normal 0.0058 gap. **Do not quote prod9m's spread as
+evidence of anything.** Two draws that happen to collide say nothing about the
+distribution; the arm's real spread is unmeasured.
 
 **⚠ The ladder is NOT monotone, and that is the whole point of showing it.** At
 face value 18M beats 37M by +0.0132 — the wrong direction for a budget effect.
@@ -4244,23 +4255,38 @@ Reproduce: `python scripts/aggregate_triplet_seeds.py --root
       | 176569–71 | `ft_aug_pw200` | `pos_weight_cap` 50 → 200, augmented | ≥ +0.06 macro AP → clipping (12/21 classes, class 12 off by 21.9×) was suppressing the macro mean | inside noise → the macro/GT-weighted gap (0.2265 vs 0.3484) is capacity, not loss weighting |
       | 176575–77 | `ft_augstrong` | per-epoch aug at **strong** strength (`MIN_SCALE 0.9→0.70`, `ASPECT 0.05→0.15`, `COLOR 0.15→0.30`) | ≥ +0.06 → the published recipe was under-regularised, consistent with `train_bce` still collapsing to 0.0075–0.0125 | inside noise or negative → mild is already the right strength; stop tuning aug |
 
-      **FIRST CELL IN (2026-08-25): `ft_aug_last8` s1 = 0.2297** (canonical full-denominator
-      maxpick; the `[DET-AP]` console line said 0.2375 — covered denominator, +0.0078). One seed,
-      so this settles nothing. It is recorded here for one reason:
+      **TWO CELLS IN (2026-08-25): `ft_aug_last8` s1 = 0.2297, s2 = 0.2263** (canonical
+      full-denominator maxpick; the `[DET-AP]` console lines said 0.2375 / 0.2328 — covered
+      denominator, +0.0078 / +0.0065). Verdict: **depth-8 does NOT clear the +0.06 bar, and
+      the paired evidence leans slightly negative.**
 
-      ⚠ **compare PAIRED, not against the arm mean.** The `ft_aug` baseline's per-seed AP is
-      **0.2265 / 0.2585 / 0.2107** — a 0.048 spread, and **s1 is its luckiest seed**. So:
+      ⚠ **compare PAIRED, not against the arm mean** — and this arm is the worked example of
+      why. The `ft_aug` baseline's per-seed AP is **0.2265 / 0.2585 / 0.2107** (0.048 spread):
 
-      | comparison | Δ | reading |
-      |---|---:|---|
-      | s1 vs **baseline s1** (correct, paired) | **−0.0288** | depth-8 is *behind* on this seed |
-      | s1 vs baseline **mean** 0.2319 (wrong) | −0.0022 | looks like a dead tie |
+      | seed | baseline `ft_aug` | `ft_aug_last8` | paired Δ |
+      |---|---|---|---:|
+      | s0 | 0.2265 | *(176603 Q)* | — |
+      | s1 | **0.2585** ← luckiest | 0.2297 | **−0.0288** |
+      | s2 | 0.2107 ← unluckiest | 0.2263 | **+0.0156** |
+      | | | **paired mean (n=2)** | **−0.0066** |
 
-      Same number, 13× apart in magnitude, and they'd be written up differently. When an arm's
-      own seed spread (0.048) is larger than the effect being chased, a single-seed-vs-mean
-      comparison is measuring which seed you drew. Wait for s0/s2 (s0 is re-running as **176603**
-      after a walltime kill, so this arm is **n=2** until it lands). Cross-ref
+      **The pairing changes the sign of the story, not just its size.** Unpaired, the two
+      arms' means are 0.2280 (last8, n=2) vs 0.2319 (baseline, n=3) → −0.0039, or against the
+      matched two seeds 0.2346 → −0.0066. But the per-seed deltas are **−0.0288 and +0.0156**:
+      they disagree in sign, and each is dominated by which baseline seed it landed against.
+      s1 is the baseline's luckiest draw and s2 its unluckiest, so the two comparisons are
+      mostly measuring the baseline's own spread. With n=2 and deltas of opposite sign, the
+      honest statement is **no resolvable effect** — not "slightly worse".
+
+      Earlier note, kept because the trap is the point: reading s1 against the baseline *mean*
+      gave −0.0022 ("dead tie") where the paired read gives −0.0288 — same number, 13× apart,
+      and they'd be written up differently. When an arm's own seed spread (0.048) exceeds the
+      effect being chased, single-seed-vs-mean measures the draw. Cross-ref
       `[[one-seed-has-no-error-bar]]`, `[[ab-window-truncation-trap]]`.
+
+      **Pre-registered call stands: inside noise → last-4 is the depth plateau**, consistent
+      with `[[esad-unfreeze-beats-frozen]]`. s0 (176603) will complete the pairing but cannot
+      rescue a +0.06 effect from deltas this size.
 
       **Scoring.** `frozen_aug.sh` originally trained three seeds and stopped — it would have
       landed three run dirs with `best.pt` and no AP, an arm that reads as finished in `qstat`
