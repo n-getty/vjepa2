@@ -132,8 +132,29 @@ train_seed() {
   if [ -f "$OUT/log_r0.csv" ] && [ "$(( $(wc -l < "$OUT/log_r0.csv") - 1 ))" -ge 20 ]; then
     echo "[train] skip s$SEED: already 20 epochs"; return 0
   fi
+  # Early stop means converged ONLY if something ever beat epoch 0. A run that
+  # collapses prints the identical "early stop (no improve 6 >= 6)" line while
+  # best_epoch stays 0 -- so gating on the STRING skips a dead seed forever on
+  # every resubmit. meta1b augonly s0 did exactly this: 7 epochs, best 0.0829
+  # @0, val_well_map 0.078 against ~0.21 for its healthy siblings. Test
+  # improvement, not the fact of stopping. best_epoch BY HEADER, never by
+  # position -- the two ESAD trainers put different columns last.
   if grep -q "early stop at epoch" "$OUT/stdout.log" 2>/dev/null; then
-    echo "[train] skip s$SEED: converged (early stop)"; return 0
+    # The frozen trainer writes CRLF, so the LAST header field is "best_epoch\r"
+    # and a bare == comparison never matches -- the parse returns empty and the
+    # gate would retrain every converged frozen seed. Strip \r before comparing.
+    # (The FT CSV parsed fine without this only because best_epoch is not its
+    # last column; the bug is invisible on exactly the file you'd test with.)
+    BEP=$(awk -F, 'NR==1{for(i=1;i<=NF;i++){gsub(/\r/,"",$i); if($i=="best_epoch")c=i} next}
+                   c&&NF>=c{t=$c; gsub(/\r/,"",t); if(t!="")v=t}
+                   END{print (v==""?"":v)}' "$OUT/log_r0.csv" 2>/dev/null)
+    if [ -n "$BEP" ] && [ "$BEP" -gt 0 ] 2>/dev/null; then
+      echo "[train] skip s$SEED: converged (early stop, best_epoch=$BEP)"; return 0
+    fi
+    echo "[train] s$SEED early-stopped at best_epoch=${BEP:-unknown} -- COLLAPSED, not converged; retraining"
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    mkdir -p "$CR/runs/_collapsed"
+    mv "$OUT" "$CR/runs/_collapsed/$(basename "$OUT").collapsed-$ts"
   fi
   mkdir -p "$OUT"
   echo "[train] $TAG seed=$SEED gpu=$GPU $(date -u)"
