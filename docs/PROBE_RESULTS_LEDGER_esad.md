@@ -4767,7 +4767,7 @@ knobs measured separately in §6.
 Magnitude of the difference being tested (400 sampled windows): kept area
 0.946 → 0.839, max edge shift 0.029 → 0.087, colour deviation 0.113 → 0.226.
 
-### 10. 26 of 122 scored seeds trained fewer than 20 epochs — a hygiene defect, not a corrupted result
+### 10. 26 of 122 seeds trained fewer than 20 epochs (17 of the 99 scored) — a hygiene defect, not a corrupted result
 
 Found while auditing a job that exited `-29` (`176587`, killed at 03:00:20 on a
 3 h wall, mid-seed-2) and a sibling (`176599`) left `job_state=F Hold_Types=d`,
@@ -4776,8 +4776,9 @@ were re-running seeds already complete on disk (one monitor logged
 `RESUME OK: appended epoch 17 ... did not restart`), and all prod37m frozen arms
 hold 3 scored seeds. Earlier numbers in this ledger stand.
 
-What the audit *did* surface: **26 of 122 scored seeds ran 14–19 epochs instead
-of 20**, and 7 arms average short and full seeds together.
+What the audit *did* surface: of **123 seed dirs on disk / 122 with a readable
+CSV / 99 scored**, **26 ran 14–19 epochs instead of 20 — 17 of them scored**
+(17% of the scored set). 7 arms average short and full seeds together.
 
 Is the damage real? Two checks:
 
