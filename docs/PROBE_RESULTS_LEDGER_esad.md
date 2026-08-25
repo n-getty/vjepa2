@@ -1844,6 +1844,26 @@ of **+0.0009**. The two later seeds agree with each other to within 0.001 and bo
 every one of the three presrep seeds (0.1707 / 0.1905 / 0.1767). Seed 0 was the outlier, and the
 entire published claim was that outlier.
 
+**An independent metric confirms both the null and the variance inflation.** The probe's oracle
+pass (`test_oracle_cov.json` → `test_well_supported_map`) is a separate measurement path from
+detection AP, and it tracks AP **seed for seed**:
+
+| arm | AP (n=3) | oracle wellMAP (n=3) |
+|---|---:|---:|
+| `frozen_augonly` | 0.1802 ± **0.0306** | 0.2464 ± **0.0379** |
+| `frozen_presrep` | 0.1793 ± **0.0101** | 0.2507 ± **0.0052** |
+
+Per-seed ranking is identical under both metrics (augonly s0 is top in each, s1 bottom in each).
+Means are indistinguishable; the augmented arm's sd is **3× the control's in AP and 7× in
+wellMAP**. Two independent metrics agreeing on both the null *and* the spread means this is a
+property of the training, not an artifact of the detection scorer.
+
+⚠ The collector's `presMAP` column averages the oracle metric across seeds into one figure
+(0.2464 vs 0.2507 — a difference of nothing), which hides exactly this. It also aggregates over
+whatever seeds happen to have an oracle JSON, independently of which have an AP JSON, so the two
+columns on one row can rest on different seed subsets. Verified here that all three seeds have
+both files, so this table is clean — but check that before reading the column.
+
 **Scope of the null: this tests ONE FIXED augmented rendering, not augmentation-as-regulariser.**
 Every `*_augtrain` cache carries `aug_seed = 0` in its rank manifests, and the features are
 exported **once** and then read for all three training seeds. So the trainer sees the *same*
