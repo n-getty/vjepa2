@@ -4745,3 +4745,24 @@ distribution, so 0.2498 stands as a number; what is not claimed is that
 ensembling reliably buys ~0.018 on this arm.
 
 Standing best: **`ft_aug` + 3-seed `wbf_meanconf` ensemble = 0.2498 det-AP.**
+
+### 9. `augstr` is a strength test, and `augpe` — not `ft_aug` — is its control
+
+176575 (`augstr` s0) started 2026-08-25 12:18 on sophia-gpu-01. Its treatment is
+carried by three env vars rather than a CLI flag, which is the fragile case, so
+it was verified end to end:
+
+1. submit args carry `EXTRA_ARGS=--aug-per-epoch,ESAD_AUG_MIN_SCALE=0.70,ESAD_AUG_ASPECT=0.15,ESAD_AUG_COLOR=0.30`
+2. launcher echoes `[aug] ESAD_AUG_MIN_SCALE=0.70` / `ASPECT=0.15` / `COLOR=0.30`
+3. trainer self-reports `[FT] train augment=True per_epoch=True`
+4. **live process env on the compute node** contains all three (the crop is
+   sampled in forked DataLoader workers, so the parent's echo alone is not proof)
+
+**Consequence for the comparison.** `augstr` runs the strong recipe *with*
+per-epoch resampling, i.e. it differs from `augpe` by **recipe strength alone**
+and from `ft_aug` by strength *and* freshness. So the clean contrast is
+`augstr` vs `augpe`; reading `augstr` against `ft_aug` would confound the two
+knobs measured separately in §6.
+
+Magnitude of the difference being tested (400 sampled windows): kept area
+0.946 → 0.839, max edge shift 0.029 → 0.087, colour deviation 0.113 → 0.226.
