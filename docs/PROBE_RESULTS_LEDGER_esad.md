@@ -4864,3 +4864,43 @@ re-runs the `ours1b_e19` arm to pick up its unscored s2.
 `grep -q "early stop at epoch"` matches, so a collapsed seed is skipped forever
 on resubmit. Quarantining the directory is the workaround; the durable fix is
 to add the improvement test to that gate.
+
+### §11b — Walltime sizing for the remaining FT arms (and a misread I corrected)
+
+Measured per-epoch pace from each arm's own CSV (`secs` column), which is the
+only correct basis — pace is a property of the arm, not the node
+(§4b-infra 1):
+
+| arm | s/epoch | 20 ep | wall | verdict |
+|---|---:|---:|---:|---|
+| `ft_augstrong` | 720 | 4.0 h | 5 h | fits |
+| `ft_aug_pw200` | 752 | 4.2 h | 5 h | fits |
+| `ft_augpe_last4` | 767 | 4.3 h | 5 h | fits (completed) |
+| `ft_aug` / `ft_aug_last8` | 745–764 | 4.1–4.2 h | 5 h | fits (completed) |
+| `prod9m_e29 ft_last4` | **1065–1071** | **5.9 h** | 7–8 h | needs > 5 h |
+
+The plain (non-augmented) arms run ~40% slower per epoch than the augmented
+ones, because `_load_frame` crops before resizing — so a wall sized off an
+augmented sibling would truncate a plain arm at ~epoch 17.
+
+**`ft_aug_last8` s0** is a walltime kill, not a collapse: 7 epochs, best_epoch=4
+at 0.452 (in line with its siblings' 0.443/0.455), `latest.pt` present, no
+early-stop line — and the FT trainer has no early stop at all, so a short FT log
+is *always* a kill (§4b-infra). Requeued as 176603, which resumes from epoch 7.
+
+**Misread, corrected.** I read job 176647 (`F`, no SessID, no elapsed) plus its
+comment `Insufficient amount of resource: queue_tags and terminated` as the
+scheduler refusing to place an 8 h reservation, and resubmitted at 7 h. Wrong on
+both counts: (a) `ctime` 08:13 / `mtime` 09:41 with no `Exit_status` and no
+`run_count` shows it was **deleted by me** at 09:41 when I submitted its
+replacement — "and terminated" was my own qdel; (b) *every* queued job in this
+queue carries the identical `queue_tags` comment, including the 5 h ones that do
+run, so it is the generic waiting-for-a-quad message, not a placement verdict.
+The real constraint is simply that 2 of my 5 allowed slots are running and 26
+jobs are running project-wide. The 8 h wall was correctly sized; the 7 h
+resubmit (176653) traded 60 min of margin against a measured 5.9 h need for no
+benefit. It still fits, so it stands.
+
+Rule: a PBS comment describes why a job is *not running right now*, not why it
+failed. Read `Exit_status` / `run_count` / `mtime` before concluding the
+scheduler rejected a shape.
