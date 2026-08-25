@@ -1898,6 +1898,37 @@ favour — our arm would have the augmentation and the externals would not.
 > design is unchanged and is the right one either way — 3 seeds × 6 backbones is exactly the
 > power that was missing — but do not treat +0.0415 as a target these arms must reproduce.
 
+⚠ **"V-JEPA ARMS RESOLVED" overstates the seed count — two arms are n=2, not n=3** (found
+2026-08-25 by auditing the family for cells that exist on disk but were never scored):
+
+| arm | s0 | s1 | s2 | usable n |
+|---|---|---|---|---:|
+| `meta1b_frozen_augonly` | **FAILED RUN** | 0.1456 | 0.1409 | **2** |
+| `meta2b_frozen_augonly` | 0.1723 | 0.1447 | 0.0916 | 3 |
+| `ours1b_e19_frozen_augonly` | 0.1586 | 0.1505 | *unscored, queued* | 2→3 |
+| `prod37m_e199_frozen_augonly` | 0.2155 | 0.1631 | 0.1621 | 3 |
+
+**`meta1b_frozen_augonly` s0 is a collapsed run and must never be scored.** It ran 7 epochs
+with **`best_epoch=0`** — it never beat its first epoch: `val_well_map` flat at 0.08295
+throughout, final map50 **0.017** and IoU **0.210**, against siblings that climbed to
+0.25/0.18 and finished map50 ~0.39, IoU ~0.42. Its `best.pt` is an epoch-0 checkpoint.
+
+**This nearly published itself.** The run emits a real `early stop at epoch` line — patience
+elapses from epoch 0 when nothing ever improves — so the catch-up scorer's convergence gate
+(which passes anything with that line, bypassing the `epochs < 19` branch) would have scored
+it and dropped a ~0.03 cell into an arm whose healthy seeds read ~0.145. **A converged run and
+a collapsed run are indistinguishable to a gate that only asks "did it stop early?"** — it must
+also ask "did it ever improve?". Guard added to `~/.esad_catchup_score.sh` (backup
+`.bak.20260825`): refuse `best_epoch==0` when `epochs > 1`. Falsified both directions before
+trusting it — fires on s0 (nep=7 bep=0), passes s1/s2, `ours1b_e19` s2, `meta2b` s2, and a
+synthetic 1-epoch run (which must pass). Cross-ref `[[grep-guard-on-a-file-nobody-writes]]`,
+`[[early-stop-is-completion-not-truncation]]`.
+
+`ours1b_e19` s2 is a *legitimate* early stop (18 epochs, best at 11) that simply was never
+scored; the catch-up job (Polaris 7555181, `Q`) covers it and will bring that arm to n=3.
+The NULL verdict above is unaffected in direction — meta1b at n=2 reads 0.1433, still well
+below prod37m — but **the arm counts in any published table must say 2, not 3**.
+
 #### RESULT (V-JEPA family, 2026-08-25 ~04:45): the effect does not exist
 
 The three V-JEPA campaign jobs finished. Comparing each `frozen_augonly` arm against **its own**
