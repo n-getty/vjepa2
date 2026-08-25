@@ -4655,3 +4655,35 @@ or between seeds — is stated from `val_well_map`. It waits for
 the highest `val_well_map` of any arm. That read a mid-run CSV row rather than
 the `best_metric` column; its actual best is 0.4361, rank 12 of 120. Read CSV
 fields by header — the FT and augonly trainers put different columns last.)*
+
+### 6. What the augmented arms were actually doing (measured before their results)
+
+Two properties of the augmentation path, both checked against the sampler rather
+than assumed from the flag names.
+
+**(a) `--augment` on its own does not augment per epoch.** The crop RNG is
+`Random(aug_seed*1_000_003 + aug_epoch*8_388_617 + window_id)`, and without
+`--aug-per-epoch` the `aug_epoch` term is pinned at 0. **Every epoch sees the
+identical crop for a given window.** So `ft_aug` / `ft_aug_last8` are a *static
+re-crop of the dataset* — a slight fixed zoom plus a fixed colour shift — not
+augmentation. `augpe` calls `set_aug_epoch(epoch)` on all ranks before any
+loader iteration and is the first arm resampling for real (verified: 0/6 window
+collisions across epoch0/1/2 and across seeds).
+
+**(b) The default recipe is weak.** Over 400 sampled windows:
+
+| recipe | mean kept area | mean max edge shift | mean colour dev |
+|---|---:|---:|---:|
+| default (0.90 / 0.05 / 0.15) | **0.946** | 0.029 | 0.113 |
+| `augstr` (0.70 / 0.15 / 0.30) | 0.839 | 0.087 | 0.226 |
+
+95% of the frame retained, edges moved under 3%. `augpe` therefore resamples
+inside a narrow distribution and its upside is capped by the recipe regardless
+of the resampling fix.
+
+**Reporting consequence.** `ft_aug`'s +0.0284 over `ft_last4` must not be
+described as an augmentation-diversity result; it was bought by a static
+re-crop. `augpe` tests *freshness* at weak strength, `augstr` tests *strength* —
+two different questions, and neither subsumes the other. (This also explains the
+~30% epoch speedup of the augmented arms: the crop discards pixels before the
+BILINEAR resize.)
