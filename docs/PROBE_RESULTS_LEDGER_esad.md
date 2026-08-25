@@ -1689,6 +1689,21 @@ checkpoints — but it is a symptom of an unregularised box head, not a structur
 
 All five land in **0.18-0.21** regardless of where they started. That band reads as a
 **task ceiling** (n=2 training surgeries, 2,468 windows), not a checkpoint ranking.
+
+**IN FLIGHT (2026-08-25): the budget-scaling arms.** `prod18m_e59` and `prod9m_e29`
+are being FT-scored now (Sophia 176644/176645) to test whether the CPT budget
+signal that shows up in fine-tuning (`[[budget-scaling-shows-up-in-finetune]]`)
+survives on ESAD. **First cell only: `prod18m_e59_ft_last4` s0 = 0.2175.** That is
+one seed — do not read it against the table above, whose rows are 3-seed means and
+whose noise bar is 0.022-0.063. It is logged here so the number has a home, not as
+a result.
+
+⚠ **Read the JSON, not the console.** That seed's `[DET-AP]` log line prints
+`maxpick=0.2262` — the *covered*-denominator variant. The canonical figure is
+`combined_not_isolated.variants_full_denominator.maxpick.ap_mean` = **0.2175**, a
+**0.0087** gap. Every number in this ledger is full-denominator; transcribing a
+console line silently inflates an arm by roughly a third of the noise bar. See
+`[[esad-scorer-log-prints-a-different-denominator]]`.
 prod37M_e199 FT is nominally the best number on record — above e159 FT and the paper's
 0.1928 — but **+0.030 over e159 does not clear the n=3 noise bar** (§4b-seeded: spreads
 0.022-0.063; need ~8-10 seeds or an effect >0.06). Report it as a nominal lead.
@@ -1803,6 +1818,23 @@ It discovers arms by globbing `runs/esad_double_*_s{N}`, reads AP from the score
 in, and writes `results_index.json` so the next reader parses results instead of re-deriving them.
 This replaces `collect_ft.py`, which carried its numbers as a hardcoded literal dict — every new arm
 needed a collector edit, and any stale entry silently produced a wrong table.
+
+**`collect_ft.py` is now formally deprecated** (banner in-file 2026-08-25, backup
+`.collect_ft.py.bak.20260825`; nothing calls it). Audited all 18 of its literals against disk:
+**0 drifted.** The table it prints is *accurate but incomplete* — the more dangerous failure,
+because it looks right. Two blind spots: the V-JEPA block is a literal dict frozen at 2026-08-19,
+and its disk path globs only `test_detection_ap_masked_fulldenom.json` (15 runs) while **92 runs
+now write `test_detection_ap_cov_fulldenom.json`**. It silently omitted `prod18m_e59_ft_last4`
+entirely. *Check what a reporting script cannot see, not just whether what it shows is right.*
+
+**The three AP filenames, since this bites collectors.** `cov_fulldenom` (92 runs) and
+`masked_fulldenom` (15) are the **same metric on the same population** (`gt=11207`,
+`frames=5903`) — the split is source *topology* (two-source `cov_p0`/`p1` under node
+`combined_not_isolated`, vs single-source tubelet1 under `single_source`), not scoring. Safe to
+pool; `collect_esad_arms.py` reads both. **`unmasked_fulldenom` (9 runs) is a DIFFERENT
+population** — 6088 frames, and on the 9 runs holding both it reads *higher every time*
+(+0.0022 to +0.0082). It must never be averaged in, and the collector's population assert is
+what stops it.
 
 ### 4b-augext. Does the augmentation gain hold across checkpoints? — V-JEPA ARMS RESOLVED: NULL (2026-08-25)
 
@@ -3678,7 +3710,9 @@ THREE separate seams** (trainer, scorer invocation, cache export) — audit all 
 porting another image backbone.
 
 Reproduce: `run_ft_seed.sh` (NAME/PROBE_CFG/EXPORT_CFG/TRAIN_WIN/VAL_WIN/UNFREEZE_N),
-`score_ft_external.sh`, `collect_ft.py`. **Do not use `score_ft.sh` for an image backbone** —
+`score_ft_external.sh`, ~~`collect_ft.py`~~ → **`collect_esad_arms.py`** (`collect_ft.py` was
+deprecated 2026-08-25; it is blind to `cov_fulldenom` JSONs and to any arm added after
+2026-08-19 — see §4b-aug). **Do not use `score_ft.sh` for an image backbone** —
 its two-phase tubelet=2 test manifests raise `IndexError: rep_frames[j]`. Sophia co-tenancy
 killed two jobs at 5 s (`Exit_status=143`); the scorer now picks a free GPU and refuses to start
 without one ([[sophia-shares-gpus]]).
