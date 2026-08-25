@@ -1872,9 +1872,21 @@ therefore no variance-injection mechanism for a regulariser to act through. What
 actually measured is "does training on one fixed alternative rendering of the 2,468 windows beat
 training on the deterministic rendering," and the answer is no. It does **not** rule out
 augmentation that resamples per epoch, which is the live cached-path gap tracked as open task #7
-(`aug RNG has no epoch term`) and is how the FT path — where `--augment` is a *runtime* flag and
-does redraw — gets its `ft_aug` gain. That asymmetry is the most likely reason FT benefits and
-frozen does not, and it is a testable claim, not an explanation to assume.
+(`aug RNG has no epoch term`).
+
+> **Correction (~06:25).** An earlier version of this paragraph said the FT path "does redraw"
+> per epoch and offered that as the likely reason FT gains while frozen does not. **That is
+> wrong.** A *separate* per-epoch arm — `esad_double_prod37m_e199_ft_augpe_last4`, running on
+> Sophia as job 176562, whose trainer prints `[FT] train augment=True per_epoch=True` — exists
+> precisely because the standard `ft_aug` arm does **not** resample. Both `ft_aug` and
+> `frozen_augonly` therefore trained on a *fixed* augmentation draw, so resampling cannot explain
+> the asymmetry between them (`ft_aug` +0.0526 at p<0.05 vs frozen +0.0068, null). What differs
+> between those two arms is unfreezing the last 4 blocks, not the augmentation schedule.
+>
+> Note what the `augpe` arm does and does not test: it measures the **increment** from per-epoch
+> resampling on a path that *already* benefits from augmentation. It does **not** test whether
+> resampling would rescue the frozen path — that needs its own frozen arm (export K augmented
+> caches and rotate per epoch, or augment cached features at load time), and remains open.
 
 Window counts verified equal at 2,468 for `cache_prod37m_e199/train` and
 `cache_prod37m_e199_augtrain/train`, so the `augonly` arm is clean of the 2× confound by
