@@ -1903,11 +1903,41 @@ node `combined_not_isolated`, fusion `wbf_meanconf`):
 | **`frozen_augonly`** | **s0** | **0.2227** | **0.2901** | **0.2510** | **0.1270** |
 
 **+0.0415 over the baseline mean = 4.0 baseline sd**, and +0.0305 over the *best* baseline seed.
-It also clears the fine-tuned last-4 mean (0.2035) — **a frozen probe beating fine-tuning**,
-which no other arm in this campaign has done. And it gains at **all three IoU thresholds
-together** (+0.048 / +0.045 / +0.049 vs the baseline mean), the signature of a genuine
-improvement rather than the presence-vs-localisation trade that FT shows. One seed is still one
-seed, but 4 sd is well outside where a single draw normally lands.
+It also clears the **un-augmented** fine-tuned last-4 mean (0.2035). And it gains at **all three
+IoU thresholds together** (+0.048 / +0.045 / +0.049 vs the baseline mean), the signature of a
+genuine improvement rather than the presence-vs-localisation trade that FT shows. One seed is
+still one seed, but 4 sd is well outside where a single draw normally lands.
+
+⚠ **Correction (same night, 02:45).** The line above originally read "a frozen probe beating
+fine-tuning, which no other arm in this campaign has done." That is **wrong**, and the error is
+worth keeping visible: I compared the new frozen arm against `ft_last4` (0.2035) without checking
+whether the *augmented* FT arm had finished. It had. `ft_aug` scores **0.2319 ± 0.024 over three
+seeds** (paired p = 0.034), which is **above** `frozen_augonly`. The correct statement is that
+augmentation helps both paths, and FT+aug is still the best arm on record:
+
+| arm | n | maxpick AP | wbf AP |
+|---|---:|---:|---:|
+| `frozen_presrep` (baseline) | 3 | 0.1793 ± 0.0101 | 0.1812 ± 0.0104 |
+| `frozen_aug` | 1 | 0.2084 | 0.2129 |
+| `ft_last4` | 3 | 0.2035 ± 0.0162 | 0.2048 ± 0.0147 |
+| `frozen_augonly` | 1 | 0.2155 | 0.2227 |
+| **`ft_aug`** | **3** | **0.2319 ± 0.0243** | **0.2323 ± 0.0249** |
+
+What survives: frozen+augonly beats the frozen baseline by ~4 sd, and beats *un-augmented* FT —
+i.e. augmentation buys more on this probe than unfreezing four blocks does. That is still a real
+and useful finding; it is just not "frozen beats fine-tuning."
+
+**Second correction, methodological.** The table above reports `wbf_meanconf`, but
+`collect_esad_arms.py` — the repo's own collector, and therefore every other AP number in this
+ledger — uses **`maxpick`** as the headline fusion. Both fusions rank all five arms identically
+here (see the table), so nothing downstream changes, but quoting a non-default fusion for one
+section invites exactly the apples-to-oranges comparison that produced the error above. Prefer
+`maxpick` unless there is a stated reason not to.
+
+**The general lesson:** run the collector before writing the verdict. It reads every arm on
+record and prints the significance columns; I had the numbers for `ft_aug` on disk while writing
+a claim that contradicted them. A comparison against a hand-picked subset of arms is not a
+ranking. See [[verify-the-probe-before-the-hypothesis]].
 
 ⚠ **Read the right node.** These JSONs carry four population nodes. `source0_only` scores only
 **3,467** frames and gives ~0.10 for the same checkpoints; the canonical

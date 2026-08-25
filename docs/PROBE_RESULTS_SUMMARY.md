@@ -413,9 +413,17 @@ population, `wbf_meanconf`:
 | **`frozen_augonly` s0** | **0.2227** | **0.2901** | **0.2510** | **0.1270** |
 
 **+0.0415 = 4.0 baseline sd**, +0.0305 over the *best* baseline seed, and above the fine-tuned
-last-4 mean (0.2035) — **a frozen probe beating fine-tuning**, which nothing else in this
-campaign has done. It gains at all three IoU thresholds together, unlike FT's
+**un-augmented** last-4 mean (0.2035). It gains at all three IoU thresholds together, unlike FT's
 presence-for-localisation trade. Still one seed; s1/s2 pending.
+
+⚠ **Correction (02:45).** This originally claimed "a frozen probe beating fine-tuning." Wrong —
+I compared against `ft_last4` without checking whether the *augmented* FT arm had finished. It
+had: **`ft_aug` = 0.2319 ± 0.024 over 3 seeds** (paired p = 0.034), above `frozen_augonly`.
+Augmentation helps both paths and **FT+aug remains the best arm on record**. What survives is
+that frozen+augonly beats the frozen baseline by ~4 sd and beats *un-augmented* FT — augmentation
+buys more here than unfreezing four blocks. Note also that these two rows are `wbf_meanconf`
+while the repo collector's headline fusion is `maxpick` (0.2155 for `frozen_augonly`); both
+fusions rank every arm identically, but `maxpick` is the convention.
 
 This also means the "+aug" arm's advantage was **not** the doubled window count: `augonly`
 trains on 2,468 windows, the same as the baseline. The augmentation is doing the work.
