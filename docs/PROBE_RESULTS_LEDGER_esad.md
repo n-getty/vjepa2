@@ -1856,6 +1856,15 @@ is **not measurement noise**: it is a real bimodality in whether the presence he
 and augmentation raises the rate of that failure. Any future frozen arm should report final
 `bce`/`val_wellmap` next to AP so a collapsed head is visible rather than averaged in.
 
+**Scope correction — the instability is the augonly arm's, not frozen probes' in general.** The
+third correction in §4b-frozctl warned that "any frozen delta under ~0.05 is unresolved at n=3."
+Measured across all 27 frozen seeds on disk, that is too broad: **4 of 12 `augonly` seeds end
+with train BCE above 0.48 (max 0.913), while all 15 `presrep` seeds fall in 0.207–0.437** — a
+tight, bounded distribution with no collapses at all. The un-augmented frozen columns elsewhere
+in this ledger (notably §4i, sample sd 0.0007–0.0258 over 3 seeds) are therefore **not** put in
+doubt by this campaign and stand as published. It is specifically the *augmented* frozen arm
+that requires n≥3 plus a per-seed convergence check before any delta is read from it.
+
 **Still pending:** the three ext arms (`lemonfm`/`snx`/`endovit`, jobs 7555011/14/15) were queued
 on Polaris `preemptable` when this was written. They extend the table but cannot change the
 V-JEPA verdict above.

@@ -444,6 +444,11 @@ The delta is now inside the baseline's own sd, and the arm's between-seed spread
 augmentation effect is established.** Treat any frozen delta under ~0.05 as unresolved until
 n=3. `ft_aug` is unaffected and remains the best arm on record.
 
+*(Scope correction, ~05:00: "any frozen delta under ~0.05" over-generalised. Across all 27
+frozen seeds, 4 of 12 `augonly` end with train BCE > 0.48 while all 15 `presrep` fall in
+0.207–0.437 — the instability belongs to the augmented arm. Un-augmented frozen results,
+including §4i, stand as published.)*
+
 The recurring error: a 1-seed arm has no error bar, so "4 sd above baseline" was measuring the
 *baseline's* spread. See [[one-seed-has-no-error-bar]].
 
