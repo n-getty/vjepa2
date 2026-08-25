@@ -1877,6 +1877,28 @@ is **not** usable here — its 1 h cap already walltime-killed two of these runs
 
 The vjepa arms additionally assert `presence override ACTIVE` in the train log — without it a run
 trains on *union* labels under a `presrep` name, a plausible answer to the wrong question.
+(Confirmed present in all nine vjepa seeds by reading `stdout.log` directly, since the six
+in-flight jobs carry a spooled copy predating the guard fix in `dab1de7`. Each line also reports
+`2468 windows`, which is the `augonly` signature — `aug` would read 4,936.)
+
+⚠ **Gate 2 as written skips converged seeds, and the in-flight six carry it.** `>=19` conflates
+"finished" with "ran long enough". With `early_stop_patience: 6` against `num_epochs: 20`, a seed
+that converges can legitimately stop at epoch 14 — and **8 of the 21 completed frozen runs on
+record ended at ep 14–18** (`meta2b_presrep_s0`=14, `v1_presrep_s1`=16, `prod37m_presrep_s1`=17).
+Those were scored only because the older presrep launcher had no epoch gate. Here the gate would
+skip them via `return 0`: no failure, no result, roughly a third of the campaign silently absent.
+
+Fixed in `2903465` — the gate now accepts `>=19 epochs` **or** the trainer's
+`[TRAIN] early stop at epoch N` line (`train_esad_double_head.py:732`), which a walltime kill
+never prints, so convergence passes and a kill still does not. Falsified over four cases before
+use: converged@14 → SCORE, killed@14 → SKIP, full@20 → SCORE, missing log → SKIP (fails *closed*).
+Because PBS spooled the pre-patch script, **the six in-flight jobs are unaffected by the fix** —
+any early-stopped seed among them trains and goes unscored. This is recoverable rather than lost:
+`best.pt` is written regardless, and `~/.esad_catchup_score.sh` rescores exactly those runs
+(`best.pt` present, 19 epochs *or* an early-stop line, no result JSON, `latest.pt` cold ≥10 min).
+So **a seed missing from the table below means "not yet scored", not "failed"** — check the
+catch-up pass before reading anything into it. See
+[[early-stop-is-completion-not-truncation]].
 
 ### 4b-frozctl. Is the frozen "+aug" gain augmentation, or just more windows? — SEED 0 ONLY, preliminary (2026-08-25)
 
