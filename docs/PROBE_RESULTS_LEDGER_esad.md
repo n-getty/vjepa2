@@ -1892,12 +1892,41 @@ Window counts verified equal at 2,468 for `cache_prod37m_e199/train` and
 `cache_prod37m_e199_augtrain/train`, so the `augonly` arm is clean of the 2× confound by
 measurement, not by assertion.
 
-**The doubled-window arm reproduces the same seed pattern.** `frozen_aug` (both caches, 4,936
-windows/epoch) is at 0.2084 / 0.1564 → 0.1824 ± 0.0367 (n=2, s2 pending). Both *augmented* arms
-therefore show a high seed 0 and a much lower tail, with sd 0.031–0.037, while the un-augmented
-control sits at sd 0.0101 over three seeds. The instability tracks the augmented caches, not the
-window count. Note the `aug_seed=0` finding rules out the tempting reading that training seed 0
-is somehow matched to the cache draw: all three training seeds read identical pixels.
+#### The doubled-window arm completes at n=3 — and answers §4b-frozctl's question with "neither"
+
+`frozen_aug` s2 = 0.1552, giving all three prod37m frozen arms at full n=3:
+
+| arm | windows/ep | AP (n=3) | oracle wellMAP | Δ AP vs presrep |
+|---|---:|---:|---:|---:|
+| `frozen_presrep` | 2,468 | 0.1793 ± **0.0101** | 0.2507 ± **0.0052** | — |
+| `frozen_augonly` | 2,468 | 0.1802 ± 0.0306 | 0.2464 ± 0.0379 | +0.0009 |
+| `frozen_aug` | 4,936 | **0.1733 ± 0.0303** | 0.2416 ± 0.0362 | **−0.0060** |
+
+§4b-frozctl asked whether the frozen "+aug" gain was augmentation or just more windows. With
+every cell at n=3 the answer is **neither**: augmentation alone moves nothing (+0.0009), and
+doubling the windows makes it *worse* (−0.0060, now the lowest of the three). The oracle metric
+reproduces the same ordering. Both augmented arms sit at sd ≈0.030 against the control's 0.0101.
+
+**Seed 0 is high in both augmented arms, and the training curves show why.** Per-seed AP —
+augonly 0.2155 / 0.1631 / 0.1621, aug 0.2084 / 0.1564 / 0.1552 — is the same rank order with the
+same ~0.05 gap. Reading train BCE at a fixed epoch 5:
+
+| arm | s0 | s1 | s2 |
+|---|---:|---:|---:|
+| `frozen_presrep` | 0.495 | 0.545 | 0.519 |
+| `frozen_augonly` | **0.490** | 0.695 | 0.754 |
+| `frozen_aug` | **0.491** | 0.642 | 0.543 |
+
+Seed 0 fits the augmented data as easily as the un-augmented control, while seeds 1 and 2 fall
+behind by epoch 5 in **both** augmented arms. Since the two arms differ in window count and
+`aug_seed=0` is shared by all training seeds (so no seed is matched to the cache draw), this is
+seed-dependent optimisation behaviour under augmented inputs — not a data-volume effect and not
+a cache artifact.
+
+⚠ **Lower train loss did not mean better AP here.** `frozen_aug` s0 reaches the lowest final BCE
+of all nine frozen runs (**0.171**) yet scores 0.2084 AP — *below* `augonly` s0's 0.2155 at BCE
+0.216. The doubled window count bought overfitting, not generalisation, which is consistent with
+that arm finishing last overall.
 
 ⚠ **Read `variants_full_denominator.maxpick.ap_mean`, not the scorer log's printed number.**
 The `[DET-AP]` line the scorer emits is from `variants` — the *covered*-denominator column — and
