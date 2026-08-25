@@ -191,6 +191,13 @@ score_seed() {
   # (it read best_epoch as a timing column and concluded head-training was
   # free). This script only scores frozen arms today, but the failure is silent
   # and the fix is one awk clause.
+  # And if this ever DOES score an FT run, the (last-best)>=6 test below must
+  # gain an `&& !ft` clause too. It reproduces the frozen trainer's stop rule
+  # (epochs_no_improve == last-best, break at >= patience) -- but
+  # train_esad_unfreeze.py has no early_stop, no no_improve and no break at
+  # all, so a short FT log is ALWAYS a kill and the test would fail OPEN,
+  # scoring a seed killed at ep12 with best ep3 (gap 9). Verified 2026-08-25:
+  # zero such runs exist today; score_ft.sh already carries the `!ft` guard.
   local CONVERGED=no
   if [ -f "$OUT/log_r0.csv" ]; then
     CONVERGED=$(awk -F, '
