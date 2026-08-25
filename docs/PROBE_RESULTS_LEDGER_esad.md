@@ -4904,3 +4904,47 @@ benefit. It still fits, so it stands.
 Rule: a PBS comment describes why a job is *not running right now*, not why it
 failed. Read `Exit_status` / `run_count` / `mtime` before concluding the
 scheduler rejected a shape.
+
+### §11c — endovit is truncated, not weak: do not table its 0.07
+
+endovit scored **0.0487 / 0.0743 / 0.0886** (mean 0.0705) — half the next-lowest
+arm. That is not a backbone result. Checking `best_epoch` across every augonly
+seed:
+
+| arm | seeds still rising at the cut (best_epoch ≥ ep−1) |
+|---|---|
+| **endovit** | **3 of 3** |
+| lemonfm | 1 of 3 |
+| meta1b | 1 of 2 |
+| meta2b | 1 of 3 |
+| snx | 1 of 3 |
+| ours1b_e19 | 0 of 3 |
+| **prod37m_e199 (the winner)** | **0 of 3** |
+
+endovit's val_well_map climbs monotonically through epoch 19 on all three seeds
+(s0 0.066→0.109, s1 0.069→0.149, s2 0.072→0.147) — it never plateaus and never
+early-stops. Every other arm peaks at epoch 13–18 and flattens.
+
+**The asymmetry runs in our favour, which is exactly why it has to be fixed.**
+The arm we are claiming a win over is the one that did not finish converging,
+while the winning arm converged on all three seeds. Reporting 0.0705 next to our
+0.1802 would be comparing a converged model to a half-trained one.
+
+The 20-epoch budget is *not* unfair by construction — all six configs carry
+byte-identical `optimization:` blocks (bs 8, lr 1e-3, warmup 2.0, patience 6).
+endovit is simply slower to converge under it, plausibly because it is an image
+ViT rather than a video backbone.
+
+**Action:** `endovit40`, a 40-epoch arm, submitted as 7557222. Verified by YAML
+*parse* (not grep) that `num_epochs: 20→40` is the only difference from the
+matched config. The matched 20-epoch arm is left intact — the extended run is an
+*addition* to the table, not a replacement, so the apples-to-apples row survives
+alongside the converged one. Both will be reported.
+
+**Infra note.** Running a variant arm normally re-exports 2468 windows (~40 min)
+to produce byte-identical features, because every path derives from `NAME`. Added
+`CACHE_NAME` (which cache to READ) and `TAG_SUFFIX` (which run dir to WRITE), so
+the variant borrows the export and cannot overwrite the arm it borrows from.
+Before submitting, confirmed the export gate *passes* on the borrowed cache — a
+gate miss runs `rm -rf "$AUGC/train"`, which would have deleted endovit's cache
+and silently re-exported it under the variant's seed.
