@@ -2364,6 +2364,18 @@ Artifacts: `runs/esad_double_meta1b_{boxonly,presonly}_ablation_s{0,1,2}/`, comp
 `runs/esad_double_meta1b_selmetric_ablation_s{0,1,2}/`; floor from
 `runs/esad_double_meta1b_frozen_s{0,1,2}/`. Launcher: `run_freeze_head_ablation.sh`.
 
+**Scope: this floor is a meta1b measurement, not a global constant.** Swept all `esad_double_*_s{0,1,2}`
+run dirs for other accidental same-config-same-seed pairings (match on epoch-0 `train_bce`, requiring
+agreement on every shared seed *and* clean separation from cross-seed distances) — **meta1b is the
+only backbone with one**. So there is no free floor for meta2b/prod37m/the externals; treat ±0.026
+presence / ±0.059 box as an order-of-magnitude guide there, not a measured bound.
+Two notes for anyone re-running that sweep: epoch-0 `train_loss` **cannot** do this job — it is
+dominated by the box term, and on the known pair its matched distances (≤0.106) overlap its
+cross-seed distances (≥0.009), so it finds nothing including the true positive. `train_bce`
+separates cleanly (matched 0.0104–0.0161 vs cross-seed ≥0.032). And a detector returning zero hits
+is uninformative until it fires on a positive you can verify by hand — this one is self-tested
+against the meta1b pair.
+
 **What this closes.** §4b-selmetric asked whether meta1b's weak localization was a selection
 artifact or head interference. Neither: selection-on-IoU makes it *worse* (11/11), and separate
 training does nothing. The gap is the checkpoint's, not the head's — stop tuning the head for it.
