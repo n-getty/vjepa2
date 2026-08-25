@@ -1693,10 +1693,16 @@ All five land in **0.18-0.21** regardless of where they started. That band reads
 **IN FLIGHT (2026-08-25): the budget-scaling arms.** `prod18m_e59` and `prod9m_e29`
 are being FT-scored now (Sophia 176644/176645) to test whether the CPT budget
 signal that shows up in fine-tuning (`[[budget-scaling-shows-up-in-finetune]]`)
-survives on ESAD. **First cell only: `prod18m_e59_ft_last4` s0 = 0.2175.** That is
-one seed — do not read it against the table above, whose rows are 3-seed means and
-whose noise bar is 0.022-0.063. It is logged here so the number has a home, not as
-a result.
+survives on ESAD. **First cells: `prod18m_e59_ft_last4` s0 = 0.2175,
+`prod9m_e29_ft_last4` s0 = 0.1925.** Those are single seeds — do not read them
+against the table above, whose rows are 3-seed means and whose noise bar is
+0.022-0.063. They are logged here so the numbers have a home, not as a result.
+The s0-vs-s0 gap (+0.0250, the higher-budget checkpoint ahead) is the *direction*
+`[[budget-scaling-shows-up-in-finetune]]` predicts, but it is one paired draw and
+sits inside the noise bar; it is not evidence yet.
+
+⚠ **`prod9m_e29_ft_last4` is n=2, not n=3** — its s1 never trained (see the
+never-trained-dir note in the Open items table); relaunched 2026-08-25 as 176647.
 
 ⚠ **Read the JSON, not the console.** That seed's `[DET-AP]` log line prints
 `maxpick=0.2262` — the *covered*-denominator variant. The canonical figure is
@@ -4188,11 +4194,42 @@ Reproduce: `python scripts/aggregate_triplet_seeds.py --root
       | 176569–71 | `ft_aug_pw200` | `pos_weight_cap` 50 → 200, augmented | ≥ +0.06 macro AP → clipping (12/21 classes, class 12 off by 21.9×) was suppressing the macro mean | inside noise → the macro/GT-weighted gap (0.2265 vs 0.3484) is capacity, not loss weighting |
       | 176575–77 | `ft_augstrong` | per-epoch aug at **strong** strength (`MIN_SCALE 0.9→0.70`, `ASPECT 0.05→0.15`, `COLOR 0.15→0.30`) | ≥ +0.06 → the published recipe was under-regularised, consistent with `train_bce` still collapsing to 0.0075–0.0125 | inside noise or negative → mild is already the right strength; stop tuning aug |
 
+      **FIRST CELL IN (2026-08-25): `ft_aug_last8` s1 = 0.2297** (canonical full-denominator
+      maxpick; the `[DET-AP]` console line said 0.2375 — covered denominator, +0.0078). One seed,
+      so this settles nothing. It is recorded here for one reason:
+
+      ⚠ **compare PAIRED, not against the arm mean.** The `ft_aug` baseline's per-seed AP is
+      **0.2265 / 0.2585 / 0.2107** — a 0.048 spread, and **s1 is its luckiest seed**. So:
+
+      | comparison | Δ | reading |
+      |---|---:|---|
+      | s1 vs **baseline s1** (correct, paired) | **−0.0288** | depth-8 is *behind* on this seed |
+      | s1 vs baseline **mean** 0.2319 (wrong) | −0.0022 | looks like a dead tie |
+
+      Same number, 13× apart in magnitude, and they'd be written up differently. When an arm's
+      own seed spread (0.048) is larger than the effect being chased, a single-seed-vs-mean
+      comparison is measuring which seed you drew. Wait for s0/s2 (s0 is re-running as **176603**
+      after a walltime kill, so this arm is **n=2** until it lands). Cross-ref
+      `[[one-seed-has-no-error-bar]]`, `[[ab-window-truncation-trap]]`.
+
       **Scoring.** `frozen_aug.sh` originally trained three seeds and stopped — it would have
       landed three run dirs with `best.pt` and no AP, an arm that reads as finished in `qstat`
       but has no number (the exact gap `run_esad_score_presrep.sh` was written to clean up after
       last time). Every arm above now scores inline: detection AP on the full denominator, then
       `score_oracle.py`, then a `collect_esad_arms.py` table in the job log.
+
+      **A seed can go missing without anything looking wrong.** Two of these arms are at n=2 for
+      unrelated reasons, and neither announced itself: `ft_aug_last8` s0 was a **6000 s walltime
+      on a ~15,300 s arm** (760 s/epoch × 20; killed at 6033 s), and — found while scoring —
+      `prod9m_e29_ft_last4` **s1 never trained at all**. Job 175628 died in the old
+      `run_ft_seed.sh` GPU-wait loop on 2026-08-20 (`Exit_status=143`, `resources_used.ngpus=0`,
+      94 s, a 124-byte log), leaving a run dir containing **only `.code_stamp`**. It sat
+      unnoticed for five days because `collect_esad_arms.py` renders it as a `-` inside the
+      best-epoch list (`10/-/11`), which reads like a formatting gap rather than a lost seed.
+      Swept every run dir: **exactly one** such never-trained dir exists. Relaunched as **176647**
+      (the wait loop has since been replaced by the `assigned_gpus`/cgroup path, which aborts
+      loudly with `exit 3` instead of waiting in silence). See
+      `[[ft-launcher-gpu-wait-self-contention]]`.
 
       **Why 176548 became 176588.** PBS spools a job's script at submit time, so the inline-score
       patch could not reach the already-queued 176548; a `depend=afterany` scorer (176583) was
