@@ -4976,3 +4976,33 @@ move numbers inside their own noise floor. endovit is categorically different �
 3/3 rather than 1/3, and with no converged sibling there is no within-arm
 comparison available to bound it at all. That is why it alone got the 40-epoch
 arm (7557222), and why the fix is an *added* row rather than a re-run.
+
+### §11e — The 20-epoch budget is NOT binding for fine-tuning (scope bound on §11c)
+
+§11c found a fixed epoch budget silently favouring whichever backbone converges
+fastest. That defect would invalidate far more than the frozen table if it also
+held for the FT arms — every FT comparison in §4, §7–§9 runs the same 20-epoch
+cut. So the same `best_epoch` audit was run across all 20 completed FT runs
+before those results were trusted further.
+
+Result: `best_epoch` lands at **5–12 against a 19-epoch cut on every completed
+FT arm** — `ft_aug` 10/9/5, `ft_last4` 8/6/10, `aug_last8` 4/12/10, `augpe` 12,
+`prod9m` 10/11, `snx_ft` 5/8/9, `v1_ft` 10/8/8. Not one is within 6 epochs of
+the cut. Fine-tuning converges roughly twice as fast as the frozen readout and
+has ample headroom in the budget.
+
+**The FT tables are therefore unaffected by §11c** — the endovit finding is
+scoped to the frozen+augonly family, where the readout trains slowly enough for
+20 epochs to bind on a slow backbone.
+
+Three runs flagged as still-rising are not counterexamples: `pw200` s0 and
+`augstr` s0 are the two jobs *currently mid-flight* (ep15 and ep7 as of writing),
+and `esad_double_v1_aug` is a 2026-08-05 exploratory run that predates the
+current builder and appears in no table (it still writes the old
+`test_detection_ap.json` filename).
+
+**How to apply:** when a measurement defect is found in one family, the next
+question is not "how do I fix it" but "how far does it reach". The audit that
+found it is usually cheap to re-run against every other family — `best_epoch` is
+already sitting in every CSV — and bounding the blast radius is worth more than
+the fix, because it tells you which existing conclusions you may keep.
