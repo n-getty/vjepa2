@@ -1696,11 +1696,33 @@ signal that shows up in fine-tuning (`[[budget-scaling-shows-up-in-finetune]]`)
 survives on ESAD. All three rungs share the **identical** `ft_last4` recipe, so
 this is a matched ladder, not a cross-arm comparison:
 
-| CPT budget | s0 | s1 | s2 | n | mean | spread |
-|---|---|---|---|---:|---|---|
-| `prod9m_e29` | 0.1925 | *(176647 Q)* | 0.1925 | 2 | 0.1925 | **0.0000** |
-| `prod18m_e59` | 0.2175 | 0.2157 | *(pending)* | 2 | **0.2166** | 0.0018 |
-| `prod37m_e199` | **0.1849** | 0.2146 | 0.2108 | 3 | 0.2034 | **0.0297** |
+| CPT budget | s0 | s1 | s2 | n | mean | sd | spread |
+|---|---|---|---|---:|---|---|---|
+| `prod9m_e29` (9.2M) | 0.1925 | *(176647 Q)* | 0.1925 | 2 | 0.1925 | — | **0.0000** |
+| `prod18m_e59` (18.4M) | 0.2175 | 0.2157 | 0.2026 | 3 | **0.2119** | 0.0082 | 0.0150 |
+| `prod37m_e199` (36.9M) | **0.1849** | 0.2146 | 0.2108 | 3 | 0.2035 | 0.0162 | **0.0297** |
+
+**Paired deltas** (only seeds both arms hold — the ladder's rungs behave differently):
+
+| step | seeds | per-seed Δ | mean Δ | signs |
+|---|---|---|---:|---|
+| 9M → 18M | 0, 2 | +0.0250, +0.0101 | **+0.0176** | **++ consistent** |
+| 18M → 37M | 0, 1, 2 | −0.0326, −0.0011, +0.0082 | −0.0085 | −−+ **disagree** |
+| 9M → 37M | 0, 2 | −0.0076, +0.0183 | +0.0054 | −+ disagree |
+
+**Read: the first doubling shows a consistent positive effect; the second does not.**
+9M→18M moves both available seeds in the same direction (+0.0176 mean), which agrees with
+the Triplet finding in `[[budget-scaling-shows-up-in-finetune]]`. 18M→37M is −0.0085 with
+signs disagreeing, and is dominated by prod37M's s0 (0.1849) — drop that one seed and the
+step is +0.0035. **Neither step clears the ~0.06 bar this probe needs**, so treat the
+ladder as: *weak support for budget mattering at the low end, no resolvable effect at the
+high end, everything inside the 0.18–0.22 band.*
+
+⚠ **prod18M's mean MOVED when its third seed landed** — 0.2166 (n=2) → 0.2119 (n=3), and
+its spread went 0.0018 → 0.0150. An earlier revision of this block reported the n=2 mean
+alongside a note that its 0.0018 spread "looks authoritative and is the least trustworthy
+row here". That caution was correct and is worth keeping: s2 came in at 0.2026, well below
+both earlier seeds. **Two tight draws predicted nothing about the third.**
 
 ⚠ **prod9m's two seeds agree to four decimals (0.19249 vs 0.19253) and this is a
 COINCIDENCE, not a duplicate run** — checked, because a 0.0000 spread next to a
@@ -1711,7 +1733,8 @@ identical, best epochs differ (10 vs 11), and the val trajectories diverge by up
 to 0.052 `val_well_map`. `wbf_meanconf` — same runs, different fusion — reads
 0.1880 vs 0.1938, a normal 0.0058 gap. **Do not quote prod9m's spread as
 evidence of anything.** Two draws that happen to collide say nothing about the
-distribution; the arm's real spread is unmeasured.
+distribution; the arm's real spread is unmeasured, and prod18M above is the
+cautionary case.
 
 **⚠ The ladder is NOT monotone, and that is the whole point of showing it.** At
 face value 18M beats 37M by +0.0132 — the wrong direction for a budget effect.
