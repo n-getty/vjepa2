@@ -4715,3 +4715,33 @@ the arm been called from its selection metric it would have been called wrong.
 Read together with §6: making the weak default recipe *fresh* every epoch bought
 nothing on this seed, which points at recipe **strength** (`augstr`, 176575-77)
 rather than freshness as the remaining lever — if either is one.
+
+### 8. Seed ensembling on the FT arms — 0.2498, the best ESAD number on record
+
+Both complete FT arms were seed-ensembled (`score_esad_seed_ensemble_ft.py`,
+outputs in `seed_ensemble_scores/`). Canonical
+`variants_full_denominator`, denominators identical across arms (5903 frames,
+coverage 0.9696, gt_full 11207):
+
+| arm | 3-seed mean | sd | ens `maxpick` | ens **`wbf_meanconf`** | gain vs mean |
+|---|---:|---:|---:|---:|---:|
+| `ft_aug` | 0.2319 | 0.0243 | 0.2460 | **0.2498** | +0.0179 (0.73 sd) |
+| `ft_last4` | 0.2035 | 0.0162 | 0.2106 | 0.2274 | +0.0239 (1.48 sd) |
+
+**`wbf_meanconf` > `maxpick` on both arms**, reproducing
+[[esad-ft-seed-ensemble-is-localization]]: under fine-tuning the seeds disagree
+on *where* the box is, so confidence-weighted fusion beats picking one seed's
+box. Use `wbf_meanconf` for any FT seed-ensemble headline.
+
+**Provenance verified** — 3 distinct seed specs per arm, each pairing its own
+`best.pt` with its OWN test cache (the stale-cache trap this FT-specific scorer
+exists to avoid), and the scorer's per-seed baselines match the values read
+independently from each run's `test_detection_ap_cov_fulldenom.json`.
+
+**Caveat on `ft_aug`.** +0.73 sd is inside that arm's own seed spread, so the
+*gain* is not separately established there (it is at 1.48 sd on `ft_last4`).
+The ensemble is a single deterministic artifact rather than a draw from the seed
+distribution, so 0.2498 stands as a number; what is not claimed is that
+ensembling reliably buys ~0.018 on this arm.
+
+Standing best: **`ft_aug` + 3-seed `wbf_meanconf` ensemble = 0.2498 det-AP.**
