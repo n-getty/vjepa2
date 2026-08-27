@@ -57,8 +57,9 @@ import torch.nn.functional as F
 import yaml
 from sklearn.metrics import average_precision_score
 
-# Make the Aurora repo importable for `evals.*` and `src.*`.
-sys.path.insert(0, "/lus/flare/projects/ModCon/ngetty/vjepa2")
+# Make the repo root importable for `evals.*` and `src.*`, regardless of
+# which checkout (Aurora/flare, Polaris/eagle, ...) this script lives in.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # XPU support: importing intel_extension_for_pytorch registers torch.xpu kernels.
 try:
