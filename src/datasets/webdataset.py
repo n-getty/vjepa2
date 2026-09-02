@@ -39,6 +39,12 @@ _WARNED_MISSING_LABEL = False
 # dropped. Override via VJEPA_MIN_CLIP_STD.
 _DEFAULT_MIN_CLIP_STD = float(os.environ.get("VJEPA_MIN_CLIP_STD", "1.0"))
 
+# Per-source WDS shuffle buffer depth. data_manager.py never passes
+# shuffle_buffer through to make_webdataset, so this default is what every
+# production run actually uses -- override via VJEPA_SHUFFLE_BUFFER, mirroring
+# VJEPA_PREFETCH_FACTOR below.
+_DEFAULT_SHUFFLE_BUFFER = int(os.environ.get("VJEPA_SHUFFLE_BUFFER", "1000"))
+
 # --- Batch-source / clip-variance instrumentation -------------------------
 # Per-process (DataLoader worker) diagnostics. Two purposes:
 #   1. Mechanism-check: log the source + raw per-pixel std of the first
@@ -280,6 +286,26 @@ def _record_dropped_clip(source_name, clip_std):
         )
 
 
+def resolve_epoch_samples(total_corpus_samples, total_budget_samples=None, num_epochs=None):
+    """Real per-epoch sample count for the reps/clip/epoch tripwire.
+
+    A configured epoch is ``ipe * world_size * batch_size * true_accum``
+    samples -- NOT the corpus size. Using the corpus size (``total_corpus_
+    samples``) under-reports per-epoch replay by 1.75x on prod_9M (307,200
+    real vs 175,869 corpus), and by an arbitrary factor on any other config.
+    When the caller knows the real whole-run budget (``total_budget_samples``)
+    and epoch count (``num_epochs``), their ratio is the true per-epoch
+    sample count; otherwise fall back to the corpus size, which is what every
+    run before this fix effectively used.
+
+    Returns ``(epoch_samples, is_real)`` -- ``is_real`` is False when the
+    fallback fired, so callers can log that the denominator is approximate.
+    """
+    if total_budget_samples and num_epochs:
+        return float(total_budget_samples) / float(num_epochs), True
+    return float(total_corpus_samples), False
+
+
 def compute_mixing_probs(sample_counts, datasets_weights=None, temperature=0.5):
     """Per-sample source-selection probabilities for ``wds.RandomMix``.
 
@@ -377,91 +403,106 @@ class VideoDecoder:
         Load video content using Decord from a byte buffer.
         Replicates the logic from `VideoDataset.loadvideo_decord`.
         """
+        tmp_name = None
         try:
-            vr = VideoReader(io.BytesIO(video_bytes), num_threads=1, ctx=cpu(0))
-        except Exception as e:
             try:
-                logger.info(f"Fallback: Writing {len(video_bytes)} bytes to temp file")
-                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-                    tmp_name = tmp.name
-                    tmp.write(video_bytes)
-                    tmp.flush()
-                vr = VideoReader(tmp_name, num_threads=1, ctx=cpu(0))
-                os.remove(tmp_name)
-            except Exception as e2:
-                if 'tmp_name' in locals() and os.path.exists(tmp_name):
-                    os.remove(tmp_name)
-                logger.warning(f"Failed to open video with Decord (BytesIO and TempFile): {e} | {e2}")
-                return [], None
-
-        fstp = self.frame_step
-
-        if self.duration is not None or self.fps is not None:
-            try:
-                video_fps = math.ceil(vr.get_avg_fps())
+                vr = VideoReader(io.BytesIO(video_bytes), num_threads=1, ctx=cpu(0))
             except Exception as e:
-                logger.warning(e)
+                try:
+                    logger.info(f"Fallback: Writing {len(video_bytes)} bytes to temp file")
+                    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                        tmp_name = tmp.name
+                        tmp.write(video_bytes)
+                        tmp.flush()
+                    vr = VideoReader(tmp_name, num_threads=1, ctx=cpu(0))
+                except Exception as e2:
+                    logger.warning(f"Failed to open video with Decord (BytesIO and TempFile): {e} | {e2}")
+                    return [], None
+
+            # Decord opens container headers eagerly but decodes frames lazily
+            # on get_avg_fps()/seek()/get_batch() below -- removing tmp_name
+            # right after open (as this function used to) races decord's
+            # internal demuxer threads against the unlink. A clip with a
+            # broken GOP forces extra re-seeks to resolve missing reference
+            # frames, and a re-seek landing after the unlink throws
+            # std::system_error from a non-Python thread that no `except`
+            # here can catch, killing the whole DataLoader worker outright
+            # (see no-relaunch-blocked-a-real-stall-recovery memory: this
+            # took down a 3072-rank job when the dead worker's queue.get()
+            # blocked forever). tmp_name is now removed only in the
+            # `finally` below, after every decord read in this function --
+            # including get_batch() -- has completed.
+            fstp = self.frame_step
+
+            if self.duration is not None or self.fps is not None:
+                try:
+                    video_fps = math.ceil(vr.get_avg_fps())
+                except Exception as e:
+                    logger.warning(e)
+                    return [], None
+
+                if self.duration is not None:
+                    assert self.fps is None
+                    fstp = int(self.duration * video_fps / fpc)
+                else:
+                    assert self.duration is None
+                    fstp = max(1, video_fps // self.fps)
+
+            assert fstp is not None and fstp > 0, "frame_step must be set"
+            clip_len = int(fpc * fstp)
+
+            if self.filter_short_videos and len(vr) < clip_len:
+                logger.warning(f"skipping video of length {len(vr)}")
                 return [], None
 
-            if self.duration is not None:
-                assert self.fps is None
-                fstp = int(self.duration * video_fps / fpc)
-            else:
-                assert self.duration is None
-                fstp = max(1, video_fps // self.fps)
+            vr.seek(0)
 
-        assert fstp is not None and fstp > 0, "frame_step must be set"
-        clip_len = int(fpc * fstp)
+            partition_len = len(vr) // self.num_clips
 
-        if self.filter_short_videos and len(vr) < clip_len:
-            logger.warning(f"skipping video of length {len(vr)}")
-            return [], None
-
-        vr.seek(0)
-
-        partition_len = len(vr) // self.num_clips
-
-        all_indices, clip_indices = [], []
-        for i in range(self.num_clips):
-            if partition_len > clip_len:
-                end_indx = clip_len
-                if self.random_clip_sampling:
-                    end_indx = np.random.randint(clip_len, partition_len)
-                start_indx = end_indx - clip_len
-                indices = np.linspace(start_indx, end_indx, num=fpc)
-                indices = np.clip(indices, start_indx, end_indx - 1).astype(np.int64)
-                indices = indices + i * partition_len
-            else:
-                if not self.allow_clip_overlap:
-                    indices = np.linspace(0, partition_len, num=partition_len // fstp)
-                    indices = np.concatenate(
-                        (
-                            indices,
-                            np.ones(fpc - partition_len // fstp) * partition_len,
-                        )
-                    )
-                    indices = np.clip(indices, 0, partition_len - 1).astype(np.int64)
+            all_indices, clip_indices = [], []
+            for i in range(self.num_clips):
+                if partition_len > clip_len:
+                    end_indx = clip_len
+                    if self.random_clip_sampling:
+                        end_indx = np.random.randint(clip_len, partition_len)
+                    start_indx = end_indx - clip_len
+                    indices = np.linspace(start_indx, end_indx, num=fpc)
+                    indices = np.clip(indices, start_indx, end_indx - 1).astype(np.int64)
                     indices = indices + i * partition_len
                 else:
-                    sample_len = min(clip_len, len(vr)) - 1
-                    indices = np.linspace(0, sample_len, num=sample_len // fstp)
-                    indices = np.concatenate(
-                        (
-                            indices,
-                            np.ones(fpc - sample_len // fstp) * sample_len,
+                    if not self.allow_clip_overlap:
+                        indices = np.linspace(0, partition_len, num=partition_len // fstp)
+                        indices = np.concatenate(
+                            (
+                                indices,
+                                np.ones(fpc - partition_len // fstp) * partition_len,
+                            )
                         )
-                    )
-                    indices = np.clip(indices, 0, sample_len - 1).astype(np.int64)
-                    clip_step = 0
-                    if len(vr) > clip_len:
-                        clip_step = (len(vr) - clip_len) // (self.num_clips - 1)
-                    indices = indices + i * clip_step
+                        indices = np.clip(indices, 0, partition_len - 1).astype(np.int64)
+                        indices = indices + i * partition_len
+                    else:
+                        sample_len = min(clip_len, len(vr)) - 1
+                        indices = np.linspace(0, sample_len, num=sample_len // fstp)
+                        indices = np.concatenate(
+                            (
+                                indices,
+                                np.ones(fpc - sample_len // fstp) * sample_len,
+                            )
+                        )
+                        indices = np.clip(indices, 0, sample_len - 1).astype(np.int64)
+                        clip_step = 0
+                        if len(vr) > clip_len:
+                            clip_step = (len(vr) - clip_len) // (self.num_clips - 1)
+                        indices = indices + i * clip_step
 
-            clip_indices.append(indices)
-            all_indices.extend(list(indices))
+                clip_indices.append(indices)
+                all_indices.extend(list(indices))
 
-        buffer = vr.get_batch(all_indices).asnumpy()
-        return buffer, clip_indices
+            buffer = vr.get_batch(all_indices).asnumpy()
+            return buffer, clip_indices
+        finally:
+            if tmp_name is not None and os.path.exists(tmp_name):
+                os.remove(tmp_name)
 
     def loadimage(self, image_bytes, fpc):
         try:
@@ -726,7 +767,7 @@ class _PerSampleDecode:
         return out
 
 
-def _make_stream(meta, dataset_dir, decoder, fpc, shuffle_buffer=1000,
+def _make_stream(meta, dataset_dir, decoder, fpc, shuffle_buffer=_DEFAULT_SHUFFLE_BUFFER,
                  rank=None, world_size=None):
     """Build one WDS pipeline for a single dataset that yields decoded samples.
 
@@ -834,7 +875,9 @@ def make_webdataset(
     deterministic=True,
     log_dir=None,
     ipe=None,
-    shuffle_buffer=1000,
+    shuffle_buffer=_DEFAULT_SHUFFLE_BUFFER,
+    total_budget_samples=None,
+    num_epochs=None,
 ):
     """Create a WebDataset-based DataLoader honoring rank/world_size via
     ``wds.split_by_node`` and per-dataset frames_per_clip.
@@ -915,8 +958,27 @@ def make_webdataset(
         # of temperature. The old uniform default drove this into the hundreds
         # for tiny sets (e.g. 8-clip endovis15 each clip ~hundreds of times per
         # epoch) while kinetics clips were seen <1x.
+        #
+        # `total` (corpus size) is NOT a real epoch: a configured epoch is
+        # `ipe * world_size * batch_size * true_accum` samples, which for
+        # prod_9M is 307,200 vs a corpus of 175,869 -- using `total` under-
+        # reports per-epoch replay by 1.75x on that config, and by an
+        # arbitrary factor on any other. When the caller (app/vjepa_2_1/
+        # train.py, via data_manager.init_data) knows the real budget it
+        # passes `total_budget_samples` (whole run) and `num_epochs`; their
+        # ratio is the real per-epoch sample count. Fall back to the corpus
+        # size, worded as before, when the budget isn't known (e.g. configs
+        # that omit `ipe`).
         names = [s[0] for s in summary]
-        epoch_samples = total  # ~one pass over the corpus per nominal epoch
+        epoch_samples, _is_real_epoch = resolve_epoch_samples(
+            total, total_budget_samples=total_budget_samples, num_epochs=num_epochs
+        )
+        if _log0 and not _is_real_epoch:
+            logger.info(
+                "  (real per-epoch budget unknown -- using corpus size %d as "
+                "the reps/clip/epoch denominator; ~one pass over the corpus "
+                "per nominal epoch)", int(total),
+            )
         reps_per_clip = []
         for name, cnt, p in zip(names, sample_counts, probs):
             reps = (p * epoch_samples / cnt) if cnt > 0 else float("inf")
@@ -929,6 +991,18 @@ def make_webdataset(
                     "  %-24s n=%-8d true=%6.2f%%  realized=%6.2f%%  "
                     "reps/clip/epoch=%.2f",
                     name, cnt, 100.0 * cnt / total, 100.0 * p, reps,
+                )
+        # Whole-run replay: the number that actually maps to memorization
+        # risk (a run trains for many epochs). Reported at WARN only -- never
+        # wired into fail_reps below, so a corrected/expanded number cannot
+        # turn an already-running config's warning into a boot failure.
+        if _log0 and total_budget_samples:
+            for name, cnt, p in zip(names, sample_counts, probs):
+                run_reps = (p * total_budget_samples / cnt) if cnt > 0 else float("inf")
+                logger.warning(
+                    "  %-24s whole-run reps/clip=%.1f over the full "
+                    "%.3gM-sample budget",
+                    name, run_reps, total_budget_samples / 1e6,
                 )
         # Two-level guard on per-clip repetition (the memorization signature).
         # WARN: any tiny set whose clips repeat a lot — visible but allowed,

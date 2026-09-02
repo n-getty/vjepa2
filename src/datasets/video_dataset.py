@@ -92,6 +92,7 @@ def make_videodataset(
     return_sample_path=False,
     train_frac=1.0,
     subset_seed=0,
+    shuffle=True,
 ):
     dataset = VideoDataset(
         data_paths=data_paths,
@@ -127,13 +128,26 @@ def make_videodataset(
         )
 
     logger.info("VideoDataset dataset created")
+    # seed= was previously omitted, so DistributedSampler used its torch default
+    # of 0 and every "seed" of a probe sweep saw the SAME sample order -- only
+    # head init varied. Deriving it from the probe seed makes a seed sweep vary
+    # data order too.
+    # shuffle=False is REQUIRED by the feature-cache exporter: it makes
+    # row_index equal enumeration order, so caches built by different seeds (or
+    # different world sizes) index the same clip at the same row. Seed
+    # ensembling and cache-vs-cache comparison both depend on that. The
+    # exporter's docstring already claimed "no shuffle" -- until this parameter
+    # existed, that claim was false, since the sampler was hardcoded to shuffle.
+    from src.utils.probe_seed import probe_seed
+
+    _seed = probe_seed()
     if datasets_weights is not None:
         dist_sampler = DistributedWeightedSampler(
-            dataset, num_replicas=world_size, rank=rank, shuffle=True
+            dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
         )
     else:
         dist_sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank, shuffle=True
+            dataset, num_replicas=world_size, rank=rank, shuffle=shuffle, seed=_seed
         )
 
     if deterministic:

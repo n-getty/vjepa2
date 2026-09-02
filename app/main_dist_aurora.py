@@ -32,7 +32,12 @@ if "--train_mode" in sys.argv:
     for var in ("PALS_LOCAL_RANKID", "PMI_LOCAL_RANK", "MPI_LOCALRANKID",
                 "OMPI_COMM_WORLD_LOCAL_RANK", "LOCAL_RANK"):
         if var in os.environ:
-            os.environ["ZE_AFFINITY_MASK"] = os.environ[var]
+            # VJEPA_TILE_OFFSET (default 0) lets multiple independent mpiexec
+            # launches share a 12-tile node on disjoint tiles -- e.g. three
+            # 4-tile probe seeds packed onto one node at offsets 0/4/8. Offset
+            # 0 preserves prior single-launch-per-node behavior exactly.
+            _tile = int(os.environ[var]) + int(os.environ.get("VJEPA_TILE_OFFSET", "0"))
+            os.environ["ZE_AFFINITY_MASK"] = str(_tile)
             break
     # MP_SOCKET_DIR IS A NO-OP with this torch build -- verified 2026-08-06, the
     # string appears nowhere in the install: 0 hits across the python tree,
@@ -479,6 +484,52 @@ def run_training(args):
     if rank == 0:
         logger.info(f"World size: {world_size}; loaded params:")
         pprint.PrettyPrinter(indent=2).pprint(params)
+
+    # GUARD: triplet_recog_frozen MUST run at world_size=4. world_size=12
+    # triples the global batch and cuts optimizer steps to 1/3 at the same
+    # unscaled LR, depressing IVT mAP by 4-10 points (rare classes hit
+    # hardest) -- see [[triplet-collapse-is-tpn12-probe-artifact]] in memory.
+    # This bug shipped from a launcher script TWICE (once caught 2026-08-18,
+    # once recurring 2026-08-20 via a new script that copied an unpatched
+    # template) because nothing but a memory note enforced it. Checked here,
+    # not in the launcher, because every launcher goes through this one
+    # chokepoint regardless of which shell script invokes it.
+    if params.get("eval_name") == "triplet_recog_frozen" and world_size != 4:
+        if os.environ.get("VJEPA_ALLOW_NONSTANDARD_TRIPLET_WORLD_SIZE", "0") != "1":
+            sys.exit(
+                f"FATAL: triplet_recog_frozen launched at world_size={world_size}, "
+                f"not the validated 4. This is the TPN=12 confound that has silently "
+                f"depressed triplet IVT mAP by 4-10 points twice before. Fix the "
+                f"launcher's mpiexec -n / WORLD_SIZE to 4, or set "
+                f"VJEPA_ALLOW_NONSTANDARD_TRIPLET_WORLD_SIZE=1 if this is deliberate."
+            )
+
+    # GUARD: GraSP configs that still point at the OLD, build-confounded clip
+    # CSVs (grasp_phase_asformer_ctx3_seq_*.csv under leonardo_borgioli/probes/csv)
+    # produce numbers that are NOT comparable to the fixed official_ctx16 builder
+    # (raw meta2b 68.04 old vs 75.65 best-head / 79.77 ensemble fixed -- a ~7-12
+    # mAP gap from the harness alone, not the encoder). This has been cloned into
+    # new probe configs from full_cached_384/ as a template more than once. See
+    # configs/heads/grasp/full_cached_384/_DEPRECATED_OLD_BUILDER.md and
+    # [[grasp-fixed-build-beats-sota]] in memory. Warn, don't fail -- the old
+    # rows in docs/PROBE_RESULTS_LEDGER.md are intentionally kept reproducible.
+    # NOTE: "ctx3_seq" alone is NOT a safe marker -- SAR-RARP50 configs use the
+    # SAME suffix for their own (unrelated, unconfounded) clip CSVs
+    # (sarrarp50_actions_4fps_asformer_ctx3_seq_*.csv). The distinguishing
+    # marker is "grasp_phase_asformer_ctx3" / "grasp_cache_384" /
+    # "grasp_cached_384", which are exclusive to the old GraSP builder.
+    _data_cfg = params.get("experiment", {}).get("data", {}) if isinstance(params.get("experiment"), dict) else {}
+    for _k in ("dataset_train", "dataset_val", "train_cache_root", "val_cache_root"):
+        _v = _data_cfg.get(_k, "") or ""
+        if "grasp_phase_asformer_ctx3" in _v or "grasp_cache_384" in _v or "grasp_cached_384" in _v:
+            logger.warning(
+                f"GraSP config uses the OLD build-confounded clip builder "
+                f"({_k}={_v!r}). This is NOT comparable to official_ctx16 "
+                f"results -- see configs/heads/grasp/full_cached_384/"
+                f"_DEPRECATED_OLD_BUILDER.md before citing this number as a "
+                f"'best' or SOTA-comparable result."
+            )
+            break
 
     try:
         # Eval YAMLs (e.g. configs/heads/sarrarp50/*) carry `eval_name` and route

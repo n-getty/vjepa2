@@ -29,6 +29,60 @@ def read_cache_pooled(cache_root):
     return "none"
 
 
+def _peek_manifest(cache_root):
+    if cache_root is None:
+        return None
+    root = Path(cache_root)
+    candidates = [root / "manifest.json"] + sorted(root.glob("rank_*/manifest.json"))
+    for m in candidates:
+        if m.exists():
+            try:
+                with open(m) as f:
+                    return json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+    return None
+
+
+def assert_cache_matches_encoder(cache_root, checkpoint_path, readout_layer):
+    """Hard-fail if a feature cache was exported for a DIFFERENT checkpoint or
+    readout_layer than the one this probe run is about to score against.
+
+    A mid-layer readout cache is byte-shape-identical to a final-layer cache
+    (same manifest keys otherwise) -- scripts/eval_grasp_map_cached.py even
+    infers embed_dim from the cache itself, so nothing downstream would ever
+    catch a silent mismatch (see frozen-probe diagnosis plan, Exp-2). Caches
+    written before these fields existed have them absent (None), which reads
+    as "old cache, unknown provenance" and is allowed through -- only an
+    explicit, non-matching value is a hard fail.
+    """
+    manifest = _peek_manifest(cache_root)
+    if manifest is None:
+        return
+    # KEY ABSENT (old cache, written before these fields existed) = unknown
+    # provenance, allowed through. KEY PRESENT but None = new-format export
+    # that explicitly recorded "no override" (baseline final-layer / no
+    # checkpoint captured) -- that IS a known value and must still be compared,
+    # or a mid-layer request against a baseline cache would silently pass.
+    if "checkpoint_path" in manifest:
+        cached_ckpt = manifest["checkpoint_path"]
+        if cached_ckpt is not None and checkpoint_path is not None and cached_ckpt != checkpoint_path:
+            raise RuntimeError(
+                f"Cache staleness guard: {cache_root} was exported from checkpoint "
+                f"{cached_ckpt!r} but this run requests {checkpoint_path!r}. Refusing "
+                "to score a cache built from a different encoder."
+            )
+    if "readout_layer" in manifest:
+        cached_layer = manifest["readout_layer"]
+        if cached_layer != readout_layer:
+            raise RuntimeError(
+                f"Cache staleness guard: {cache_root} was exported with readout_layer="
+                f"{cached_layer!r} but this run requests readout_layer={readout_layer!r}. "
+                "A mid-layer cache is byte-shape-identical to a final-layer cache -- "
+                "refusing to silently score the wrong layer."
+            )
+
+
 class BackboneFeatureCacheDataset(Dataset):
     def __init__(self, cache_root, require_complete_export=True):
         self.cache_root = Path(cache_root)
@@ -256,12 +310,17 @@ def make_backbone_feature_cache(
         from src.datasets.video_dataset import seeded_subset_indices
 
         subset_indices = seeded_subset_indices(len(dataset), train_frac, subset_seed)
+    # seed was hardcoded 0, so the cached head-train path shuffled identically
+    # for every "seed" of a sweep -- on this path there is also no augmentation,
+    # so head init was the ONLY thing that varied. Derive it from the probe seed.
+    from src.utils.probe_seed import probe_seed
+
     sampler = ShardOrderDistributedSampler(
         dataset,
         num_replicas=world_size,
         rank=rank,
         shuffle=training,
-        seed=0,
+        seed=probe_seed(),
         drop_last=False,
         subset_indices=subset_indices,
     )

@@ -397,6 +397,12 @@ def main(args, resume_preempt=False):
         # dataload-time purely because decode runs inline instead of prefetched.
         f"num_workers={num_workers} pin_mem={pin_mem} "
         f"persistent_workers={persistent_workers} "
+        # VJEPA_SHUFFLE_BUFFER: per-source WDS shuffle buffer depth
+        # (src/datasets/webdataset.py, default 1000). Was hardcoded until now, so
+        # every finished run used 1000 regardless of config -- logged for the same
+        # reason as num_workers: an env-only override that data_manager.py never
+        # threads through is otherwise unrecoverable from params-pretrain.yaml.
+        f"shuffle_buffer={os.environ.get('VJEPA_SHUFFLE_BUFFER', '1000')} "
         # GOPEN_BUFFER sets the read() size webdataset uses to stream shards:
         # gopen falls through to open(url, "rb", buffering=int($GOPEN_BUFFER or
         # -1)) for scheme-less paths, and at -1 CPython uses the mount's
@@ -608,6 +614,36 @@ def main(args, resume_preempt=False):
         #     from "something else on the node is eating memory"
         ("%.1f", "host-avail-mib"),
         ("%.1f", "rss-mib"),
+        # Drift-investigation columns 19-22 (docs/THROUGHPUT_RECIPE_AURORA.md,
+        # "backward drift episode"). APPENDED, never inserted -- same
+        # positional contract as columns 16-18 above; every existing reader
+        # indexes low, fixed offsets, so this is backward-compatible.
+        #   gap-ms: wall time between THIS row's iter_elapsed_time_ms stamp and
+        #     the NEXT iteration's itr_start_time -- log_stats() and
+        #     _watchdog_disarm() run in that window and no other column times
+        #     it. Reported on the FOLLOWING row (it isn't known until then), so
+        #     row 0 of a run/resume always logs 0.0.
+        #   log-io-ms: the csv_logger.log() call's own wall time in isolation,
+        #     to separate "the gap is the Lustre open/append/close" from "the
+        #     gap is something else in that window." Same one-row deferral.
+        #   fwd-context-encoder-ms / fwd-context-predictor-ms: splits the
+        #     existing fwd-context-ms (col 7, kept as their SUM for backward
+        #     compatibility) into the context ENCODER forward and the
+        #     PREDICTOR forward. A 2n reproduction caught a 140s fwd-context
+        #     stall with flat device memory; a single black-box column cannot
+        #     say which half it was in.
+        ("%.2f", "gap-ms"),
+        ("%.2f", "log-io-ms"),
+        ("%.2f", "fwd-context-encoder-ms"),
+        ("%.2f", "fwd-context-predictor-ms"),
+        # Column 23, appended. Job 8744917 (validating the CSVLogger fix that
+        # removed the per-iteration Lustre open/close, see src/utils/logging.py)
+        # found gap-ms still elevated on iterations immediately after a
+        # log_freq boundary even with log-io-ms near zero -- the periodic
+        # logger.info() call (also a per-rank Lustre write, `rank.%r.out`) is
+        # the other candidate in the untimed gap window. loginfo-ms isolates
+        # it the same way log-io-ms isolates the CSV write.
+        ("%.2f", "loginfo-ms"),
     )
 
     # -- init model
@@ -692,6 +728,17 @@ def main(args, resume_preempt=False):
     )
 
     # -- init data-loaders/samplers
+    # Real per-epoch/whole-run sample budget, threaded through so the
+    # reps/clip/epoch tripwire (src/datasets/webdataset.py) measures the
+    # CONFIGURED epoch (ipe * world_size * batch_size * true_accum) rather
+    # than the corpus size -- the two differ by 1.75x on prod_9M. `ipe` here
+    # is the config's declared value (None on configs that omit it); the
+    # tripwire falls back to its old corpus-size wording when it is.
+    total_budget_samples = (
+        ipe * data_world_size * batch_size * true_accum * num_epochs
+        if ipe and num_epochs
+        else None
+    )
     (unsupervised_loader, unsupervised_sampler) = init_data(
         data=dataset_type,
         root_path=dataset_paths,
@@ -711,6 +758,9 @@ def main(args, resume_preempt=False):
         pin_mem=pin_mem,
         persistent_workers=persistent_workers,
         log_dir=None,
+        ipe=ipe,
+        total_budget_samples=total_budget_samples,
+        num_epochs=num_epochs,
     )
     # See _LOADER_KEEPALIVE at module top: without this the loader dies at
     # main()'s return and its worker-shutdown destructor runs before any exit
@@ -1046,6 +1096,32 @@ def main(args, resume_preempt=False):
     trailing_losses = []
     step_count = 0
 
+    # Drift-investigation gap probe (plan: docs/THROUGHPUT_RECIPE_AURORA.md
+    # "backward drift episode"). The stall found in job 8744159 lives entirely
+    # in the wall time between one iteration's `iter_elapsed_time_ms` stamp and
+    # the NEXT iteration's `itr_start_time` -- log_stats()'s CSVLogger.log() and
+    # _watchdog_disarm() run in that gap and nothing times it. `_prev_iter_end`
+    # carries the previous iteration's end-of-timed-work timestamp forward so
+    # the gap can be measured and logged on the FOLLOWING row (it cannot be
+    # known until that row's itr_start_time exists). None on the very first
+    # iteration of the run, where there is no prior row to attribute a gap to.
+    _prev_iter_end = None
+    # log-io-ms companion: csv_logger.log() cannot time its own call (the value
+    # would have to be an argument to itself), so it is measured during
+    # iteration N and reported on row N+1's gap_ms -- both describe the same
+    # untimed window, and log-io-ms isolates how much of it is the Lustre write.
+    _prev_log_io_ms = 0.0
+    # loginfo-ms: the periodic logger.info() call (every log_freq=10 iters)
+    # writes to this rank's own stdout file, ALSO on Lustre
+    # (scripts/scaling_ladder.sh's `-o "$dir/rank.%r.out"`). Job 8744917 (the
+    # CSVLogger fix's own validation run) found gap-ms still elevated on 4 of
+    # 8 flagged 128n transitions even with log-io-ms near zero -- and every one
+    # of those 4 had its gap attributed to the iteration immediately AFTER a
+    # log_freq boundary, i.e. exactly when this call fires. Measuring it
+    # directly separates "the CSV write is fine but stdout isn't" from an
+    # unexplained residual in the gap.
+    _prev_loginfo_ms = 0.0
+
     # -- Per-rank HANG WATCHDOG (diagnostic; env-gated, default OFF so the proven
     # recipe is untouched unless VJEPA_ITER_WATCHDOG_S is set). Ported/upgraded from
     # PRISM's step-watchdog (BaseMM_PRISM/src/training/trainer_native.py): each rank
@@ -1171,6 +1247,23 @@ def main(args, resume_preempt=False):
 
         for itr in range(ipe):
             itr_start_time = time.time()
+            # gap-ms: wall time since the PREVIOUS iteration's timed work ended
+            # (its iter_elapsed_time_ms stamp) -- i.e. everything log_stats() and
+            # _watchdog_disarm() did in between. None -> 0.0 attributes no gap to
+            # the first iteration of a run/resume, which has no prior row.
+            gap_ms = (
+                (itr_start_time - _prev_iter_end) * 1000.0
+                if _prev_iter_end is not None
+                else 0.0
+            )
+            # log-io-ms for THIS row reports the PREVIOUS iteration's
+            # csv_logger.log() duration -- same deferred-by-one-row reasoning
+            # as gap_ms: the call that would time row N cannot also be inside
+            # row N (it is what writes that row).
+            log_io_ms = _prev_log_io_ms
+            # loginfo-ms: same deferred-by-one-row reasoning, for the periodic
+            # logger.info() call (see _prev_loginfo_ms above).
+            loginfo_ms = _prev_loginfo_ms
             _watchdog_arm()  # per-rank hang stack-dump (no-op unless VJEPA_ITER_WATCHDOG_S set)
 
             sample = fetch_sample()
@@ -1246,12 +1339,20 @@ def main(args, resume_preempt=False):
                                 new_h.append(F.layer_norm(hi, (hi.size(-1),)))
                         return new_h
 
-                def forward_context(clips, masks_enc, masks_pred, embed_dim=embed_dim_encoder):
+                def forward_context(clips, masks_enc, masks_pred, embed_dim=embed_dim_encoder,
+                                     mark_fwd=False):
                     modality = "video"
                     if img_temporal_dim_size is not None:
                         if clips[0].shape[2] == img_temporal_dim_size:
                             modality = "image"
                     z = encoder(clips, masks_enc, gram_mode=False, training_mode=True)
+                    # §7 of the drift investigation caught a 140s fwd-context stall
+                    # on 2n with flat device memory -- a single black-box column
+                    # cannot say whether that time is in the context ENCODER or the
+                    # PREDICTOR. This mark splits them; mark_fwd follows the same
+                    # micro-batch-0-only convention as fwd_target_done/fwd_context_done.
+                    if mark_fwd:
+                        phase_timer.mark("fwd_context_encoder_done")
                     z_pred, z_context = predictor(
                         z, masks_enc, masks_pred, mod=modality
                     )
@@ -1341,7 +1442,7 @@ def main(args, resume_preempt=False):
                         if mark_fwd:
                             phase_timer.mark("fwd_target_done")
                         z_pred, z_context = forward_context(
-                            clips_mb, menc_mb, mpred_mb
+                            clips_mb, menc_mb, mpred_mb, mark_fwd=mark_fwd
                         )
                         loss_pred = loss_fn(
                             z_pred, h, mpred_mb, cls_loss=has_cls_first, d_weights=None
@@ -1587,10 +1688,26 @@ def main(args, resume_preempt=False):
                 _new_wd,
                 run_step,
             ), gpu_etime_ms = gpu_timer(train_step)
-            iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
+            _iter_end_time = time.time()
+            iter_elapsed_time_ms = (_iter_end_time - itr_start_time) * 1000.0
+            # Stamp now so the NEXT iteration's gap_ms measures from here, not
+            # from after log_stats()/_watchdog_disarm() run below.
+            _prev_iter_end = _iter_end_time
             phase_times = phase_timer.to_dict()
             phase_fwd_target = phase_times.get("start->fwd_target_done", 0.0)
-            phase_fwd_context = phase_times.get("fwd_target_done->fwd_context_done", 0.0)
+            # The fwd_context_encoder_done mark splits what used to be one
+            # "fwd_target_done->fwd_context_done" pair into two adjacent ones.
+            # phase_fwd_context is kept as their SUM so the existing
+            # fwd-context-ms column (readers already index it positionally)
+            # keeps its historical meaning: the whole context-encoder +
+            # predictor phase, not just the new sub-slice.
+            phase_fwd_context_encoder = phase_times.get(
+                "fwd_target_done->fwd_context_encoder_done", 0.0
+            )
+            phase_fwd_context_predictor = phase_times.get(
+                "fwd_context_encoder_done->fwd_context_done", 0.0
+            )
+            phase_fwd_context = phase_fwd_context_encoder + phase_fwd_context_predictor
             phase_backward = phase_times.get("fwd_context_done->backward_done", 0.0)
             phase_opt_step = phase_times.get("backward_done->opt_step_done", 0.0)
             phase_ema = phase_times.get("opt_step_done->ema_done", 0.0)
@@ -1613,6 +1730,7 @@ def main(args, resume_preempt=False):
 
             # -- Logging
             def log_stats():
+                nonlocal _prev_log_io_ms
                 # -- L0 free-memory probe (per rank, per iter). external =
                 # l0_used - torch_alloc catches CCL/OFI growth reserved can't see.
                 l0_free_mib = -1.0
@@ -1629,6 +1747,7 @@ def main(args, resume_preempt=False):
 
                 host_avail_mib, rss_mib = _host_mem_mib()
 
+                _log_io_start = time.time()
                 csv_logger.log(
                     epoch + 1,
                     itr,
@@ -1649,7 +1768,17 @@ def main(args, resume_preempt=False):
                     barrier_ms,
                     host_avail_mib,
                     rss_mib,
+                    gap_ms,
+                    log_io_ms,
+                    phase_fwd_context_encoder,
+                    phase_fwd_context_predictor,
+                    loginfo_ms,
                 )
+                # Isolates the Lustre open/append/close from the rest of the
+                # untimed gap; reported on the NEXT row (see log_io_ms above).
+                _prev_log_io_ms = (time.time() - _log_io_start) * 1000.0
+                nonlocal _prev_loginfo_ms
+                _loginfo_start = time.time()
                 if (
                     (itr % log_freq == 0)
                     or (itr == ipe - 1)
@@ -1698,6 +1827,12 @@ def main(args, resume_preempt=False):
                             data_elapsed_time_meter.avg,
                         )
                     )
+                # Isolates the periodic logger.info() stdout write (also on
+                # Lustre, per-rank `rank.%r.out`) from the rest of the untimed
+                # gap; reported on the NEXT row, same one-row deferral as
+                # log-io-ms. Zero on iterations where the `if` above didn't
+                # fire, which is the expected/common case.
+                _prev_loginfo_ms = (time.time() - _loginfo_start) * 1000.0
 
             log_stats()
             _watchdog_disarm()  # iter completed within the deadline — cancel the stack-dump timer

@@ -139,8 +139,20 @@ def _use_toplevel_wrap():
     return env == "shard_grad_op"
 
 
-def wrap_hsdp(module, mesh, *, requires_grad=True, logger=None):
+def wrap_hsdp(module, mesh, *, requires_grad=True, logger=None, ignored_modules=None):
     """FSDP1-wrap an encoder/predictor/target_encoder for HSDP.
+
+    ``ignored_modules`` (PARTIAL FINE-TUNE): submodules whose params FSDP must
+    leave entirely alone -- not sharded, not gathered, not reduced. This is what
+    makes last-N unfreeze viable under HSDP. Without it, the frozen blocks land
+    in the same flat-param unit as the trainable ones and every step pays a
+    FULL-model gradient buffer to reduce a PARTIAL-model gradient (FSDP's own
+    `_validate_frozen_params` warns about exactly this), which is why the eval
+    path previously refused partial unfreeze and fell back to DDP.
+
+    The ignored params stay dense, replicated, and requires_grad=False on every
+    rank -- correct here, since a frozen block is identical everywhere and never
+    produces a gradient to reduce.
 
     - transformer_auto_wrap_policy on the shared `Block` class (encoder AND
       predictor blocks are the same class), so each attention block is its own
@@ -184,6 +196,11 @@ def wrap_hsdp(module, mesh, *, requires_grad=True, logger=None):
         # also omits it.
         limit_all_gathers=True,
     )
+    if ignored_modules:
+        # NB: `ignored_modules` (not `ignored_states`). Both exist in this torch,
+        # but ignored_modules takes nn.Modules, which is what we have; passing
+        # modules to ignored_states would be wrong (it wants params/buffers).
+        kwargs["ignored_modules"] = list(ignored_modules)
     if toplevel:
         # TOP-LEVEL wrap: one FSDP unit for the whole module -> ONE ReduceScatter
         # per backward (like DDP AllReduce). No auto_wrap_policy. This is the
@@ -213,9 +230,10 @@ def wrap_hsdp(module, mesh, *, requires_grad=True, logger=None):
         for p in wrapped.parameters():
             p.requires_grad = False
     if logger is not None:
+        _ign = f", ignored_modules={len(kwargs['ignored_modules'])}" if ignored_modules else ""
         logger.info(
             f"[HSDP] wrapped module: {label}; wrap={wrap_desc} "
-            f"(requires_grad={requires_grad})"
+            f"(requires_grad={requires_grad}{_ign})"
         )
     return wrapped
 
@@ -237,6 +255,93 @@ def full_state_dict_context(module):
 
     cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     return FSDP.state_dict_type(module, StateDictType.FULL_STATE_DICT, cfg)
+
+
+def save_optim_shards(optimizer, path_prefix, logger=None):
+    """Persist AdamW moments for an HSDP run as PER-RANK sidecar files.
+
+    WHY THIS EXISTS: without it, a resume-chained run reinitializes the
+    optimizer at every link. The FT arm runs ~27 min/epoch, so a 6h link is
+    ~13 epochs, and Adam's beta2=0.999 needs ~1/(1-beta2)=1000 steps (~5.2
+    epochs at ipe=192) to re-estimate the second moment. A chained run would
+    therefore train a large fraction of its steps with a cold optimizer --
+    silently degrading exactly the fine-tuning being measured.
+
+    WHY NOT `FSDP.optim_state_dict`: the probe's single AdamW owns TWO param
+    groups -- the head (a plain, unsharded module) and the FSDP-sharded
+    encoder. FSDP walks EVERY param in the optimizer and looks it up in the
+    module's param->FQN map, so the head params raise
+    `KeyError: Parameter containing: ...`. That is not hypothetical -- it
+    killed all three seeds of a live campaign run at their first
+    best-checkpoint save (job 8791652), which is why this function exists in
+    this shape.
+
+    WHY SIDECARS AND NOT THE MAIN CHECKPOINT: each rank's Adam moments belong
+    to that rank's shard, and only rank 0 writes the main checkpoint. Stuffing
+    rank 0's local state into the shared file would hand ranks 1..N-1 the wrong
+    moments on resume -- worse than a cold start, because it looks warm. So
+    every rank writes its own `<prefix>.optshard_<rank>.pt`.
+
+    NOT collective: every rank writes independently, no barrier needed.
+
+    Same-topology only, and enforced rather than assumed: `load_optim_shards`
+    refuses a world_size mismatch and reports a cold start instead of applying
+    another rank's moments. A resume chain always keeps geometry fixed (the
+    launcher pins nodes-per-seed and ppn), so this is the operative case.
+    """
+    import torch
+    import torch.distributed as dist
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world = dist.get_world_size() if dist.is_initialized() else 1
+    path = f"{path_prefix}.optshard_{rank}.pt"
+    tmp = f"{path}.tmp"
+    torch.save(
+        {"format": "hsdp-optshard-v1", "world_size": world, "rank": rank,
+         "state": optimizer.state_dict()},
+        tmp,
+    )
+    os.replace(tmp, path)   # atomic: a torn shard would silently poison resume
+    if logger is not None and rank == 0:
+        logger.info("saved optimizer shards -> %s.optshard_*.pt (world=%d)", path_prefix, world)
+    return path
+
+
+def load_optim_shards(optimizer, path_prefix, logger=None):
+    """Restore this rank's AdamW moments written by save_optim_shards.
+
+    Returns True if state was applied. Returns False -- loudly -- when the
+    shard is missing or was written at a different world size, so the caller
+    can report a genuinely cold optimizer rather than assume a warm one.
+    """
+    import torch
+    import torch.distributed as dist
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world = dist.get_world_size() if dist.is_initialized() else 1
+    path = f"{path_prefix}.optshard_{rank}.pt"
+    if not os.path.exists(path):
+        if logger is not None and rank == 0:
+            logger.warning("no optimizer shard at %s -- optimizer starts COLD.", path)
+        return False
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as e:
+        if logger is not None:
+            logger.warning("optimizer shard %s unreadable (%s) -- starting COLD.", path, e)
+        return False
+    if blob.get("world_size") != world:
+        if logger is not None and rank == 0:
+            logger.warning(
+                "optimizer shard was written at world_size=%s but this run is %d; "
+                "per-rank moments do not transfer across topologies -- starting COLD.",
+                blob.get("world_size"), world,
+            )
+        return False
+    optimizer.load_state_dict(blob["state"])
+    if logger is not None and rank == 0:
+        logger.info("restored optimizer shards from %s.optshard_* (Adam moments warm)", path_prefix)
+    return True
 
 
 def full_state_dict_context_multi(modules):

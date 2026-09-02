@@ -23,6 +23,11 @@ Pipeline:
 If `return_sequence=False`, the last step mean-pools over T_total to return
 `[B, num_classes]` (pooled-clip mode; not the recommended training path).
 
+Optional `num_stages > 1` appends ASFormer/MS-TCN-style refinement stages
+(each conditioned on the previous stage's logits) after step 5; forward()
+then returns a list of per-stage logits instead of one tensor. Default
+`num_stages=1` is unchanged from the above and bit-identical.
+
 This module is independent of `src/models/utils/modules.py` so it stays usable
 even if upstream V-JEPA helpers change shape.
 """
@@ -134,6 +139,43 @@ class DilatedTemporalConvBlock(nn.Module):
         return residual + self.dropout(y)
 
 
+class RefinementStage(nn.Module):
+    """ASFormer/MS-TCN-style refinement stage (Farha & Gall 2019, sec 3.2):
+    each stage takes the previous stage's per-token prediction and refines it.
+
+    No self-attention here -- ASFormer's decoder stages self-attend too, but at
+    T=24 tokens the encoder stage's one global attention block already sees the
+    whole sequence, so re-attending in every refinement stage is redundant
+    compute for the frame count this head runs at. This keeps the pilot cheap:
+    just dilated-conv refinement conditioned on the previous stage's logits.
+
+    Input : features [B, T, D] (pre-classifier feature from the previous
+            stage), prev_logits [B, T, num_classes].
+    Output: features [B, T, D] (unnormalized, chains to the next stage),
+            logits [B, T, num_classes].
+    """
+
+    def __init__(self, embed_dim: int, num_classes: int, num_layers: int = 4,
+                 dropout: float = 0.0):
+        super().__init__()
+        self.logits_proj = nn.Linear(num_classes, embed_dim)
+        self.blocks = nn.ModuleList(
+            [
+                DilatedTemporalConvBlock(embed_dim=embed_dim, dilation=2 ** i, dropout=dropout)
+                for i in range(num_layers)
+            ]
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+        self.classifier = nn.Linear(embed_dim, num_classes)
+
+    def forward(self, features: torch.Tensor, prev_logits: torch.Tensor):
+        x = features + self.logits_proj(prev_logits)
+        for block in self.blocks:
+            x = block(x)
+        logits = self.classifier(self.norm(x))
+        return x, logits
+
+
 # ---------------------------------------------------------------------------
 # ASFormer head
 # ---------------------------------------------------------------------------
@@ -149,7 +191,7 @@ class ASFormerHead(nn.Module):
         num_clips:        Number of V-JEPA clips per sample (3 for ctx3).
         tokens_per_clip:  Temporal tokens per clip
                           = frames_per_clip // tubelet_size (8 for 16f / ts=2).
-        num_layers:       Number of dilated temporal conv blocks.
+        num_layers:       Number of dilated temporal conv blocks (stage 0).
         num_heads:        Attention-head count (for both pool + self-attn block).
         mlp_ratio:        Hidden expansion ratio in the self-attn block MLP.
         dropout:          Dropout for attention + MLP + conv blocks.
@@ -158,6 +200,14 @@ class ASFormerHead(nn.Module):
                           T_total and return [B, num_classes].
         temporal_tokens:  Optional. If set, used as a sanity assert
                           (num_clips * tokens_per_clip == temporal_tokens).
+        num_stages:       Total stages (1 = stage-0 only, today's exact
+                          behavior, bit-identical output). >1 adds
+                          `num_stages - 1` RefinementStage modules, each
+                          refining the previous stage's prediction. When >1,
+                          forward() returns a LIST of per-stage logits instead
+                          of a single tensor.
+        refine_num_layers: Dilated conv layers per refinement stage (only
+                          used when num_stages > 1).
     """
 
     def __init__(
@@ -174,8 +224,13 @@ class ASFormerHead(nn.Module):
         temporal_tokens: int | None = None,
         spatial_prepooled: bool = False,
         input_dim: int | None = None,
+        num_stages: int = 1,
+        refine_num_layers: int = 4,
     ):
         super().__init__()
+        if num_stages < 1:
+            raise ValueError(f"num_stages must be >= 1, got {num_stages}")
+        self.num_stages = num_stages
         if temporal_tokens is not None and temporal_tokens != num_clips * tokens_per_clip:
             raise ValueError(
                 f"temporal_tokens={temporal_tokens} != num_clips*tokens_per_clip="
@@ -250,6 +305,18 @@ class ASFormerHead(nn.Module):
         )
         self.final_norm = nn.LayerNorm(embed_dim)
         self.classifier = nn.Linear(embed_dim, num_classes)
+
+        self.refinement_stages = nn.ModuleList(
+            [
+                RefinementStage(
+                    embed_dim=embed_dim,
+                    num_classes=num_classes,
+                    num_layers=refine_num_layers,
+                    dropout=dropout,
+                )
+                for _ in range(num_stages - 1)
+            ]
+        )
 
         self.apply(self._init_weights)
 
@@ -331,11 +398,25 @@ class ASFormerHead(nn.Module):
         for block in self.temporal_blocks:
             x = block(x)
         x = self.final_norm(x)
-        logits = self.classifier(x)              # [B, T_total, num_classes]
+        logits = self.classifier(x)              # [B, T_total, num_classes] -- stage 0
+
+        if self.num_stages == 1:
+            if not self.return_sequence:
+                logits = logits.mean(dim=1)      # [B, num_classes]
+            return logits
+
+        # Multi-stage: each refinement stage takes the running feature plus the
+        # previous stage's logits, matching ASFormer/MS-TCN's "refine the
+        # prediction" mechanism (Farha & Gall 2019 sec 3.2). Returns per-stage
+        # logits so the training loop can sum a per-stage loss (see eval.py).
+        all_logits = [logits]
+        for stage in self.refinement_stages:
+            x, logits = stage(x, logits)
+            all_logits.append(logits)
 
         if not self.return_sequence:
-            logits = logits.mean(dim=1)          # [B, num_classes]
-        return logits
+            all_logits = [lg.mean(dim=1) for lg in all_logits]  # [B, num_classes]
+        return all_logits
 
 
 __all__ = ["ASFormerHead"]

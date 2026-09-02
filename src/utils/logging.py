@@ -98,26 +98,58 @@ def get_logger(name=None, force=False):
 
 
 class CSVLogger(object):
+    """Per-rank training CSV: one row appended per iteration for the life of
+    the process.
+
+    `log()` used to `open(fname, "+a")` / `close()` on EVERY call -- a fresh
+    Lustre `open`/append/`close` per iteration, per rank. At production scale
+    (1536+ ranks each hitting the same MDS every ~3s) this is exactly the
+    shape of stall a shared filesystem's metadata server can occasionally
+    impose on one unlucky rank, and it was DIRECTLY measured doing so: job
+    8744839 (2 nodes, `sb10`-clean, docs/THROUGHPUT_RECIPE_AURORA.md) caught
+    one rank's log() call taking 9253 ms while its own iteration and every
+    other timed phase were normal, and every peer rank blocked in its NEXT
+    barrier waiting for it -- the "backward drift episode" investigation's
+    leading confirmed mechanism. The file handle is now opened once and kept
+    open for the object's lifetime; `log()` only writes and flushes, which
+    keeps external tailers (PBS watchdog `awk`/`tail` polling on log_r0.csv)
+    working exactly as before while removing the per-iteration open/close.
+    """
 
     def __init__(self, fname, *argv, **kwargs):
         self.fname = fname
         self.types = []
         mode = kwargs.get("mode", "+a")
         self.delim = kwargs.get("delim", ",")
+        self._f = open(self.fname, mode)
         # -- print headers
-        with open(self.fname, mode) as f:
-            for i, v in enumerate(argv, 1):
-                self.types.append(v[0])
-                if i < len(argv):
-                    print(v[1], end=self.delim, file=f)
-                else:
-                    print(v[1], end="\n", file=f)
+        for i, v in enumerate(argv, 1):
+            self.types.append(v[0])
+            if i < len(argv):
+                print(v[1], end=self.delim, file=self._f)
+            else:
+                print(v[1], end="\n", file=self._f)
+        self._f.flush()
 
     def log(self, *argv):
-        with open(self.fname, "+a") as f:
-            for i, tv in enumerate(zip(self.types, argv), 1):
-                end = self.delim if i < len(argv) else "\n"
-                print(tv[0] % tv[1], end=end, file=f)
+        for i, tv in enumerate(zip(self.types, argv), 1):
+            end = self.delim if i < len(argv) else "\n"
+            print(tv[0] % tv[1], end=end, file=self._f)
+        # Flush (not fsync): a tailer must see the row promptly, but paying an
+        # fsync's fdatasync-to-OST round trip every iteration would reintroduce
+        # the same per-iteration Lustre RPC this fix removes -- the buffered
+        # write() the open/close cycle used to imply is preserved by flush().
+        self._f.flush()
+
+    def close(self):
+        if not self._f.closed:
+            self._f.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass  # interpreter teardown can tear down `open`/file state first
 
 
 class AverageMeter(object):

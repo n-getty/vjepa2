@@ -43,6 +43,9 @@ def init_data(
     return_sample_path=False,
     train_frac=1.0,
     subset_seed=0,
+    ipe=None,
+    total_budget_samples=None,
+    num_epochs=None,
 ):
     if data.lower() == "imagenet":
         from src.datasets.imagenet1k import make_imagenet1k
@@ -123,6 +126,9 @@ def init_data(
             rank=rank,
             deterministic=deterministic,
             log_dir=log_dir,
+            ipe=ipe,
+            total_budget_samples=total_budget_samples,
+            num_epochs=num_epochs,
             **({} if min_clip_std is None else {"min_clip_std": min_clip_std}),
         )
 

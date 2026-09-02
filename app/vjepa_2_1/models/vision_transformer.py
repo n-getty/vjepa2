@@ -179,6 +179,14 @@ class VisionTransformer(nn.Module):
 
         self.cls_token = None
         self.return_hierarchical = False
+        # Mid-layer frozen-readout early-exit (flag-gated, default None ->
+        # bit-identical to prior behavior). When set to one of
+        # self.hierarchical_layers, forward() returns norms_block[k](x) right
+        # after block `readout_layer` and skips every later block -- cheaper
+        # than the full-depth baseline, not just different. See the
+        # return_hierarchical precedent above for the set-after-construction
+        # convention (evals/*/modelcustom/vit_encoder_multiclip_v21.py).
+        self.readout_layer = None
 
         self.modality_embedding = False
         if modality_embedding:
@@ -328,6 +336,13 @@ class VisionTransformer(nn.Module):
             if i in self.out_layers_distillation:
                 out_idx = self.hierarchical_layers.index(i)
                 hier.append(self.norms_block[out_idx](x))
+
+            if self.readout_layer is not None and i == self.readout_layer:
+                # Early-exit: skip every later block. readout_layer must be one
+                # of self.hierarchical_layers (index() raises otherwise) so we
+                # reuse an ALREADY-TRAINED norms_block -- zero new parameters.
+                out_idx = self.hierarchical_layers.index(i)
+                return self.norms_block[out_idx](x)
 
         if self.out_layers is not None:
             return outs
